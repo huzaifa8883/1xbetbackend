@@ -1,7 +1,6 @@
 'use strict';
 
-require('dotenv').config();
-
+require('dotenv').config({ path: '../.env' });
 const http = require('http');
 const { Server: SocketServer } = require('socket.io');
 
