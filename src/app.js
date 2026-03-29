@@ -17,6 +17,23 @@ const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
 const app = express();
 
 /* ─────────────────────────────────────────────────────────── */
+/* Trust proxy (needed behind Nginx / Aiven / Railway etc.)   */
+/* Without this, req.ip and x-forwarded-proto are unreliable  */
+/* ─────────────────────────────────────────────────────────── */
+app.set('trust proxy', 1);
+
+/* ─────────────────────────────────────────────────────────── */
+/* Force HTTPS — redirect any HTTP request to HTTPS           */
+/* Works when behind a reverse proxy that sets x-forwarded-*  */
+/* ─────────────────────────────────────────────────────────── */
+app.use((req, res, next) => {
+  if (req.headers['x-forwarded-proto'] && req.headers['x-forwarded-proto'] !== 'https') {
+    return res.redirect(301, 'https://' + req.headers.host + req.url);
+  }
+  next();
+});
+
+/* ─────────────────────────────────────────────────────────── */
 /* Security headers                                            */
 /* ─────────────────────────────────────────────────────────── */
 app.use(helmet());
@@ -32,8 +49,10 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
 app.use(
   cors({
     origin: (origin, cb) => {
-      // Allow server-to-server / Postman (no origin) and listed origins
-      if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+      // Allow server-to-server / Postman / curl (no origin header)
+      if (!origin) return cb(null, true);
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+      logger.warn(`CORS blocked for origin: ${origin}`);
       cb(new Error(`CORS blocked for origin: ${origin}`));
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
@@ -66,7 +85,7 @@ app.use(
   '/api',
   rateLimit({
     windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '900000', 10),
-    max: parseInt(process.env.RATE_LIMIT_MAX || '100', 10),
+    max: parseInt(process.env.RATE_LIMIT_MAX || '1000', 10),
     standardHeaders: true,
     legacyHeaders: false,
     message: { success: false, message: 'Too many requests, please try again later.' },
