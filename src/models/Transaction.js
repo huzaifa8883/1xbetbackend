@@ -9,20 +9,22 @@ class Transaction extends Model {}
 Transaction.init(
   {
     id: {
-      type: DataTypes.BIGINT,
+      type: DataTypes.BIGINT.UNSIGNED,
       autoIncrement: true,
       primaryKey: true,
     },
+    // IMPORTANT: Must be UNSIGNED to match users.id (BIGINT UNSIGNED)
+    // Mismatch causes silent LEFT JOIN failures in MySQL
     user_id: {
-      type: DataTypes.BIGINT,
+      type: DataTypes.BIGINT.UNSIGNED,
       allowNull: false,
     },
     from_user_id: {
-      type: DataTypes.BIGINT,
+      type: DataTypes.BIGINT.UNSIGNED,
       allowNull: true,
     },
     to_user_id: {
-      type: DataTypes.BIGINT,
+      type: DataTypes.BIGINT.UNSIGNED,
       allowNull: true,
     },
     type: {
