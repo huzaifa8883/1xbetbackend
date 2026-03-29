@@ -8,7 +8,15 @@ const { sendSuccess, sendError } = require('../utils/response');
 const { CREATION_PERMISSIONS, ROLE_HIERARCHY, TRANSACTION_TYPE, ROLES } = require('../config/constants');
 const logger = require('../utils/logger');
 
-/* ── GET /api/v1/users ───────────────────────────────────── */
+/* ── Shared include helper ───────────────────────────────────── */
+const parentInclude = {
+  model: User,
+  as: 'parent',
+  attributes: ['id', 'username', 'role'],
+  required: false,
+};
+
+/* ── GET /api/v1/users ───────────────────────────────────────── */
 async function listUsers(req, res) {
   const { role, status, page = 1, limit = 50 } = req.query;
   const where = {};
@@ -18,7 +26,7 @@ async function listUsers(req, res) {
   const { count, rows } = await User.findAndCountAll({
     where,
     attributes: { exclude: ['password'] },
-    include: [{ model: User, as: 'parent', attributes: ['id', 'username', 'role'], required: false }],
+    include: [parentInclude],
     limit: parseInt(limit, 10),
     offset: (parseInt(page, 10) - 1) * parseInt(limit, 10),
     order: [['created_at', 'DESC']],
@@ -30,14 +38,14 @@ async function listUsers(req, res) {
   });
 }
 
-/* ── GET /api/v1/users/:role-alias ──────────────────────── */
+/* ── GET /api/v1/users/:role-alias ──────────────────────────── */
 function listByRole(role) {
   return async function (req, res) {
     try {
       const users = await User.findAll({
         where: { role },
         attributes: { exclude: ['password'] },
-        include: [{ model: User, as: 'parent', attributes: ['id', 'username', 'role'], required: false }],
+        include: [parentInclude],
         order: [['created_at', 'DESC']],
       });
 
@@ -53,7 +61,7 @@ function listByRole(role) {
   };
 }
 
-/* ── GET /api/v1/users/dashboard ─────────────────────────── */
+/* ── GET /api/v1/users/dashboard ────────────────────────────── */
 async function getDashboardStats(req, res) {
   try {
     const [adminCount, smCount, masterCount, userCount] = await Promise.all([
@@ -66,7 +74,7 @@ async function getDashboardStats(req, res) {
     const recentTx = await Transaction.findAll({
       limit: 10,
       order: [['created_at', 'DESC']],
-      include: [{ model: User, as: 'user', attributes: ['username', 'role'], required: false }],
+      include: [{ model: User, as: 'user', attributes: ['id', 'username', 'role'], required: false }],
     });
 
     return sendSuccess(res, {
@@ -79,7 +87,7 @@ async function getDashboardStats(req, res) {
   }
 }
 
-/* ── GET /api/v1/users/all-balances ──────────────────────── */
+/* ── GET /api/v1/users/all-balances ─────────────────────────── */
 async function getAllBalances(req, res) {
   try {
     const { role } = req.query;
@@ -90,7 +98,7 @@ async function getAllBalances(req, res) {
     const users = await User.findAll({
       where,
       attributes: { exclude: ['password'] },
-      include: [{ model: User, as: 'parent', attributes: ['id', 'username', 'role'], required: false }],
+      include: [parentInclude],
       order: [['role', 'ASC'], ['created_at', 'DESC']],
     });
 
@@ -101,17 +109,16 @@ async function getAllBalances(req, res) {
   }
 }
 
-/* ── GET /api/v1/users/activity-log ──────────────────────── */
+/* ── GET /api/v1/users/activity-log ─────────────────────────── */
 async function getActivityLog(req, res) {
   try {
     const { page = 1, limit = 50, type, role } = req.query;
     const where = {};
     if (type) where.type = type;
 
-    // If role filter is provided, find matching user IDs first,
-    // then filter transactions by those user_ids.
-    // This avoids the Sequelize LEFT JOIN + WHERE bug that causes
-    // transactions with non-matching users to be excluded incorrectly.
+    // If role filter is provided, find matching user IDs first.
+    // This avoids the Sequelize LEFT JOIN + WHERE bug that turns
+    // a LEFT JOIN into an INNER JOIN, causing missing rows.
     if (role) {
       const matchingUsers = await User.findAll({
         where: { role },
@@ -147,7 +154,7 @@ async function getActivityLog(req, res) {
   }
 }
 
-/* ── GET /api/v1/users/all-transactions ─────────────────── */
+/* ── GET /api/v1/users/all-transactions ─────────────────────── */
 async function getAllTransactions(req, res) {
   try {
     const { page = 1, limit = 50, type } = req.query;
@@ -159,7 +166,9 @@ async function getAllTransactions(req, res) {
       limit: parseInt(limit, 10),
       offset: (parseInt(page, 10) - 1) * parseInt(limit, 10),
       order: [['created_at', 'DESC']],
-      include: [{ model: User, as: 'user', attributes: ['username', 'role'], required: false }],
+      include: [
+        { model: User, as: 'user', attributes: ['id', 'username', 'role'], required: false },
+      ],
     });
 
     return sendSuccess(res, {
@@ -172,7 +181,7 @@ async function getAllTransactions(req, res) {
   }
 }
 
-/* ── POST /api/v1/users ──────────────────────────────────── */
+/* ── POST /api/v1/users ─────────────────────────────────────── */
 async function createUser(req, res) {
   try {
     const { username, password, phone, role, initial_balance = 0 } = req.body;
@@ -203,7 +212,7 @@ async function createUser(req, res) {
 
     const created = await User.findByPk(newUser.id, {
       attributes: { exclude: ['password'] },
-      include: [{ model: User, as: 'parent', attributes: ['id', 'username', 'role'], required: false }],
+      include: [parentInclude],
     });
 
     return sendSuccess(res, { user: created }, `${role} created successfully`, 201);
@@ -215,17 +224,17 @@ async function createUser(req, res) {
   }
 }
 
-/* ── GET /api/v1/users/me ────────────────────────────────── */
+/* ── GET /api/v1/users/me ───────────────────────────────────── */
 async function getMe(req, res) {
   const user = await User.findByPk(req.user.id, {
     attributes: { exclude: ['password'] },
-    include: [{ model: User, as: 'parent', attributes: ['id', 'username', 'role'], required: false }],
+    include: [parentInclude],
   });
   if (!user) return sendError(res, 'User not found', 404);
   return sendSuccess(res, { user });
 }
 
-/* ── GET /api/v1/users/downline ──────────────────────────── */
+/* ── GET /api/v1/users/downline ─────────────────────────────── */
 async function getDownline(req, res) {
   const { parentId } = req.query;
   const searchParentId = parentId ? parseInt(parentId, 10) : req.user.id;
@@ -233,24 +242,24 @@ async function getDownline(req, res) {
   const users = await User.findAll({
     where: { parent_id: searchParentId },
     attributes: { exclude: ['password'] },
-    include: [{ model: User, as: 'parent', attributes: ['id', 'username', 'role'], required: false }],
+    include: [parentInclude],
     order: [['created_at', 'DESC']],
   });
 
   return sendSuccess(res, { users });
 }
 
-/* ── GET /api/v1/users/:id ───────────────────────────────── */
+/* ── GET /api/v1/users/:id ──────────────────────────────────── */
 async function getUser(req, res) {
   const user = await User.findByPk(req.params.id, {
     attributes: { exclude: ['password'] },
-    include: [{ model: User, as: 'parent', attributes: ['id', 'username', 'role'], required: false }],
+    include: [parentInclude],
   });
   if (!user) return sendError(res, 'User not found', 404);
   return sendSuccess(res, { user });
 }
 
-/* ── PUT /api/v1/users/:id ───────────────────────────────── */
+/* ── PUT /api/v1/users/:id ──────────────────────────────────── */
 async function updateUser(req, res) {
   const { password, username, phone, status } = req.body;
   const user = await User.findByPk(req.params.id);
@@ -277,7 +286,7 @@ async function updateUser(req, res) {
   return sendSuccess(res, { user: safe }, 'User updated');
 }
 
-/* ── DELETE /api/v1/users/:id ───────────────────────────── */
+/* ── DELETE /api/v1/users/:id ───────────────────────────────── */
 async function deleteUser(req, res) {
   const user = await User.findByPk(req.params.id);
   if (!user) return sendError(res, 'User not found', 404);
@@ -292,7 +301,7 @@ async function deleteUser(req, res) {
   return sendSuccess(res, null, 'User deleted');
 }
 
-/* ── POST /api/v1/users/transaction ─────────────────────── */
+/* ── POST /api/v1/users/transaction ─────────────────────────── */
 async function processTransaction(req, res) {
   const { type, amount, userId, description } = req.body;
   const txAmount = parseFloat(amount);
@@ -338,11 +347,14 @@ async function processTransaction(req, res) {
 
     await t.commit();
 
+    const newSenderBal = parseFloat(currentUser.wallet_balance) + senderDelta;
+    const newReceiverBal = parseFloat(targetUser.wallet_balance) + receiverDelta;
+
     return sendSuccess(res, {
-      senderBalance: parseFloat(currentUser.wallet_balance) + senderDelta,
-      receiverBalance: parseFloat(targetUser.wallet_balance) + receiverDelta,
-      currentUserBalance: parseFloat(currentUser.wallet_balance) + senderDelta,
-      targetUserBalance: parseFloat(targetUser.wallet_balance) + receiverDelta,
+      senderBalance: newSenderBal,
+      receiverBalance: newReceiverBal,
+      currentUserBalance: newSenderBal,
+      targetUserBalance: newReceiverBal,
     }, `${type === TRANSACTION_TYPE.DEPOSIT ? 'Deposit' : 'Withdrawal'} successful`);
   } catch (err) {
     await t.rollback();
@@ -351,7 +363,7 @@ async function processTransaction(req, res) {
   }
 }
 
-/* ── POST /api/v1/users/credit-transaction ───────────────── */
+/* ── POST /api/v1/users/credit-transaction ──────────────────── */
 async function processCreditTransaction(req, res) {
   const { type, amount, userId, description } = req.body;
   const txAmount = parseFloat(amount);
@@ -400,7 +412,7 @@ async function processCreditTransaction(req, res) {
   }, 'Credit transaction successful');
 }
 
-/* ── GET /api/v1/users/:id/transactions ─────────────────── */
+/* ── GET /api/v1/users/:id/transactions ─────────────────────── */
 async function getUserTransactions(req, res) {
   const { page = 1, limit = 50, type } = req.query;
   const where = { user_id: req.params.id };
@@ -411,6 +423,9 @@ async function getUserTransactions(req, res) {
     limit: parseInt(limit, 10),
     offset: (parseInt(page, 10) - 1) * parseInt(limit, 10),
     order: [['created_at', 'DESC']],
+    include: [
+      { model: User, as: 'user', attributes: ['id', 'username', 'role'], required: false },
+    ],
   });
 
   return sendSuccess(res, {
