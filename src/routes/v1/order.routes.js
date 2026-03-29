@@ -23,16 +23,23 @@ router.get('/', ctrl.getAllOrders);
 router.post('/', placeBetRules, validate, ctrl.placeBets);
 
 /**
- * @route   GET  /api/v1/orders/pending
+ * @route   GET /api/v1/orders/pending
  * @desc    Get PENDING orders (optionally filtered by marketId)
  */
 router.get('/pending', ctrl.getPendingOrders);
 
 /**
- * @route   GET  /api/v1/orders/matched
+ * @route   GET /api/v1/orders/matched
  * @desc    Get MATCHED orders (optionally filtered by marketId)
  */
 router.get('/matched', ctrl.getMatchedOrders);
+
+/**
+ * @route   GET /api/v1/orders/event
+ * @desc    Get orders by eventId/marketId — used by bundle0a.js (legacy bfexch compatibility)
+ *          Accepts token via ?token= query param OR Authorization header
+ */
+router.get('/event', ctrl.getOrdersByEvent);
 
 /**
  * @route   POST /api/v1/orders/cancel-all
