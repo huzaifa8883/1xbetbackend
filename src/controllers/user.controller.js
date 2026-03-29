@@ -5,7 +5,7 @@ const { Op } = require('sequelize');
 const { sequelize } = require('../config/database');
 const { User, Transaction } = require('../models');
 const { sendSuccess, sendError } = require('../utils/response');
-const { CREATION_PERMISSIONS, ROLE_HIERARCHY, TRANSACTION_TYPE } = require('../config/constants');
+const { CREATION_PERMISSIONS, ROLE_HIERARCHY, TRANSACTION_TYPE, ROLES } = require('../config/constants');
 const logger = require('../utils/logger');
 
 /* ── GET /api/v1/users ───────────────────────────────────── */
@@ -18,6 +18,7 @@ async function listUsers(req, res) {
   const { count, rows } = await User.findAndCountAll({
     where,
     attributes: { exclude: ['password'] },
+    include: [{ model: User, as: 'parent', attributes: ['id', 'username', 'role'], required: false }],
     limit: parseInt(limit, 10),
     offset: (parseInt(page, 10) - 1) * parseInt(limit, 10),
     order: [['created_at', 'DESC']],
@@ -29,31 +30,146 @@ async function listUsers(req, res) {
   });
 }
 
-
 /* ── GET /api/v1/users/:role-alias ──────────────────────── */
-/* Handles /masters  /supermasters  /admin  /user           */
 function listByRole(role) {
   return async function (req, res) {
     try {
       const users = await User.findAll({
         where: { role },
         attributes: { exclude: ['password'] },
+        include: [{ model: User, as: 'parent', attributes: ['id', 'username', 'role'], required: false }],
         order: [['created_at', 'DESC']],
       });
 
-      // Return field name matching what Admin.html expects:
-      //   /masters, /supermasters  → { masters: [...] }
-      //   /admin                   → { admins:  [...] }
-      //   /user                    → { users:   [...] }
       let key = 'users';
       if (role === 'Master' || role === 'SuperMaster') key = 'masters';
       if (role === 'Admin') key = 'admins';
 
       return sendSuccess(res, { [key]: users, users });
     } catch (err) {
+      logger.error('listByRole error: ' + err.message);
       return sendError(res, err.message, 500);
     }
   };
+}
+
+/* ── GET /api/v1/users/dashboard ─────────────────────────── */
+async function getDashboardStats(req, res) {
+  try {
+    const [adminCount, smCount, masterCount, userCount] = await Promise.all([
+      User.count({ where: { role: ROLES.ADMIN } }),
+      User.count({ where: { role: ROLES.SUPER_MASTER } }),
+      User.count({ where: { role: ROLES.MASTER } }),
+      User.count({ where: { role: ROLES.USER } }),
+    ]);
+
+    const recentTx = await Transaction.findAll({
+      limit: 10,
+      order: [['created_at', 'DESC']],
+      include: [{ model: User, as: 'user', attributes: ['username', 'role'], required: false }],
+    });
+
+    return sendSuccess(res, {
+      counts: { admins: adminCount, supermasters: smCount, masters: masterCount, users: userCount },
+      recentTransactions: recentTx,
+    });
+  } catch (err) {
+    logger.error('getDashboardStats error: ' + err.message);
+    return sendError(res, err.message, 500);
+  }
+}
+
+/* ── GET /api/v1/users/all-balances ──────────────────────── */
+async function getAllBalances(req, res) {
+  try {
+    const { role } = req.query;
+    const where = {};
+    if (req.user.role !== ROLES.SUPERADMIN) where.parent_id = req.user.id;
+    if (role) where.role = role;
+
+    const users = await User.findAll({
+      where,
+      attributes: { exclude: ['password'] },
+      include: [{ model: User, as: 'parent', attributes: ['id', 'username', 'role'], required: false }],
+      order: [['role', 'ASC'], ['created_at', 'DESC']],
+    });
+
+    return sendSuccess(res, { users });
+  } catch (err) {
+    logger.error('getAllBalances error: ' + err.message);
+    return sendError(res, err.message, 500);
+  }
+}
+
+/* ── GET /api/v1/users/activity-log ──────────────────────── */
+async function getActivityLog(req, res) {
+  try {
+    const { page = 1, limit = 50, type, role } = req.query;
+    const where = {};
+    if (type) where.type = type;
+
+    // If role filter is provided, find matching user IDs first,
+    // then filter transactions by those user_ids.
+    // This avoids the Sequelize LEFT JOIN + WHERE bug that causes
+    // transactions with non-matching users to be excluded incorrectly.
+    if (role) {
+      const matchingUsers = await User.findAll({
+        where: { role },
+        attributes: ['id'],
+      });
+      const userIds = matchingUsers.map(u => u.id);
+      if (!userIds.length) {
+        return sendSuccess(res, {
+          logs: [],
+          pagination: { total: 0, page: parseInt(page, 10), limit: parseInt(limit, 10) },
+        });
+      }
+      where.user_id = { [Op.in]: userIds };
+    }
+
+    const { count, rows } = await Transaction.findAndCountAll({
+      where,
+      limit: parseInt(limit, 10),
+      offset: (parseInt(page, 10) - 1) * parseInt(limit, 10),
+      order: [['created_at', 'DESC']],
+      include: [
+        { model: User, as: 'user', attributes: ['id', 'username', 'role'], required: false },
+      ],
+    });
+
+    return sendSuccess(res, {
+      logs: rows,
+      pagination: { total: count, page: parseInt(page, 10), limit: parseInt(limit, 10) },
+    });
+  } catch (err) {
+    logger.error('getActivityLog error: ' + err.message);
+    return sendError(res, err.message, 500);
+  }
+}
+
+/* ── GET /api/v1/users/all-transactions ─────────────────── */
+async function getAllTransactions(req, res) {
+  try {
+    const { page = 1, limit = 50, type } = req.query;
+    const where = {};
+    if (type) where.type = type;
+
+    const { count, rows } = await Transaction.findAndCountAll({
+      where,
+      limit: parseInt(limit, 10),
+      offset: (parseInt(page, 10) - 1) * parseInt(limit, 10),
+      order: [['created_at', 'DESC']],
+      include: [{ model: User, as: 'user', attributes: ['username', 'role'], required: false }],
+    });
+
+    return sendSuccess(res, {
+      transactions: rows,
+      pagination: { total: count, page: parseInt(page, 10), limit: parseInt(limit, 10) },
+    });
+  } catch (err) {
+    logger.error('getAllTransactions error: ' + err.message);
+    return sendError(res, err.message, 500);
+  }
 }
 
 /* ── POST /api/v1/users ──────────────────────────────────── */
@@ -68,10 +184,9 @@ async function createUser(req, res) {
 
     const allowed = CREATION_PERMISSIONS[creator.role] || [];
     if (!allowed.includes(role)) {
-      return sendError(res, `Your role cannot create a '${role}' user`, 403);
+      return sendError(res, `Your role (${creator.role}) cannot create a '${role}' user`, 403);
     }
 
-    // MySQL case-insensitive compare (Op.like on MySQL is case-insensitive by default)
     const existing = await User.findOne({ where: { username: { [Op.like]: username } } });
     if (existing) return sendError(res, 'Username already exists', 409);
 
@@ -86,23 +201,26 @@ async function createUser(req, res) {
       status: 'Active',
     });
 
-    const { password: _, ...safe } = newUser.toJSON();
-    return sendSuccess(res, { user: safe }, `${role} created successfully`, 201);
+    const created = await User.findByPk(newUser.id, {
+      attributes: { exclude: ['password'] },
+      include: [{ model: User, as: 'parent', attributes: ['id', 'username', 'role'], required: false }],
+    });
+
+    return sendSuccess(res, { user: created }, `${role} created successfully`, 201);
   } catch (err) {
     logger.error('createUser error: ' + err.message);
-    if (err.name === 'SequelizeUniqueConstraintError') {
-      return sendError(res, 'Username already exists', 409);
-    }
-    if (err.name === 'SequelizeDatabaseError') {
-      return sendError(res, 'Database error: ' + err.message, 500);
-    }
+    if (err.name === 'SequelizeUniqueConstraintError') return sendError(res, 'Username already exists', 409);
+    if (err.name === 'SequelizeDatabaseError') return sendError(res, 'Database error: ' + err.message, 500);
     return sendError(res, err.message || 'Server error', 500);
   }
 }
 
 /* ── GET /api/v1/users/me ────────────────────────────────── */
 async function getMe(req, res) {
-  const user = await User.findByPk(req.user.id, { attributes: { exclude: ['password'] } });
+  const user = await User.findByPk(req.user.id, {
+    attributes: { exclude: ['password'] },
+    include: [{ model: User, as: 'parent', attributes: ['id', 'username', 'role'], required: false }],
+  });
   if (!user) return sendError(res, 'User not found', 404);
   return sendSuccess(res, { user });
 }
@@ -115,6 +233,7 @@ async function getDownline(req, res) {
   const users = await User.findAll({
     where: { parent_id: searchParentId },
     attributes: { exclude: ['password'] },
+    include: [{ model: User, as: 'parent', attributes: ['id', 'username', 'role'], required: false }],
     order: [['created_at', 'DESC']],
   });
 
@@ -123,7 +242,10 @@ async function getDownline(req, res) {
 
 /* ── GET /api/v1/users/:id ───────────────────────────────── */
 async function getUser(req, res) {
-  const user = await User.findByPk(req.params.id, { attributes: { exclude: ['password'] } });
+  const user = await User.findByPk(req.params.id, {
+    attributes: { exclude: ['password'] },
+    include: [{ model: User, as: 'parent', attributes: ['id', 'username', 'role'], required: false }],
+  });
   if (!user) return sendError(res, 'User not found', 404);
   return sendSuccess(res, { user });
 }
@@ -133,6 +255,12 @@ async function updateUser(req, res) {
   const { password, username, phone, status } = req.body;
   const user = await User.findByPk(req.params.id);
   if (!user) return sendError(res, 'User not found', 404);
+
+  const callerLevel = ROLE_HIERARCHY[req.user.role] ?? 0;
+  const targetLevel = ROLE_HIERARCHY[user.role] ?? 0;
+  if (callerLevel <= targetLevel && req.user.id !== user.id) {
+    return sendError(res, 'Insufficient permissions to edit this user', 403);
+  }
 
   const updates = {};
   if (phone !== undefined) updates.phone = phone;
@@ -153,6 +281,13 @@ async function updateUser(req, res) {
 async function deleteUser(req, res) {
   const user = await User.findByPk(req.params.id);
   if (!user) return sendError(res, 'User not found', 404);
+
+  const callerLevel = ROLE_HIERARCHY[req.user.role] ?? 0;
+  const targetLevel = ROLE_HIERARCHY[user.role] ?? 0;
+  if (callerLevel <= targetLevel) {
+    return sendError(res, 'Cannot delete a user with equal or higher role', 403);
+  }
+
   await user.destroy();
   return sendSuccess(res, null, 'User deleted');
 }
@@ -188,7 +323,14 @@ async function processTransaction(req, res) {
     await currentUser.update({ wallet_balance: parseFloat(currentUser.wallet_balance) + senderDelta }, { transaction: t });
     await targetUser.update({ wallet_balance: parseFloat(targetUser.wallet_balance) + receiverDelta }, { transaction: t });
 
-    const txBase = { from_user_id: currentUser.id, to_user_id: targetUser.id, amount: txAmount, description, status: 'completed' };
+    const txBase = {
+      from_user_id: currentUser.id,
+      to_user_id: targetUser.id,
+      amount: txAmount,
+      description: description || `${type} by ${currentUser.username}`,
+      status: 'completed',
+    };
+
     await Transaction.bulkCreate([
       { ...txBase, user_id: currentUser.id, type },
       { ...txBase, user_id: targetUser.id, type },
@@ -197,6 +339,8 @@ async function processTransaction(req, res) {
     await t.commit();
 
     return sendSuccess(res, {
+      senderBalance: parseFloat(currentUser.wallet_balance) + senderDelta,
+      receiverBalance: parseFloat(targetUser.wallet_balance) + receiverDelta,
       currentUserBalance: parseFloat(currentUser.wallet_balance) + senderDelta,
       targetUserBalance: parseFloat(targetUser.wallet_balance) + receiverDelta,
     }, `${type === TRANSACTION_TYPE.DEPOSIT ? 'Deposit' : 'Withdrawal'} successful`);
@@ -224,15 +368,11 @@ async function processCreditTransaction(req, res) {
   if (currentLevel <= targetLevel) return sendError(res, 'Insufficient permissions', 403);
 
   if (type === TRANSACTION_TYPE.CREDIT_DEPOSIT) {
-    if (parseFloat(currentUser.wallet_balance) < txAmount) {
-      return sendError(res, 'Insufficient wallet balance', 400);
-    }
+    if (parseFloat(currentUser.wallet_balance) < txAmount) return sendError(res, 'Insufficient wallet balance', 400);
     await currentUser.update({ wallet_balance: parseFloat(currentUser.wallet_balance) - txAmount });
     await targetUser.update({ credit_balance: parseFloat(targetUser.credit_balance) + txAmount });
   } else if (type === TRANSACTION_TYPE.CREDIT_WITHDRAWAL) {
-    if (parseFloat(targetUser.credit_balance) < txAmount) {
-      return sendError(res, 'Insufficient credit balance', 400);
-    }
+    if (parseFloat(targetUser.credit_balance) < txAmount) return sendError(res, 'Insufficient credit balance', 400);
     await targetUser.update({ credit_balance: parseFloat(targetUser.credit_balance) - txAmount });
   } else {
     return sendError(res, 'Invalid transaction type', 400);
@@ -244,7 +384,7 @@ async function processCreditTransaction(req, res) {
     to_user_id: targetUser.id,
     type,
     amount: txAmount,
-    description,
+    description: description || `Credit ${type} by ${currentUser.username}`,
     status: 'completed',
   });
 
@@ -252,6 +392,7 @@ async function processCreditTransaction(req, res) {
     User.findByPk(targetUser.id, { attributes: { exclude: ['password'] } }),
     User.findByPk(currentUser.id, { attributes: { exclude: ['password'] } }),
   ]);
+
   return sendSuccess(res, {
     user: updatedTarget,
     newCreditBalance: parseFloat(updatedTarget.credit_balance),
@@ -279,15 +420,8 @@ async function getUserTransactions(req, res) {
 }
 
 module.exports = {
-  listUsers,
-  listByRole,
-  createUser,
-  getMe,
-  getDownline,
-  getUser,
-  updateUser,
-  deleteUser,
-  processTransaction,
-  processCreditTransaction,
-  getUserTransactions,
+  listUsers, listByRole, createUser, getMe, getDownline,
+  getUser, updateUser, deleteUser,
+  processTransaction, processCreditTransaction, getUserTransactions,
+  getDashboardStats, getAllBalances, getActivityLog, getAllTransactions,
 };
