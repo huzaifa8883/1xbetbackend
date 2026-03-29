@@ -214,6 +214,40 @@ async function triggerAutoMatch(req, res) {
   return sendSuccess(res, { selections: unique.length }, `Auto-match triggered for ${unique.length} selections`);
 }
 
+/* ── GET /api/v1/orders/event ────────────────────────────── */
+/* bundle0a.js calls: ?eventId=xxx&marketId=xxx&maxResults=N&token=xxx */
+async function getOrdersByEvent(req, res) {
+  const { marketId, maxResults } = req.query;
+  const userId = req.user.id;
+
+  const where = { user_id: userId };
+  if (marketId && marketId !== 'undefined') where.market_id = marketId;
+
+  const limit = parseInt(maxResults, 10);
+
+  const orders = await Order.findAll({
+    where,
+    order: [['created_at', 'DESC']],
+    ...(limit > 0 ? { limit } : {}),
+  });
+
+  // Format response to match legacy bfexch bundle expectations
+  const formatted = orders.map((o) => ({
+    id: String(o.request_id),
+    marketId: o.market_id,
+    selectionId: String(o.selection_id),
+    eventName: o.event_name || '',
+    side: o.side,
+    price: parseFloat(o.price),
+    size: parseFloat(o.size),
+    matched: parseFloat(o.matched),
+    status: o.status,
+    placedDate: o.created_at,
+  }));
+
+  return sendSuccess(res, { orders: formatted });
+}
+
 module.exports = {
   placeBets,
   getPendingOrders,
@@ -222,4 +256,5 @@ module.exports = {
   cancelOrder,
   cancelAllPendingOrders,
   triggerAutoMatch,
+  getOrdersByEvent,
 };
