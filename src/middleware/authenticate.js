@@ -13,12 +13,12 @@ const logger = require('../utils/logger');
  */
 function authenticate(requiredRole = null) {
   return (req, res, next) => {
-    // Accept token from Authorization header OR ?token= query param (for bundle0a.js compatibility)
+    // Accept token from Authorization header OR ?token= query param (bundle0a.js / mv2.min.js compat)
     const authHeader = req.headers['authorization'];
     let token;
     if (authHeader && authHeader.startsWith('Bearer ')) {
       token = authHeader.slice(7);
-    } else if (req.query.token) {
+    } else if (req.query.token && req.query.token !== 'undefined') {
       token = req.query.token;
     } else {
       return sendError(res, 'Authentication token missing', 401);
