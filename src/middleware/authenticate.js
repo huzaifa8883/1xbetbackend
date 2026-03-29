@@ -13,12 +13,16 @@ const logger = require('../utils/logger');
  */
 function authenticate(requiredRole = null) {
   return (req, res, next) => {
+    // Accept token from Authorization header OR ?token= query param (for bundle0a.js compatibility)
     const authHeader = req.headers['authorization'];
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    let token;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.slice(7);
+    } else if (req.query.token) {
+      token = req.query.token;
+    } else {
       return sendError(res, 'Authentication token missing', 401);
     }
-
-    const token = authHeader.slice(7);
 
     try {
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
