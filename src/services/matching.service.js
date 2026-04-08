@@ -1,130 +1,102 @@
 'use strict';
 
-/**
- * Pure matching-engine logic.
- * Determines whether an order should be MATCHED and at what price.
- */
+const { BET_SIDE } = require('../config/constants');
 
-const { BET_SIDE, ORDER_STATUS } = require('../config/constants');
+/* ── Liability for a single bet ─────────────────────────── */
+function calculateLiability(bet) {
+  const price = parseFloat(bet.price);
+  const size  = parseFloat(bet.size);
+  if (bet.side === BET_SIDE.BACK) return size;           // BACK: stake
+  return (price - 1) * size;                             // LAY: (price-1)*stake
+}
 
-/**
- * @typedef {{ matchedSize: number, status: string, executedPrice: number }} MatchResult
- */
-
-/**
- * Evaluate a single order against live Betfair runner data.
- *
- * @param {Object} order         - The bet order (price, size, side)
- * @param {Object} runner        - Betfair runner book (ex.availableToBack, ex.availableToLay)
- * @returns {MatchResult}
- */
+/* ── evaluateMatch (aka checkMatch from orders.js) ──────── */
 function evaluateMatch(order, runner) {
+  let matchedSize  = 0;
+  let status       = 'PENDING';
+  let executedPrice = parseFloat(order.price);
+
   const backs = runner.ex?.availableToBack || [];
-  const lays = runner.ex?.availableToLay || [];
+  const lays  = runner.ex?.availableToLay  || [];
   const selectedPrice = Number(order.price);
 
-  /* ── BACK bet ──────────────────────────────────────────── */
   if (order.side === BET_SIDE.BACK || order.type === 'BACK') {
-    if (!backs.length) return _pending(order);
+    if (!backs.length) return { matchedSize, status, executedPrice };
+    const prices      = backs.map(b => b.price);
+    const highestBack = Math.max(...prices);
+    const lowestBack  = Math.min(...prices);
 
-    const prices = backs.map((b) => b.price);
-    const highest = Math.max(...prices);
-    const lowest = Math.min(...prices);
-
-    if (selectedPrice <= highest) {
-      return { matchedSize: order.size, status: ORDER_STATUS.MATCHED, executedPrice: highest };
+    // Rule 1: selected ≤ lowest → MATCHED at highest back
+    // Rule 2: selected > highest → PENDING
+    // Rule 3: between → MATCHED at highest back
+    if (selectedPrice > highestBack) {
+      status = 'PENDING';
+    } else {
+      executedPrice = highestBack;
+      matchedSize   = parseFloat(order.size);
+      status        = 'MATCHED';
     }
-    if (selectedPrice <= lowest || selectedPrice <= highest) {
-      return { matchedSize: order.size, status: ORDER_STATUS.MATCHED, executedPrice: highest };
-    }
-    return _pending(order);
-  }
+  } else if (order.side === BET_SIDE.LAY || order.type === 'LAY') {
+    if (!lays.length) return { matchedSize, status, executedPrice };
+    const prices     = lays.map(l => l.price);
+    const lowestLay  = Math.min(...prices);
+    const highestLay = Math.max(...prices);
 
-  /* ── LAY bet ───────────────────────────────────────────── */
-  if (order.side === BET_SIDE.LAY || order.type === 'LAY') {
-    if (!lays.length) return _pending(order);
-
-    const prices = lays.map((l) => l.price);
-    const lowest = Math.min(...prices);
-
-    if (selectedPrice >= lowest) {
-      return { matchedSize: order.size, status: ORDER_STATUS.MATCHED, executedPrice: lowest };
-    }
-    return _pending(order);
-  }
-
-  return _pending(order);
-}
-
-/**
- * Calculate the liability for an order.
- * Back bet → stake; Lay bet → (price - 1) × stake.
- */
-function calculateLiability(order) {
-  const price = Number(order.price);
-  const size = Number(order.size);
-  return order.side === BET_SIDE.BACK ? size : (price - 1) * size;
-}
-
-/**
- * Compute per-runner P&L across all active orders for one market.
- *
- * Returns an object: { [selectionId]: netPnl }
- */
-function computeRunnerPnL(orders) {
-  const selections = [...new Set(orders.map((o) => String(o.selection_id)))];
-  const pnl = {};
-  for (const s of selections) pnl[s] = 0;
-
-  for (const bet of orders) {
-    const sel = String(bet.selection_id);
-    const price = Number(bet.price);
-    const size = Number(bet.status === ORDER_STATUS.MATCHED ? (bet.matched || bet.size) : bet.size);
-
-    if (bet.side === BET_SIDE.BACK) {
-      pnl[sel] += (price - 1) * size;
-      selections.forEach((s) => { if (s !== sel) pnl[s] -= size; });
-    } else if (bet.side === BET_SIDE.LAY) {
-      pnl[sel] -= (price - 1) * size;
-      selections.forEach((s) => { if (s !== sel) pnl[s] += size; });
+    // Rule 1: selected ≥ highest → MATCHED at lowest lay
+    // Rule 2: selected < lowest  → PENDING
+    // Rule 3: between → MATCHED at lowest lay
+    if (selectedPrice < lowestLay) {
+      status = 'PENDING';
+    } else {
+      executedPrice = lowestLay;
+      matchedSize   = parseFloat(order.size);
+      status        = 'MATCHED';
     }
   }
 
-  return pnl;
+  return { matchedSize, status, executedPrice };
 }
 
-/**
- * Total liability across multiple markets.
- * Uses MAX-liability logic for multi-runner markets, SUM for single-runner.
- *
- * @param {Array}  activeOrders   - PENDING + MATCHED orders
- * @returns {number}              - Total liability amount
- */
-function computeTotalLiability(activeOrders) {
-  const byMarket = {};
-  for (const o of activeOrders) {
-    if (!byMarket[o.market_id]) byMarket[o.market_id] = [];
-    byMarket[o.market_id].push(o);
+/* ── computeTotalLiability (green-book + pending) ───────── */
+// Exact port of recalculateUserLiableAndPnL logic from orders.js
+function computeTotalLiability(orders) {
+  const matched = orders.filter(o => o.status === 'MATCHED');
+  const pending = orders.filter(o => o.status === 'PENDING');
+
+  let totalLiability = 0;
+
+  // --- MATCHED: market-wise green-book ---
+  const markets = [...new Set(matched.map(o => o.market_id || o.marketId))];
+  for (const marketId of markets) {
+    const marketOrders = matched.filter(o => (o.market_id || o.marketId) === marketId);
+    let globalPnL = 0;
+    const runnerAdj = {};
+
+    for (const bet of marketOrders) {
+      const sel   = String(bet.selection_id || bet.selectionId);
+      const price = Number(bet.price);
+      const size  = Number(bet.matched || bet.size);
+
+      if (bet.side === BET_SIDE.BACK) {
+        globalPnL -= size;
+        runnerAdj[sel] = (runnerAdj[sel] || 0) + price * size;
+      } else {
+        globalPnL += size;
+        runnerAdj[sel] = (runnerAdj[sel] || 0) - price * size;
+      }
+    }
+
+    const potentials = [globalPnL, ...Object.values(runnerAdj).map(adj => globalPnL + adj)];
+    const minPnL     = Math.min(...potentials);
+    totalLiability  += minPnL < 0 ? Math.abs(minPnL) : 0;
   }
 
-  let total = 0;
-  for (const [, orders] of Object.entries(byMarket)) {
-    const pnl = computeRunnerPnL(orders);
-    const losses = Object.values(pnl).filter((v) => v < 0).map(Math.abs);
-
-    if (losses.length === 0) continue;
-
-    // Single runner → sum; Multi runner → max
-    const uniqueSel = new Set(orders.map((o) => String(o.selection_id)));
-    const liability = uniqueSel.size === 1 ? losses.reduce((a, b) => a + b, 0) : Math.max(...losses);
-    total += liability;
+  // --- PENDING: simple sum ---
+  for (const bet of pending) {
+    totalLiability += calculateLiability(bet);
   }
-  return total;
+
+  return totalLiability;
 }
 
-/* ── Private helpers ─────────────────────────────────────── */
-function _pending(order) {
-  return { matchedSize: 0, status: ORDER_STATUS.PENDING, executedPrice: Number(order.price) };
-}
-
-module.exports = { evaluateMatch, calculateLiability, computeRunnerPnL, computeTotalLiability };
+module.exports = { calculateLiability, evaluateMatch, computeTotalLiability };
