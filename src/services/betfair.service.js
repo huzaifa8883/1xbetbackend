@@ -2,186 +2,108 @@
 
 const axios = require('axios');
 const logger = require('../utils/logger');
+
+const APP_KEY  = process.env.BETFAIR_APP_KEY;
+const USERNAME = process.env.BETFAIR_USERNAME;
+const PASSWORD = process.env.BETFAIR_PASSWORD;
+const LOGIN_URL  = process.env.BETFAIR_LOGIN_URL  || 'https://identitysso.betfair.com/api/login';
+const API_URL    = process.env.BETFAIR_API_URL     || 'https://api.betfair.com/exchange/betting/json-rpc/v1';
+const TTL_MS     = parseInt(process.env.BETFAIR_SESSION_TTL_MINUTES || '29', 10) * 60 * 1000;
+
 const { SPORT_MAP } = require('../config/constants');
 
-const {
-  BETFAIR_APP_KEY: APP_KEY,
-  BETFAIR_USERNAME: USERNAME,
-  BETFAIR_PASSWORD: PASSWORD,
-  BETFAIR_LOGIN_URL,
-  BETFAIR_API_URL,
-  BETFAIR_SESSION_TTL_MINUTES,
-} = process.env;
-
-const SESSION_TTL_MS = (parseInt(BETFAIR_SESSION_TTL_MINUTES || '29', 10)) * 60 * 1000;
-
-let _sessionToken = null;
-let _tokenExpiry = 0;
-
-/* ── Session / Auth ─────────────────────────────────────── */
+/* ── Session cache ──────────────────────────────────────── */
+let cachedToken = null;
+let tokenExpiry = null;
 
 async function getSessionToken() {
-  if (_sessionToken && Date.now() < _tokenExpiry) return _sessionToken;
+  if (cachedToken && tokenExpiry && Date.now() < tokenExpiry) return cachedToken;
 
-  const response = await axios.post(
-    BETFAIR_LOGIN_URL || 'https://identitysso.betfair.com/api/login',
+  const res = await axios.post(
+    LOGIN_URL,
     new URLSearchParams({ username: USERNAME, password: PASSWORD }),
-    {
-      headers: {
-        'X-Application': APP_KEY,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-    },
+    { headers: { 'X-Application': APP_KEY, 'Content-Type': 'application/x-www-form-urlencoded' } }
   );
 
-  if (response.data?.status !== 'SUCCESS') {
-    throw new Error(`Betfair login failed: ${response.data?.error}`);
-  }
+  if (res.data.status !== 'SUCCESS') throw new Error(`Betfair login failed: ${res.data.error}`);
 
-  _sessionToken = response.data.token;
-  _tokenExpiry = Date.now() + SESSION_TTL_MS;
-  logger.info('Betfair session token refreshed');
-  return _sessionToken;
+  cachedToken  = res.data.token;
+  tokenExpiry  = Date.now() + TTL_MS;
+  logger.info('Betfair: new session token generated');
+  return cachedToken;
 }
 
-/* ── Core JSON-RPC helper ───────────────────────────────── */
-
-async function betfairRpc(method, params) {
+/* ── Generic JSON-RPC call ──────────────────────────────── */
+async function jsonRpc(method, params) {
   const token = await getSessionToken();
-  const payload = [{ jsonrpc: '2.0', method, params, id: 1 }];
-
-  const response = await axios.post(
-    BETFAIR_API_URL || 'https://api.betfair.com/exchange/betting/json-rpc/v1',
-    payload,
-    {
-      headers: {
-        'X-Application': APP_KEY,
-        'X-Authentication': token,
-        'Content-Type': 'application/json',
-      },
-    },
-  );
-
-  const result = response.data?.[0]?.result;
-  if (!result) throw new Error(`Betfair RPC empty result for method: ${method}`);
+  const body  = [{ jsonrpc: '2.0', method, params, id: 1 }];
+  const resp  = await axios.post(API_URL, body, {
+    headers: { 'X-Application': APP_KEY, 'X-Authentication': token, 'Content-Type': 'application/json' }
+  });
+  const result = resp.data[0]?.result;
+  if (!result) throw new Error(`No result from Betfair: ${method}`);
   return result;
 }
 
-/* ── Public helpers ─────────────────────────────────────── */
+/* ── Public helpers ──────────────────────────────────────── */
 
-/**
- * Fetch live market book for given market IDs.
- */
-async function listMarketBook(marketIds, priceData = ['EX_BEST_OFFERS']) {
-  return betfairRpc('SportsAPING/v1.0/listMarketBook', {
-    marketIds,
-    priceProjection: { priceData, virtualise: true },
-  });
+async function listEventTypes(filter = {}) {
+  return jsonRpc('SportsAPING/v1.0/listEventTypes', { filter });
 }
 
-/**
- * Fetch market catalogue for given market IDs.
- */
-async function listMarketCatalogue(filter, maxResults = '20', marketProjection = ['EVENT', 'EVENT_TYPE', 'RUNNER_METADATA']) {
-  return betfairRpc('SportsAPING/v1.0/listMarketCatalogue', {
-    filter,
-    maxResults,
-    marketProjection,
-  });
+async function listCompetitions(filter = {}) {
+  return jsonRpc('SportsAPING/v1.0/listCompetitions', { filter });
 }
 
-/**
- * Fetch events matching a filter.
- */
-async function listEvents(filter) {
-  return betfairRpc('SportsAPING/v1.0/listEvents', { filter });
+async function listEvents(filter = {}) {
+  return jsonRpc('SportsAPING/v1.0/listEvents', { filter });
 }
 
-/**
- * Fetch competitions matching a filter.
- */
-async function listCompetitions(filter) {
-  return betfairRpc('SportsAPING/v1.0/listCompetitions', { filter });
+async function listMarketCatalogue(filter = {}, maxResults = '20', marketProjection = ['EVENT', 'RUNNER_METADATA']) {
+  return jsonRpc('SportsAPING/v1.0/listMarketCatalogue', { filter, maxResults: String(maxResults), marketProjection });
 }
 
-/**
- * Fetch event types (top-level sports).
- */
-async function listEventTypes() {
-  return betfairRpc('SportsAPING/v1.0/listEventTypes', { filter: {} });
+async function listMarketBook(marketIds = [], priceProjection = { priceData: ['EX_BEST_OFFERS'], virtualise: true }) {
+  return jsonRpc('SportsAPING/v1.0/listMarketBook', { marketIds, priceProjection });
 }
 
-/**
- * Get event name and sport category for a single marketId.
- */
+/* ── getEventDetails (orders.js compatible) ─────────────── */
 async function getEventDetails(marketId) {
   try {
-    const [market] = await listMarketCatalogue(
-      { marketIds: [marketId] },
-      '1',
-      ['EVENT', 'EVENT_TYPE'],
+    const results = await listMarketCatalogue(
+      { marketIds: [marketId] }, '1', ['EVENT', 'EVENT_TYPE']
     );
-
+    const market = results?.[0];
     if (!market?.event) return { eventName: 'Unknown Event', category: 'Other' };
-
-    const eventName = market.event.name;
-    const eventTypeId = String(market.eventType?.id ?? '');
-    const category = SPORT_MAP[eventTypeId] || market.eventType?.name || 'Other';
-
-    return { eventName, category };
+    const eventTypeId = String(market.eventType?.id || '');
+    const category    = SPORT_MAP[eventTypeId] || market.eventType?.name || 'Other';
+    return { eventName: market.event.name, category };
   } catch (err) {
-    logger.warn(`getEventDetails(${marketId}): ${err.message}`);
+    logger.warn(`getEventDetails failed for ${marketId}: ${err.message}`);
     return { eventName: 'Unknown Event', category: 'Other' };
   }
 }
 
-/**
- * Get runner data for a single selection in a market.
- */
+/* ── getRunnerBook (orders.js compatible) ───────────────── */
 async function getRunnerBook(marketId, selectionId) {
   try {
     const books = await listMarketBook([marketId]);
-    const runner = books?.[0]?.runners?.find((r) => r.selectionId === selectionId);
+    if (!books?.length) return null;
+    const runner = books[0].runners?.find(r => r.selectionId === Number(selectionId));
     return runner || null;
   } catch (err) {
-    logger.warn(`getRunnerBook(${marketId}, ${selectionId}): ${err.message}`);
+    logger.warn(`getRunnerBook failed for ${marketId}/${selectionId}: ${err.message}`);
     return null;
   }
 }
 
-/**
- * Fetch full market details (catalogue + book) for a list of market IDs.
- */
-async function getMarketsWithDetails(marketIds) {
-  if (!marketIds.length) return [];
-
-  const [books, catalogues] = await Promise.all([
-    listMarketBook(marketIds).catch(() => []),
-    listMarketCatalogue({ marketIds }, String(marketIds.length), ['EVENT', 'EVENT_TYPE']).catch(() => []),
-  ]);
-
-  return books.map((book) => {
-    const cat = catalogues.find((c) => c.marketId === book.marketId);
-    const eventTypeId = String(cat?.eventType?.id ?? '');
-    return {
-      marketId: book.marketId,
-      status: book.status,
-      inPlay: book.inPlay || false,
-      runners: book.runners || [],
-      eventName: cat?.event?.name || 'Unknown',
-      category: SPORT_MAP[eventTypeId] || cat?.eventType?.name || 'Other',
-    };
-  });
-}
-
 module.exports = {
   getSessionToken,
-  listMarketBook,
-  listMarketCatalogue,
-  listEvents,
-  listCompetitions,
-  listEventTypes,
   getEventDetails,
   getRunnerBook,
-  getMarketsWithDetails,
+  listEventTypes,
+  listCompetitions,
+  listEvents,
+  listMarketCatalogue,
+  listMarketBook,
 };
