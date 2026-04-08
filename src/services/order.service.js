@@ -1,67 +1,99 @@
 'use strict';
 
-const { sequelize } = require('../config/database');
-const { User, Order, Transaction } = require('../models');
-const { ORDER_STATUS, TRANSACTION_TYPE, BET_SIDE } = require('../config/constants');
-const { evaluateMatch, calculateLiability, computeTotalLiability } = require('./matching.service');
-const { getRunnerBook, getEventDetails, getMarketsWithDetails } = require('./betfair.service');
-const logger = require('../utils/logger');
 const { Op } = require('sequelize');
+const { User, Order, Transaction } = require('../models');
+const { getRunnerBook } = require('./betfair.service');
+const { evaluateMatch, calculateLiability, computeTotalLiability } = require('./matching.service');
+const { ORDER_STATUS, TRANSACTION_TYPE, BET_SIDE } = require('../config/constants');
+const logger = require('../utils/logger');
 
-/* ── Liability Recalculation ─────────────────────────────── */
-
-/**
- * Recalculate total liability for a user based on all PENDING/MATCHED orders,
- * then update wallet_balance and liable fields accordingly.
- */
+/* ── recalculateLiability ────────────────────────────────── */
+// Direct port of recalculateUserLiableAndPnL from orders.js
 async function recalculateLiability(userId) {
-  const t = await sequelize.transaction();
-  try {
-    const user = await User.findByPk(userId, {
-      include: [{ model: Order, as: 'orders', where: { status: [ORDER_STATUS.PENDING, ORDER_STATUS.MATCHED] }, required: false }],
-      lock: t.LOCK.UPDATE,
-      transaction: t,
-    });
+  const user = await User.findByPk(userId);
+  if (!user) return null;
 
-    if (!user) { await t.rollback(); return; }
+  const allOrders = await Order.findAll({
+    where: { user_id: userId, status: { [Op.in]: [ORDER_STATUS.PENDING, ORDER_STATUS.MATCHED] } },
+    raw: true,
+  });
 
-    const activeOrders = user.orders || [];
-    const newLiability = activeOrders.length ? computeTotalLiability(activeOrders.map((o) => o.toJSON())) : 0;
-    const oldLiability = parseFloat(user.liable) || 0;
-    const currentWallet = parseFloat(user.wallet_balance) || 0;
-    const newWallet = Math.max(0, currentWallet + oldLiability - newLiability);
+  const matched = allOrders.filter(o => o.status === ORDER_STATUS.MATCHED);
+  const pending = allOrders.filter(o => o.status === ORDER_STATUS.PENDING);
 
-    await user.update({ wallet_balance: newWallet, liable: newLiability }, { transaction: t });
-    await t.commit();
+  // Total funds invariant = wallet + current stored liability
+  const currentWallet    = parseFloat(user.wallet_balance) || 0;
+  const currentLiable    = parseFloat(user.liable) || 0;
+  const totalFunds       = currentWallet + currentLiable;
 
-    // Push real-time update via Socket.IO
-    if (global.io) {
-      global.io.to(`user_${userId}`).emit('userUpdated', {
-        wallet_balance: newWallet,
-        liable: newLiability,
-      });
+  let totalLiability = 0;
+  const combinedRunnerPnL = {};
+
+  // MATCHED: market-wise green-book
+  const markets = [...new Set(matched.map(o => o.market_id))];
+  for (const marketId of markets) {
+    const marketOrders = matched.filter(o => o.market_id === marketId);
+    let globalPnL = 0;
+    const runnerAdj = {};
+
+    for (const bet of marketOrders) {
+      const sel   = String(bet.selection_id);
+      const price = Number(bet.price);
+      const size  = Number(bet.matched || bet.size);
+
+      if (bet.side === BET_SIDE.BACK) {
+        globalPnL -= size;
+        runnerAdj[sel] = (runnerAdj[sel] || 0) + price * size;
+      } else {
+        globalPnL += size;
+        runnerAdj[sel] = (runnerAdj[sel] || 0) - price * size;
+      }
     }
-  } catch (err) {
-    await t.rollback();
-    logger.error(`recalculateLiability(${userId}): ${err.message}`);
+
+    const potentials = [globalPnL];
+    for (const [sel, adj] of Object.entries(runnerAdj)) {
+      const runnerFinal = globalPnL + adj;
+      potentials.push(runnerFinal);
+      combinedRunnerPnL[sel] = (combinedRunnerPnL[sel] || 0) + runnerFinal;
+    }
+
+    const minPnL = Math.min(...potentials);
+    totalLiability += minPnL < 0 ? Math.abs(minPnL) : 0;
   }
+
+  // PENDING: simple sum
+  for (const bet of pending) {
+    totalLiability += calculateLiability(bet);
+  }
+
+  const newWallet = Math.max(0, totalFunds - totalLiability);
+
+  await user.update({
+    wallet_balance: newWallet,
+    liable: totalLiability,
+    runner_pnl: combinedRunnerPnL,
+  });
+
+  const freshData = { wallet_balance: newWallet, liable: totalLiability, runner_pnl: combinedRunnerPnL };
+
+  if (global.io) {
+    global.io.to(`user_${userId}`).emit('userUpdated', freshData);
+  }
+
+  return freshData;
 }
 
-/* ── Auto-Matching ───────────────────────────────────────── */
-
-/**
- * Attempt to match PENDING bets for a market/selection against live Betfair odds.
- */
+/* ── autoMatchPendingBets ────────────────────────────────── */
 async function autoMatchPendingBets(marketId, selectionId) {
   try {
     const runner = await getRunnerBook(marketId, selectionId);
     if (!runner) return;
 
-    const pendingOrders = await Order.findAll({
+    const pending = await Order.findAll({
       where: { market_id: marketId, selection_id: selectionId, status: ORDER_STATUS.PENDING },
     });
 
-    for (const order of pendingOrders) {
+    for (const order of pending) {
       const { matchedSize, status, executedPrice } = evaluateMatch(order.toJSON(), runner);
 
       if (status === ORDER_STATUS.MATCHED) {
@@ -74,135 +106,98 @@ async function autoMatchPendingBets(marketId, selectionId) {
             order: order.toJSON(),
           });
         }
+
         logger.info(`Auto-matched order ${order.request_id} for user ${order.user_id}`);
       }
     }
   } catch (err) {
-    logger.error(`autoMatchPendingBets(${marketId}, ${selectionId}): ${err.message}`);
+    logger.error(`autoMatchPendingBets error: ${err.message}`);
   }
 }
 
-/* ── Settlement ──────────────────────────────────────────── */
-
-const settledMarketIds = new Set();
-
-/**
- * Settle all MATCHED bets for a closed market.
- */
-async function settleMarket(marketId, winningSelectionId) {
-  if (settledMarketIds.has(marketId)) return;
-  settledMarketIds.add(marketId);
-
-  const t = await sequelize.transaction();
-  try {
-    const matchedOrders = await Order.findAll({
-      where: { market_id: marketId, status: ORDER_STATUS.MATCHED },
-      transaction: t,
-    });
-
-    // Group by user
-    const byUser = {};
-    for (const o of matchedOrders) {
-      if (!byUser[o.user_id]) byUser[o.user_id] = [];
-      byUser[o.user_id].push(o);
-    }
-
-    for (const [userId, orders] of Object.entries(byUser)) {
-      let totalProfit = 0;
-      let totalLoss = 0;
-      let releasedLiability = 0;
-
-      for (const bet of orders) {
-        const price = Number(bet.price);
-        const size = Number(bet.size);
-        const liable = bet.side === BET_SIDE.BACK ? size : (price - 1) * size;
-        releasedLiability += liable;
-
-        if (String(bet.selection_id) === String(winningSelectionId)) {
-          totalProfit += bet.side === BET_SIDE.BACK ? (price - 1) * size : size;
-        } else {
-          totalLoss += bet.side === BET_SIDE.BACK ? size : (price - 1) * size;
-        }
-      }
-
-      const netChange = totalProfit - totalLoss;
-      const user = await User.findByPk(userId, { transaction: t });
-      const newWallet = Math.max(0, (parseFloat(user.wallet_balance) || 0) + releasedLiability + netChange);
-      const newLiable = Math.max(0, (parseFloat(user.liable) || 0) - releasedLiability);
-
-      await user.update({ wallet_balance: newWallet, liable: newLiable }, { transaction: t });
-
-      await Transaction.create({
-        user_id: userId,
-        type: TRANSACTION_TYPE.BET_SETTLEMENT,
-        amount: netChange,
-        description: `Settlement for market ${marketId}. Profit: ${totalProfit}, Loss: ${totalLoss}`,
-        status: 'completed',
-        reference_id: marketId,
-      }, { transaction: t });
-
-      // Mark bets as settled
-      await Order.update(
-        { status: ORDER_STATUS.SETTLED, settled_at: new Date() },
-        { where: { user_id: userId, market_id: marketId, status: ORDER_STATUS.MATCHED }, transaction: t },
-      );
-
-      if (global.io) {
-        global.io.to(`user_${userId}`).emit('userUpdated', { wallet_balance: newWallet, liable: newLiable });
-      }
-    }
-
-    await t.commit();
-    logger.info(`Market ${marketId} settled. Winner: ${winningSelectionId}`);
-  } catch (err) {
-    await t.rollback();
-    settledMarketIds.delete(marketId); // allow retry
-    logger.error(`settleMarket(${marketId}): ${err.message}`);
-  }
-}
-
-/* ── Market Update Job helper ────────────────────────────── */
-
-/**
- * Pull all active market IDs from the DB, check their status on Betfair,
- * trigger settlement for CLOSED markets, and auto-match pending bets.
- */
-async function updateActiveMarkets() {
-  const activeOrders = await Order.findAll({
-    attributes: ['market_id', 'selection_id'],
-    where: { status: [ORDER_STATUS.PENDING, ORDER_STATUS.MATCHED] },
-    raw: true,
+/* ── settleEventBets ──────────────────────────────────────── */
+// winningSelectionId — string or number of the winning runner
+async function settleEventBets(marketId, winningSelectionId) {
+  const matchedOrders = await Order.findAll({
+    where: { market_id: marketId, status: ORDER_STATUS.MATCHED },
   });
 
-  if (!activeOrders.length) return;
+  if (!matchedOrders.length) return;
 
-  const uniqueMarketIds = [...new Set(activeOrders.map((o) => o.market_id))];
-  const markets = await getMarketsWithDetails(uniqueMarketIds);
+  // Group by user
+  const byUser = {};
+  for (const o of matchedOrders) {
+    const uid = String(o.user_id);
+    (byUser[uid] = byUser[uid] || []).push(o);
+  }
 
-  for (const market of markets) {
-    if (market.status === 'CLOSED') {
-      const winner = market.runners?.find((r) => r.status === 'WINNER');
-      if (winner) await settleMarket(market.marketId, winner.selectionId);
+  for (const [userId, bets] of Object.entries(byUser)) {
+    const user = await User.findByPk(userId);
+    if (!user) continue;
+
+    let totalProfit  = 0;
+    let totalLoss    = 0;
+    let totalRelease = 0;
+
+    for (const bet of bets) {
+      const price = Number(bet.price);
+      const size  = Number(bet.size);
+      const liable = bet.side === BET_SIDE.BACK ? size : (price - 1) * size;
+      totalRelease += liable;
+
+      const isWinner = String(bet.selection_id) === String(winningSelectionId);
+      if (isWinner) {
+        if (bet.side === BET_SIDE.BACK) totalProfit += (price - 1) * size;
+        else totalProfit += size;
+      } else {
+        if (bet.side === BET_SIDE.BACK) totalLoss += size;
+        else totalLoss += (price - 1) * size;
+      }
     }
-  }
 
-  // Auto-match pending bets per selection
-  const selectionPairs = activeOrders
-    .filter((o) => o.status === ORDER_STATUS.PENDING)
-    .map((o) => ({ marketId: o.market_id, selectionId: o.selection_id }));
+    const netChange    = totalProfit - totalLoss;
+    const walletBefore = parseFloat(user.wallet_balance) || 0;
+    const liableBefore = parseFloat(user.liable) || 0;
+    let newWallet = Math.max(0, walletBefore + totalRelease + netChange);
 
-  const unique = [...new Map(selectionPairs.map((p) => [`${p.marketId}_${p.selectionId}`, p])).values()];
+    await user.update({
+      wallet_balance: newWallet,
+      liable: Math.max(0, liableBefore - totalRelease),
+    });
 
-  for (const { marketId, selectionId } of unique) {
-    await autoMatchPendingBets(marketId, selectionId).catch((e) =>
-      logger.error(`autoMatch error: ${e.message}`),
+    await Transaction.create({
+      user_id: userId,
+      type: TRANSACTION_TYPE.BET_SETTLEMENT,
+      amount: netChange,
+      description: `Settlement for market ${marketId}`,
+      status: 'completed',
+      reference_id: String(marketId),
+    });
+
+    // Mark bets settled
+    await Order.update(
+      { status: ORDER_STATUS.SETTLED, settled_at: new Date() },
+      { where: { user_id: userId, market_id: marketId, status: ORDER_STATUS.MATCHED } }
     );
+
+    if (global.io) {
+      global.io.to(`user_${userId}`).emit('userUpdated', {
+        wallet_balance: newWallet,
+        profit: totalProfit,
+        loss: totalLoss,
+        net: netChange,
+      });
+    }
+
+    logger.info(`Settled bets for user ${userId}: profit=${totalProfit}, loss=${totalLoss}, net=${netChange}`);
   }
+
+  // Final recalculate for all affected users
+  for (const userId of Object.keys(byUser)) {
+    await recalculateLiability(userId);
+  }
+
+  logger.info(`Settlement complete for market: ${marketId}`);
 }
 
-module.exports = {
-  recalculateLiability,
-  autoMatchPendingBets,
-  settleMarket,
-  updateActiveMarkets,
-};
+module.exports = { recalculateLiability, autoMatchPendingBets, settleEventBets };
