@@ -41,4 +41,25 @@ async function saveLeagues(req, res) {
   return sendSuccess(res, { message: 'Saved successfully' });
 }
 
-module.exports = { getLeagues, saveLeagues };
+// GET /api/v1/settings/leagues/enabled/:sport
+// Dashboard call karta hai: sirf us sport ke enabledLeagueIds return karo
+async function getEnabledLeagues(req, res) {
+  const sport = req.params.sport;
+  if (!sport) return sendError(res, 'sport param required', 400);
+
+  const store = readStore();
+  const sportData = store[sport];
+
+  if (!sportData || !Array.isArray(sportData.enabledLeagueIds)) {
+    // Koi setting nahi → sab show karo (filter mat karo)
+    return sendSuccess(res, { sport, enabledLeagueIds: null, filterActive: false });
+  }
+
+  return sendSuccess(res, {
+    sport,
+    enabledLeagueIds: sportData.enabledLeagueIds,
+    filterActive: sportData.enabledLeagueIds.length > 0,
+  });
+}
+
+module.exports = { getLeagues, saveLeagues, getEnabledLeagues };
