@@ -361,8 +361,62 @@ async function getNavigation(req, res) {
   return sendSuccess(res, { requestId: uuidv4(), data: raw });
 }
 
+/* ── Admin: Betfair competitions & market types ─────────── */
+
+async function getBetfairCompetitions(req, res) {
+  const { eventTypeId } = req.query;
+  if (!eventTypeId) return sendError(res, 'eventTypeId query parameter is required', 400);
+
+  try {
+    const competitions = await listCompetitions({ eventTypeIds: [String(eventTypeId)] });
+    return sendSuccess(res, { competitions });
+  } catch (err) {
+    logger.error(`getBetfairCompetitions error: ${err.message}`);
+    return sendError(res, 'Failed to fetch competitions from Betfair', 500);
+  }
+}
+
+async function getBetfairMarketTypes(req, res) {
+  const { eventTypeId } = req.query;
+  if (!eventTypeId) return sendError(res, 'eventTypeId query parameter is required', 400);
+
+  try {
+    // listMarketTypes Betfair se available market types fetch karta hai
+    const now = new Date();
+    const to  = new Date(now.getTime() + 30 * 24 * 3600_000).toISOString(); // next 30 days
+
+    const events = await listEvents({
+      eventTypeIds: [String(eventTypeId)],
+      marketStartTime: { from: now.toISOString(), to },
+    });
+
+    if (!events.length) return sendSuccess(res, { marketTypes: [] });
+
+    const catalogues = await listMarketCatalogue(
+      { eventIds: events.slice(0, 20).map(e => e.event.id) },
+      '200',
+      ['MARKET_DESCRIPTION']
+    );
+
+    // Unique market types nikalo
+    const seen = new Set();
+    const marketTypes = [];
+    for (const m of catalogues) {
+      const t = m.description?.marketType || m.marketName;
+      if (t && !seen.has(t)) {
+        seen.add(t);
+        marketTypes.push({ marketType: t });
+      }
+    }
+
+    return sendSuccess(res, { marketTypes });
+  } catch (err) {
+    logger.error(`getBetfairMarketTypes error: ${err.message}`);
+    return sendError(res, 'Failed to fetch market types from Betfair', 500);
+  }
+}
 module.exports = {
   getLiveCricket, getLiveCricketInplay, getLiveFootball,
   getLiveTennis, getLiveHorse, getLiveGreyhound,
-  getLiveSport, getMarketData, getMarketCatalog2, getNavigation,
+  getLiveSport, getMarketData, getMarketCatalog2, getNavigation,  getBetfairCompetitions, getBetfairMarketTypes,
 };
