@@ -32,12 +32,41 @@ async function getLeagues(req, res) {
 }
 
 async function saveLeagues(req, res) {
-  const payload = req.body;  // { cricket: { enabledLeagueIds: [...], leagues: [...] }, ... }
+  const payload = req.body;
   if (!payload || typeof payload !== 'object') {
     return sendError(res, 'Invalid payload', 400);
   }
   writeStore(payload);
-  logger.info('League settings saved');
+
+  // ✅ SportConfig DB bhi update karo taake fetchSportMarkets kaam kare
+  const { SportConfig } = require('../models');
+
+  // Admin sport key → market controller sport key mapping
+  const SPORT_KEY_MAP = {
+    cricket:      'cricket',
+    football:     'football',
+    tennis:       'tennis',
+    horse_racing: 'horse',
+    greyhounds:   'greyhound',
+  };
+
+  try {
+    for (const [adminKey, ids] of Object.entries(payload)) {
+      const sportKey = SPORT_KEY_MAP[adminKey] || adminKey;
+      const competitionIds = (ids.enabledLeagueIds || []).join(',');
+
+      await SportConfig.upsert({
+        sport_key:              sportKey,
+        allowed_competition_ids: competitionIds || null,
+        is_active:              true,
+      });
+    }
+    logger.info('League settings saved + SportConfig updated');
+  } catch (e) {
+    logger.error('SportConfig update error: ' + e.message);
+    // JSON file save ho gayi, DB update fail hua — partial success
+  }
+
   return sendSuccess(res, { message: 'Saved successfully' });
 }
 
