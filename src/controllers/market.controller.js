@@ -78,7 +78,7 @@ async function fetchSportMarkets(sportKey, eventTypeId, overrides = {}) {
     marketTypeCodes: marketTypes,
   };
 
-  const catalogues = await listMarketCatalogue(catalogueFilter, maxResults, ['EVENT', 'RUNNER_METADATA']);
+  const catalogues = await listMarketCatalogue(catalogueFilter, maxResults, ['EVENT', 'RUNNER_METADATA', 'COMPETITION']);
   if (!catalogues.length) return [];
 
   // Chunk books (Betfair max 200 per request)
@@ -95,13 +95,15 @@ async function fetchSportMarkets(sportKey, eventTypeId, overrides = {}) {
     const book  = allBooks.find(b => b.marketId === market.marketId);
     const event = events.find(e => e.event.id === market.event?.id);
     return {
-      marketId:      market.marketId,
-      match:         event?.event.name || market.marketName || 'Unknown',
-      startTime:     event?.event.openDate || '',
-      marketStatus:  book?.status || 'UNKNOWN',
-      inPlay:        book?.inPlay || false,
-      totalMatched:  book?.totalMatched || 0,
-      runners:       buildOddsPayload(market.runners || [], book),
+      marketId:       market.marketId,
+      match:          event?.event.name || market.marketName || 'Unknown',
+      startTime:      event?.event.openDate || '',
+      marketStatus:   book?.status || 'UNKNOWN',
+      inPlay:         book?.inPlay || false,
+      totalMatched:   book?.totalMatched || 0,
+      runners:        buildOddsPayload(market.runners || [], book),
+      competitionId:  market.competition?.id   || null,
+      competitionName: market.competition?.name || null,
     };
   }).sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
 }
@@ -150,19 +152,21 @@ async function getLiveTennis(req, res) {
   if (!eventIds.length) return sendSuccess(res, []);
 
   const marketTypes = (cfg?.market_types ?? 'MATCH_ODDS').split(',').map(s => s.trim());
-  const catalogues = await listMarketCatalogue({ eventIds, marketTypeCodes: marketTypes }, maxResults, ['EVENT', 'RUNNER_METADATA']);
+  const catalogues = await listMarketCatalogue({ eventIds, marketTypeCodes: marketTypes }, maxResults, ['EVENT', 'RUNNER_METADATA', 'COMPETITION']);
   const books = await listMarketBook(catalogues.map(m => m.marketId));
 
   const data = catalogues.map(market => {
     const book  = books.find(b => b.marketId === market.marketId);
     const event = events.find(e => e.event.id === market.event?.id);
     return {
-      marketId:     market.marketId,
-      match:        event?.event.name || 'Unknown',
-      startTime:    event?.event.openDate || '',
-      inPlay:       book?.inPlay || false,
-      totalMatched: book?.totalMatched || 0,
-      runners:      buildOddsPayload(market.runners || [], book),
+      marketId:        market.marketId,
+      match:           event?.event.name || 'Unknown',
+      startTime:       event?.event.openDate || '',
+      inPlay:          book?.inPlay || false,
+      totalMatched:    book?.totalMatched || 0,
+      runners:         buildOddsPayload(market.runners || [], book),
+      competitionId:   market.competition?.id   || null,
+      competitionName: market.competition?.name || null,
     };
   });
 
