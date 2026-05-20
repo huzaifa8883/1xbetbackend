@@ -66,5 +66,16 @@ router.get('/catalog2', ctrl.getMarketCatalog2);
  * @desc    Sports navigation tree (sports → competitions → events → markets)
  */
 router.get('/Navigation', ctrl.getNavigation);
+/**
+ * @route   GET /api/v1/markets/betfair/competitions?eventTypeId=<id>
+ * @desc    Betfair se live competitions (leagues) fetch karo
+ */
+router.get('/betfair/competitions', ctrl.getBetfairCompetitions);
+
+/**
+ * @route   GET /api/v1/markets/betfair/market-types?eventTypeId=<id>
+ * @desc    Betfair se available market types fetch karo
+ */
+router.get('/betfair/market-types', ctrl.getBetfairMarketTypes);
 
 module.exports = router;
