@@ -51,15 +51,36 @@ async function saveLeagues(req, res) {
   };
 
   try {
+    const DEFAULTS_MAP = {
+      cricket:   { sport_name: 'Cricket',          event_type_id: '4',    max_results: 20, market_types: 'MATCH_ODDS', hours_ahead: 24 },
+      football:  { sport_name: 'Football',         event_type_id: '1',    max_results: 20, market_types: 'MATCH_ODDS', hours_ahead: 24 },
+      tennis:    { sport_name: 'Tennis',           event_type_id: '2',    max_results: 20, market_types: 'MATCH_ODDS', hours_ahead: 24 },
+      horse:     { sport_name: 'Horse Racing',     event_type_id: '7',    max_results: 100, market_types: 'WIN',        hours_ahead: 24 },
+      greyhound: { sport_name: 'Greyhound Racing', event_type_id: '4339', max_results: 100, market_types: 'WIN',        hours_ahead: 12 },
+    };
+
     for (const [adminKey, ids] of Object.entries(payload)) {
       const sportKey = SPORT_KEY_MAP[adminKey] || adminKey;
       const competitionIds = (ids.enabledLeagueIds || []).join(',');
 
-      await SportConfig.upsert({
-        sport_key:              sportKey,
-        allowed_competition_ids: competitionIds || null,
-        is_active:              true,
-      });
+      // Sirf allowed_competition_ids update karo — baaki fields (event_type_id, etc.) intact rahe
+      const [rowsUpdated] = await SportConfig.update(
+        { allowed_competition_ids: competitionIds || null },
+        { where: { sport_key: sportKey } }
+      );
+
+      if (rowsUpdated === 0) {
+        // Row exist nahi karti — defaults se create karo
+        const def = DEFAULTS_MAP[sportKey];
+        if (def) {
+          await SportConfig.create({
+            sport_key: sportKey,
+            ...def,
+            allowed_competition_ids: competitionIds || null,
+            is_active: true,
+          });
+        }
+      }
     }
     logger.info('League settings saved + SportConfig updated');
   } catch (e) {
