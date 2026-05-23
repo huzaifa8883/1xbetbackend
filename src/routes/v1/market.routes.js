@@ -2,7 +2,6 @@
 
 const { Router } = require('express');
 const ctrl = require('../../controllers/market.controller');
-
 const router = Router();
 
 /* ── Betfair live data (public) ──────────────────────────── */
@@ -33,7 +32,7 @@ router.get('/live/tennis', ctrl.getLiveTennis);
 
 /**
  * @route   GET /api/v1/markets/live/horse
- * @desc    US horse racing markets (past 6h → next 12h)
+ * @desc    Horse racing markets
  */
 router.get('/live/horse', ctrl.getLiveHorse);
 
@@ -45,19 +44,21 @@ router.get('/live/greyhound', ctrl.getLiveGreyhound);
 
 /**
  * @route   GET /api/v1/markets/live/sports/:id
- * @desc    Single market by ID or all sports markets (with optional ?eventTypeIds=)
+ * @desc    Single market by ID or all sports (with optional ?eventTypeIds=)
  */
 router.get('/live/sports/:id', ctrl.getLiveSport);
 
+/* ── Market detail endpoints ─────────────────────────────── */
+
 /**
  * @route   GET /api/v1/markets/Data?id=<marketId>
- * @desc    Formatted market book data (odds ladder format for frontend)
+ * @desc    Formatted market book (odds ladder for frontend)
  */
 router.get('/Data', ctrl.getMarketData);
 
 /**
  * @route   GET /api/v1/markets/catalog2?id=<marketId>
- * @desc    Full market catalogue details
+ * @desc    Full market catalogue details (used by market.html)
  */
 router.get('/catalog2', ctrl.getMarketCatalog2);
 
@@ -66,6 +67,37 @@ router.get('/catalog2', ctrl.getMarketCatalog2);
  * @desc    Sports navigation tree (sports → competitions → events → markets)
  */
 router.get('/Navigation', ctrl.getNavigation);
+
+/* ── NEW: All markets for a single event (match) ─────────── */
+
+/**
+ * @route   GET /api/v1/markets/event-markets?eventId=<eventId>
+ * @desc    Ek match ke SAARE Betfair markets ek saath:
+ *          Match Odds + Bookmaker + Toss + Fancy + Fancy2 + Figure + Others
+ *          market.html frontend isko use karta hai baaki tabs show karne ke liye.
+ *
+ * @example GET /api/v1/markets/event-markets?eventId=33271234
+ *
+ * Response:
+ * {
+ *   success: true,
+ *   data: {
+ *     matchOdds:  [ { marketId, marketName, marketType, runners:[...] } ],
+ *     bookmaker:  [ ... ],
+ *     toss:       [ ... ],
+ *     fancy:      [ ... ],
+ *     fancy2:     [ ... ],
+ *     figure:     [ ... ],
+ *     oddFigure:  [ ... ],
+ *     other:      [ ... ],
+ *     all:        [ ... ]   // flat list of all markets
+ *   }
+ * }
+ */
+router.get('/event-markets', ctrl.getEventMarkets);
+
+/* ── Admin: Betfair data for admin panel ─────────────────── */
+
 /**
  * @route   GET /api/v1/markets/betfair/competitions?eventTypeId=<id>
  * @desc    Betfair se live competitions (leagues) fetch karo
