@@ -316,13 +316,81 @@ async function getMarketCatalog2(req, res) {
     'Greyhound Racing': 'greyhound-racing.svg',
   };
 
+  const eventId = catalog.event?.id;
+
+  // ── subMarkets: same event ke SAARE baaki markets fetch karo ──
+  // mv2.min.js aur frontend dono isko use karte hain Toss/BM/Fancy tabs ke liye
+  let subMarkets = [];
+  if (eventId) {
+    try {
+      const allCatalogues = await listMarketCatalogue(
+        { eventIds: [String(eventId)] },
+        '200',
+        ['EVENT', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION', 'RUNNER_METADATA'],
+      );
+
+      // Main market ko exclude karo — woh pehle se load hai
+      const otherMarkets = allCatalogues.filter(m => m.marketId !== marketId);
+
+      if (otherMarkets.length > 0) {
+        // Inki books bhi fetch karo
+        const CHUNK = 200;
+        let subBooks = [];
+        const subIds = otherMarkets.map(m => m.marketId);
+        for (let i = 0; i < subIds.length; i += CHUNK) {
+          const chunk = await listMarketBook(subIds.slice(i, i + CHUNK)).catch(() => []);
+          subBooks = subBooks.concat(chunk);
+        }
+
+        subMarkets = otherMarkets.map(m => {
+          const b    = subBooks.find(bk => bk.marketId === m.marketId);
+          const mType = m.description?.marketType || '';
+          const mName = m.marketName || '';
+
+          // Category tag — mv2.min.js isko use karta hai filter karne ke liye
+          let category = 'other';
+          const t = mType.toUpperCase();
+          const n = mName.toLowerCase();
+          if (t === 'BOOKMAKER' || t === 'BOOKMAKER2' || n.includes('bookmaker')) category = 'bookmaker';
+          else if (t === 'TOSS' || n.includes('toss'))                             category = 'toss';
+          else if (t === 'FANCY2' || n.includes('fancy 2') || n.includes('fancy-2')) category = 'fancy2';
+          else if (t === 'FANCY' || t === 'INNINGS_RUNS' || t === 'SESSION_RUNS' ||
+                   n.includes('fancy') || n.includes('session') || n.includes('innings') || n.includes('over'))
+                                                                                    category = 'fancy';
+          else if (t === 'FIGURE' || n.includes('figure'))                          category = 'figure';
+          else if (t === 'ODD_FIGURE' || t === 'EVEN_ODD' || n.includes('even') || n.includes('odd figure'))
+                                                                                    category = 'oddFigure';
+
+          return {
+            marketId:    m.marketId,
+            marketName:  mName,
+            marketType:  mType,
+            category,
+            status:      b?.status      || 'OPEN',
+            status2:     null,
+            inPlay:      b?.inPlay      || false,
+            bettingType: m.description?.bettingType || 'ODDS',
+            maxBetSize:  b?.totalMatched || 0,
+            eventTypeId: m.eventType?.id || eventTypeId,
+            runners:     buildOddsPayload(m.runners || [], b),
+          };
+        });
+
+        logger.info(`getMarketCatalog2: found ${subMarkets.length} subMarkets for event ${eventId}`);
+      }
+    } catch (err) {
+      // subMarkets fail hone par main market response block nahi hona chahiye
+      logger.warn(`getMarketCatalog2 subMarkets fetch failed: ${err.message}`);
+    }
+  }
+
   return sendSuccess(res, {
     marketId:            catalog.marketId,
     marketName:          catalog.marketName,
     marketStartTime:     catalog.marketStartTime,
     eventTypeId,
     eventType:           sportName,
-    eventId:             catalog.event?.id,
+    eventId,
     eventName:           catalog.event?.name,
     competitionId:       catalog.competition?.id,
     status:              book.status,
@@ -337,6 +405,7 @@ async function getMarketCatalog2(req, res) {
       sortPriority: r.sortPriority,
       status:       'ACTIVE',
     })),
+    subMarkets,   // ← mv2.min.js aur frontend fallback dono yahan se markets lete hain
     updatedAt: new Date().toISOString(),
   });
 }
