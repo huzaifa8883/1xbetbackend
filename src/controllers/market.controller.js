@@ -126,7 +126,6 @@ async function getLiveFootball(req, res) {
 }
 
 async function getLiveTennis(req, res) {
-  // Tennis: filter out set/game markets
   const cfg = await getSportCfg('tennis');
   if (cfg && cfg.is_active === false) return sendSuccess(res, []);
 
@@ -195,7 +194,6 @@ async function getLiveGreyhound(req, res) {
       hoursAhead: 12,
     });
 
-    // Deduplicate
     const seen = new Set();
     const deduped = data.filter(d => {
       if (seen.has(d.marketId)) return false;
@@ -385,9 +383,8 @@ async function getBetfairMarketTypes(req, res) {
   if (!eventTypeId) return sendError(res, 'eventTypeId query parameter is required', 400);
 
   try {
-    // listMarketTypes Betfair se available market types fetch karta hai
     const now = new Date();
-    const to  = new Date(now.getTime() + 30 * 24 * 3600_000).toISOString(); // next 30 days
+    const to  = new Date(now.getTime() + 30 * 24 * 3600_000).toISOString();
 
     const events = await listEvents({
       eventTypeIds: [String(eventTypeId)],
@@ -402,7 +399,6 @@ async function getBetfairMarketTypes(req, res) {
       ['MARKET_DESCRIPTION']
     );
 
-    // Unique market types nikalo
     const seen = new Set();
     const marketTypes = [];
     for (const m of catalogues) {
@@ -419,8 +415,160 @@ async function getBetfairMarketTypes(req, res) {
     return sendError(res, 'Failed to fetch market types from Betfair', 500);
   }
 }
+
+/* ── NEW: All markets for a specific event ───────────────── */
+
+/**
+ * @route  GET /api/v1/markets/event-markets?eventId=<id>
+ * @desc   Ek event (match) ke SAARE available Betfair markets fetch karo.
+ *         Match Odds + Bookmaker + Toss + Fancy + etc. — sab ek saath.
+ *         market.html frontend isko use karta hai baaki tabs show karne ke liye.
+ */
+async function getEventMarkets(req, res) {
+  const { eventId } = req.query;
+  if (!eventId) return sendError(res, 'eventId query parameter is required', 400);
+
+  try {
+    // ── Step 1: Is event ke SAARE markets lo (koi marketType filter nahi) ──
+    const catalogues = await listMarketCatalogue(
+      { eventIds: [String(eventId)] },
+      '200',  // Betfair max 200
+      ['EVENT', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION', 'RUNNER_METADATA'],
+    );
+
+    if (!catalogues.length) {
+      return sendSuccess(res, {
+        matchOdds: [], bookmaker: [], toss: [],
+        fancy: [], fancy2: [], figure: [], oddFigure: [], other: [], all: [],
+      });
+    }
+
+    // ── Step 2: Saare market IDs ki books ek saath fetch karo ──
+    const allMarketIds = catalogues.map(m => m.marketId);
+    const CHUNK = 200;
+    let allBooks = [];
+    for (let i = 0; i < allMarketIds.length; i += CHUNK) {
+      const books = await listMarketBook(allMarketIds.slice(i, i + CHUNK)).catch(() => []);
+      allBooks = allBooks.concat(books);
+    }
+
+    // ── Step 3: Normalize — frontend jo shape expect karta hai ──
+    const normalized = catalogues.map(market => {
+      const book       = allBooks.find(b => b.marketId === market.marketId);
+      const marketType = market.description?.marketType || '';
+      const marketName = market.marketName || '';
+
+      return {
+        marketId:    market.marketId,
+        marketName,
+        marketType,
+        status:      book?.status      || 'OPEN',
+        status2:     null,
+        inPlay:      book?.inPlay      || false,
+        maxBetSize:  book?.totalMatched || 0,
+        bettingType: market.description?.bettingType || 'ODDS',
+        eventTypeId: market.eventType?.id || null,
+        runners:     buildOddsPayload(market.runners || [], book),
+      };
+    });
+
+    // ── Step 4: Market type ke hisaab se categorize karo ──
+    //
+    //  Betfair standard marketType strings:
+    //    MATCH_ODDS, BOOKMAKER, TOSS, INNINGS_RUNS, SESSION_RUNS,
+    //    BOTH_TEAMS_TO_SCORE, CORRECT_SCORE, HALF_TIME, ASIAN_HANDICAP,
+    //    SET_WINNER, TOTAL_GOALS, WINNER, WIN, PLACE, EACH_WAY, etc.
+
+    const result = {
+      matchOdds: [],
+      bookmaker: [],
+      toss:      [],
+      fancy:     [],
+      fancy2:    [],
+      figure:    [],
+      oddFigure: [],
+      other:     [],
+      all:       normalized,
+    };
+
+    for (const market of normalized) {
+      const type = (market.marketType || '').toUpperCase();
+      const name = (market.marketName || '').toLowerCase();
+
+      if (type === 'MATCH_ODDS' || type === 'WINNER') {
+        result.matchOdds.push(market);
+
+      } else if (
+        type === 'BOOKMAKER' || type === 'BOOKMAKER2' ||
+        name.includes('bookmaker')
+      ) {
+        result.bookmaker.push(market);
+
+      } else if (
+        type === 'TOSS' || name.includes('toss')
+      ) {
+        result.toss.push(market);
+
+      } else if (
+        type === 'FANCY2' ||
+        name.includes('fancy 2') || name.includes('fancy-2') || name.includes('fancy2')
+      ) {
+        result.fancy2.push(market);
+
+      } else if (
+        type === 'FANCY'         ||
+        type === 'INNINGS_RUNS'  ||
+        type === 'SESSION_RUNS'  ||
+        type === 'OVER_UNDER_RUNS' ||
+        type === 'TOP_BATSMAN'   ||
+        type === 'TOP_BOWLER'    ||
+        name.includes('fancy')   ||
+        name.includes('session') ||
+        name.includes('innings') ||
+        name.includes('over')
+      ) {
+        result.fancy.push(market);
+
+      } else if (
+        type === 'FIGURE' || name.includes('figure')
+      ) {
+        result.figure.push(market);
+
+      } else if (
+        type === 'ODD_FIGURE' || type === 'EVEN_ODD' ||
+        name.includes('even') || name.includes('odd figure')
+      ) {
+        result.oddFigure.push(market);
+
+      } else {
+        // BOTH_TEAMS_TO_SCORE, CORRECT_SCORE, HALF_TIME,
+        // ASIAN_HANDICAP, SET_WINNER, TOTAL_GOALS, etc.
+        result.other.push(market);
+      }
+    }
+
+    return sendSuccess(res, result);
+
+  } catch (err) {
+    logger.error(`getEventMarkets error: ${err.message}`);
+    return sendError(res, 'Failed to fetch event markets', 500);
+  }
+}
+
+/* ── Exports ─────────────────────────────────────────────── */
+
 module.exports = {
-  getLiveCricket, getLiveCricketInplay, getLiveFootball,
-  getLiveTennis, getLiveHorse, getLiveGreyhound,
-  getLiveSport, getMarketData, getMarketCatalog2, getNavigation,  getBetfairCompetitions, getBetfairMarketTypes,
+  getLiveCricket,
+  getLiveCricketInplay,
+  getLiveFootball,
+  getLiveTennis,
+  getLiveHorse,
+  getLiveGreyhound,
+  getLiveSport,
+  getMarketData,
+  getMarketCatalog2,
+  getNavigation,
+  getBetfairCompetitions,
+  getBetfairMarketTypes,
+  getEventMarkets,           // ← NEW
 };
