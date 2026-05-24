@@ -250,44 +250,98 @@ async function getMarketData(req, res) {
   const { id: marketId } = req.query;
   if (!marketId) return sendError(res, 'marketId query parameter is required', 400);
 
-  const [catalogues, books] = await Promise.all([
-    listMarketCatalogue({ marketIds: [marketId] }, '1', ['RUNNER_DESCRIPTION']),
+  // Step 1: Main market ka catalog lo — eventId nikalna hai
+  const [catalogues, mainBooks] = await Promise.all([
+    listMarketCatalogue({ marketIds: [marketId] }, '1', ['EVENT', 'RUNNER_DESCRIPTION']),
     listMarketBook([marketId]),
   ]);
 
   const catalog = catalogues?.[0];
-  const book    = books?.[0];
-  if (!book) return sendError(res, 'Market not found', 404);
+  const mainBook = mainBooks?.[0];
+  if (!mainBook) return sendError(res, 'Market not found', 404);
 
+  // Runner name map for main market
   const runnerMap = {};
   (catalog?.runners || []).forEach(r => { runnerMap[r.selectionId] = r.runnerName; });
 
-  const marketBooks = [{
-    id: book.marketId,
-    betDelay: book.betDelay,
-    totalMatched: book.totalMatched,
-    marketStatus: book.status,
-    bettingAllowed: true,
-    runners: book.runners.map(r => ({
-      id:     r.selectionId,
-      name:   runnerMap[r.selectionId] || '',
-      price1: r.ex.availableToBack?.[0]?.price || 0,
-      price2: r.ex.availableToBack?.[1]?.price || 0,
-      price3: r.ex.availableToBack?.[2]?.price || 0,
-      size1:  r.ex.availableToBack?.[0]?.size  || 0,
-      size2:  r.ex.availableToBack?.[1]?.size  || 0,
-      size3:  r.ex.availableToBack?.[2]?.size  || 0,
-      lay1:   r.ex.availableToLay?.[0]?.price  || 0,
-      lay2:   r.ex.availableToLay?.[1]?.price  || 0,
-      lay3:   r.ex.availableToLay?.[2]?.price  || 0,
-      ls1:    r.ex.availableToLay?.[0]?.size   || 0,
-      ls2:    r.ex.availableToLay?.[1]?.size   || 0,
-      ls3:    r.ex.availableToLay?.[2]?.size   || 0,
-      status: r.status,
-    })),
-    timestamp: book.lastMatchTime || '0001-01-01T00:00:00',
-    winnerIDs: [],
-  }];
+  // Helper: book ko mv2.min.js ka expected shape mein convert karo
+  function bookToMarketBook(book, rMap) {
+    return {
+      id:             book.marketId,
+      betDelay:       book.betDelay       || 0,
+      totalMatched:   book.totalMatched   || 0,
+      marketStatus:   book.status         || 'OPEN',
+      bettingAllowed: true,
+      runners: (book.runners || []).map(r => ({
+        id:     r.selectionId,
+        name:   rMap[r.selectionId] || '',
+        price1: r.ex?.availableToBack?.[0]?.price || 0,
+        price2: r.ex?.availableToBack?.[1]?.price || 0,
+        price3: r.ex?.availableToBack?.[2]?.price || 0,
+        size1:  r.ex?.availableToBack?.[0]?.size  || 0,
+        size2:  r.ex?.availableToBack?.[1]?.size  || 0,
+        size3:  r.ex?.availableToBack?.[2]?.size  || 0,
+        lay1:   r.ex?.availableToLay?.[0]?.price  || 0,
+        lay2:   r.ex?.availableToLay?.[1]?.price  || 0,
+        lay3:   r.ex?.availableToLay?.[2]?.price  || 0,
+        ls1:    r.ex?.availableToLay?.[0]?.size   || 0,
+        ls2:    r.ex?.availableToLay?.[1]?.size   || 0,
+        ls3:    r.ex?.availableToLay?.[2]?.size   || 0,
+        status: r.status || 'ACTIVE',
+      })),
+      timestamp: book.lastMatchTime || '0001-01-01T00:00:00',
+      winnerIDs: [],
+    };
+  }
+
+  // Step 2: Main market book — always included
+  const marketBooks = [bookToMarketBook(mainBook, runnerMap)];
+
+  // Step 3: Saare sub-markets bhi fetch karo (usi event ke)
+  // mv2.min.js ProcessSubMarkets() ko marketBooks mein SAARE markets chahiye
+  // warna woh subMarkets array se delete kar deta hai unhe
+  const eventId = catalog?.event?.id;
+  if (eventId) {
+    try {
+      // Is event ke baaki sub-markets dhundo
+      const subCatalogues = await listMarketCatalogue(
+        { eventIds: [String(eventId)] },
+        '200',
+        ['RUNNER_DESCRIPTION'],
+      );
+
+      const subMarketIds = subCatalogues
+        .map(m => m.marketId)
+        .filter(id => id !== marketId);  // main market exclude karo
+
+      if (subMarketIds.length > 0) {
+        // Chunk mein books fetch karo (Betfair max 200)
+        const CHUNK = 200;
+        let allSubBooks = [];
+        for (let i = 0; i < subMarketIds.length; i += CHUNK) {
+          const chunk = subMarketIds.slice(i, i + CHUNK);
+          const sb = await listMarketBook(chunk).catch(() => []);
+          allSubBooks = allSubBooks.concat(sb);
+        }
+
+        // Har sub-market ke liye runner map banao aur marketBooks mein push karo
+        const subCatalogMap = {};
+        subCatalogues.forEach(m => { subCatalogMap[m.marketId] = m; });
+
+        allSubBooks.forEach(subBook => {
+          const subCat = subCatalogMap[subBook.marketId];
+          const subRunnerMap = {};
+          (subCat?.runners || []).forEach(r => { subRunnerMap[r.selectionId] = r.runnerName; });
+          marketBooks.push(bookToMarketBook(subBook, subRunnerMap));
+        });
+
+        logger.info(`getMarketData: returning ${marketBooks.length} books (1 main + ${allSubBooks.length} sub)`);
+      }
+    } catch (err) {
+      // Sub-market fetch fail ho to sirf main market return karo — crash mat karo
+      logger.warn(`getMarketData sub-markets fetch failed: ${err.message}`);
+    }
+  }
 
   return sendSuccess(res, { requestId: uuidv4(), marketBooks, news: '' });
 }
@@ -318,79 +372,51 @@ async function getMarketCatalog2(req, res) {
 
   const eventId = catalog.event?.id;
 
-  // ── subMarkets: same event ke SAARE baaki markets fetch karo ──
-  // mv2.min.js aur frontend dono isko use karte hain Toss/BM/Fancy tabs ke liye
+  // ── Fetch ALL sub-markets for this event so mv2.min.js gets
+  //    BookmakerMarkets, TossMarkets, FancyMarkets etc. populated ──
   let subMarkets = [];
   if (eventId) {
     try {
       const allCatalogues = await listMarketCatalogue(
-        {
-          eventIds: [String(eventId)],
-          // CRITICAL: bina marketTypeCodes ke Betfair sirf MATCH_ODDS deta hai
-          marketTypeCodes: [
-            'MATCH_ODDS','WINNER','BOOKMAKER','BOOKMAKER2','TOSS','FANCY','FANCY2',
-            'INNINGS_RUNS','SESSION_RUNS','OVER_UNDER_RUNS','TOP_BATSMAN','TOP_BOWLER',
-            'FIGURE','ODD_FIGURE','EVEN_ODD','BOTH_TEAMS_TO_SCORE','CORRECT_SCORE',
-            'HALF_TIME','NEXT_GOAL','ASIAN_HANDICAP','SET_WINNER','TOTAL_GAMES',
-            'TOTAL_GOALS','WIN','PLACE','EACH_WAY',
-          ],
-        },
+        { eventIds: [String(eventId)] },
         '200',
-        ['EVENT', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION', 'RUNNER_METADATA'],
+        ['EVENT', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION'],
       );
 
-      // Main market ko exclude karo — woh pehle se load hai
-      const otherMarkets = allCatalogues.filter(m => m.marketId !== marketId);
+      const subMarketIds = allCatalogues
+        .filter(m => m.marketId !== marketId)
+        .map(m => m.marketId);
 
-      if (otherMarkets.length > 0) {
-        // Inki books bhi fetch karo
-        const CHUNK = 200;
-        let subBooks = [];
-        const subIds = otherMarkets.map(m => m.marketId);
-        for (let i = 0; i < subIds.length; i += CHUNK) {
-          const chunk = await listMarketBook(subIds.slice(i, i + CHUNK)).catch(() => []);
-          subBooks = subBooks.concat(chunk);
-        }
+      let subBooks = [];
+      if (subMarketIds.length > 0) {
+        subBooks = await listMarketBook(subMarketIds).catch(() => []);
+      }
 
-        subMarkets = otherMarkets.map(m => {
-          const b    = subBooks.find(bk => bk.marketId === m.marketId);
-          const mType = m.description?.marketType || '';
-          const mName = m.marketName || '';
-
-          // Category tag — mv2.min.js isko use karta hai filter karne ke liye
-          let category = 'other';
-          const t = mType.toUpperCase();
-          const n = mName.toLowerCase();
-          if (t === 'BOOKMAKER' || t === 'BOOKMAKER2' || n.includes('bookmaker')) category = 'bookmaker';
-          else if (t === 'TOSS' || n.includes('toss'))                             category = 'toss';
-          else if (t === 'FANCY2' || n.includes('fancy 2') || n.includes('fancy-2')) category = 'fancy2';
-          else if (t === 'FANCY' || t === 'INNINGS_RUNS' || t === 'SESSION_RUNS' ||
-                   n.includes('fancy') || n.includes('session') || n.includes('innings') || n.includes('over'))
-                                                                                    category = 'fancy';
-          else if (t === 'FIGURE' || n.includes('figure'))                          category = 'figure';
-          else if (t === 'ODD_FIGURE' || t === 'EVEN_ODD' || n.includes('even') || n.includes('odd figure'))
-                                                                                    category = 'oddFigure';
-
+      subMarkets = allCatalogues
+        .filter(m => m.marketId !== marketId)
+        .map(m => {
+          const sb = subBooks.find(b => b.marketId === m.marketId);
           return {
             marketId:    m.marketId,
-            marketName:  mName,
-            marketType:  mType,
-            category,
-            status:      b?.status      || 'OPEN',
-            status2:     null,
-            inPlay:      b?.inPlay      || false,
-            bettingType: m.description?.bettingType || 'ODDS',
-            maxBetSize:  b?.totalMatched || 0,
-            eventTypeId: m.eventType?.id || eventTypeId,
-            runners:     buildOddsPayload(m.runners || [], b),
+            marketName:  m.marketName,
+            marketType:  m.description?.marketType || '',
+            status:      sb?.status || 'OPEN',
+            inPlay:      sb?.inPlay || false,
+            runners: (m.runners || []).map(r => {
+              const rb = sb?.runners?.find(x => x.selectionId === r.selectionId);
+              return {
+                selectionId: r.selectionId,
+                runnerName:  r.runnerName,
+                sortPriority: r.sortPriority,
+                status:      rb?.status || 'ACTIVE',
+                back: rb?.ex?.availableToBack?.slice(0, 3) || [],
+                lay:  rb?.ex?.availableToLay?.slice(0, 3)  || [],
+              };
+            }),
           };
         });
-
-        logger.info(`getMarketCatalog2: found ${subMarkets.length} subMarkets for event ${eventId}`);
-      }
     } catch (err) {
-      // subMarkets fail hone par main market response block nahi hona chahiye
-      logger.warn(`getMarketCatalog2 subMarkets fetch failed: ${err.message}`);
+      logger.warn(`catalog2 subMarkets fetch failed: ${err.message}`);
     }
   }
 
@@ -415,7 +441,9 @@ async function getMarketCatalog2(req, res) {
       sortPriority: r.sortPriority,
       status:       'ACTIVE',
     })),
-    subMarkets,   // ← mv2.min.js aur frontend fallback dono yahan se markets lete hain
+    // ✅ subMarkets — mv2.min.js isko read karta hai BookmakerMarkets,
+    //    TossMarkets, FancyMarkets etc. populate karne ke liye
+    subMarkets,
     updatedAt: new Date().toISOString(),
   });
 }
@@ -510,18 +538,8 @@ async function getEventMarkets(req, res) {
   try {
     // ── Step 1: Is event ke SAARE markets lo (koi marketType filter nahi) ──
     const catalogues = await listMarketCatalogue(
-      {
-        eventIds: [String(eventId)],
-        // CRITICAL: bina marketTypeCodes ke Betfair sirf MATCH_ODDS deta hai
-        marketTypeCodes: [
-          'MATCH_ODDS','WINNER','BOOKMAKER','BOOKMAKER2','TOSS','FANCY','FANCY2',
-          'INNINGS_RUNS','SESSION_RUNS','OVER_UNDER_RUNS','TOP_BATSMAN','TOP_BOWLER',
-          'FIGURE','ODD_FIGURE','EVEN_ODD','BOTH_TEAMS_TO_SCORE','CORRECT_SCORE',
-          'HALF_TIME','NEXT_GOAL','ASIAN_HANDICAP','SET_WINNER','TOTAL_GAMES',
-          'TOTAL_GOALS','WIN','PLACE','EACH_WAY',
-        ],
-      },
-      '200',
+      { eventIds: [String(eventId)] },
+      '200',  // Betfair max 200
       ['EVENT', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION', 'RUNNER_METADATA'],
     );
 
