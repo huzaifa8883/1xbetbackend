@@ -113,3 +113,63 @@ async function getEnabledLeagues(req, res) {
 }
 
 module.exports = { getLeagues, saveLeagues, getEnabledLeagues };
+
+/* ─────────────────────────────────────────────────────────────
+   MARKET SETTINGS  —  enabled market IDs per sport
+   File: data/market-settings.json
+   Format: { cricket: ['match_odds','toss'], football: ['match_odds'], ... }
+───────────────────────────────────────────────────────────── */
+
+const MARKET_STORE_PATH = path.join(__dirname, '../../data/market-settings.json');
+
+function readMarketStore() {
+  try {
+    if (fs.existsSync(MARKET_STORE_PATH)) {
+      return JSON.parse(fs.readFileSync(MARKET_STORE_PATH, 'utf8'));
+    }
+  } catch (e) {}
+  return {};
+}
+
+function writeMarketStore(data) {
+  try {
+    fs.mkdirSync(path.dirname(MARKET_STORE_PATH), { recursive: true });
+    fs.writeFileSync(MARKET_STORE_PATH, JSON.stringify(data, null, 2));
+  } catch (e) {
+    logger.error('writeMarketStore error: ' + e.message);
+  }
+}
+
+// GET /api/v1/settings/markets
+// Returns { cricket: ['match_odds','toss'], football: [...], ... }
+async function getMarketSettings(req, res) {
+  const store = readMarketStore();
+  return sendSuccess(res, store);
+}
+
+// POST /api/v1/settings/markets
+// Body: { cricket: ['match_odds','toss'], football: ['match_odds'], ... }
+async function saveMarketSettings(req, res) {
+  const payload = req.body;
+  if (!payload || typeof payload !== 'object') {
+    return sendError(res, 'Invalid payload', 400);
+  }
+  writeMarketStore(payload);
+  logger.info('Market settings saved: ' + JSON.stringify(payload));
+  return sendSuccess(res, { message: 'Market settings saved' });
+}
+
+// GET /api/v1/settings/markets/:sport
+// Returns { sport, enabledMarketIds: ['match_odds','toss'], filterActive: true }
+async function getMarketSettingsBySport(req, res) {
+  const sport = req.params.sport;
+  if (!sport) return sendError(res, 'sport param required', 400);
+  const store = readMarketStore();
+  const ids = store[sport];
+  if (!ids || !Array.isArray(ids) || ids.length === 0) {
+    return sendSuccess(res, { sport, enabledMarketIds: null, filterActive: false });
+  }
+  return sendSuccess(res, { sport, enabledMarketIds: ids, filterActive: true });
+}
+
+module.exports = { getLeagues, saveLeagues, getEnabledLeagues, getMarketSettings, saveMarketSettings, getMarketSettingsBySport };
