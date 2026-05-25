@@ -328,6 +328,7 @@ async function getOrdersByEvent(req, res) {
     marketId:     o.market_id,
     selectionId:  String(o.selection_id),
     eventName:    o.event_name || '',
+    runnerName:   o.runner_name || o.event_name || '',   // ← runner name for bets panel
     side:         o.side,
     price:        parseFloat(o.price),
     size:         parseFloat(o.size),
@@ -361,7 +362,8 @@ function enrichOrderWithPnL(order) {
   const liable = order.side === BET_SIDE.BACK
     ? parseFloat(size.toFixed(2))
     : parseFloat(((price - 1) * size).toFixed(2));
-  return { ...order, profit, liable };
+  // runner_name field ko runnerName ke naam se bhi expose karo
+  return { ...order, profit, liable, runnerName: order.runner_name || order.event_name || '' };
 }
 
 module.exports = {
