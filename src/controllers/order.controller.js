@@ -42,7 +42,13 @@ async function placeBets(req, res) {
       const { eventName, category } = await getEventDetails(bet.marketId).catch(() => ({
         eventName: 'Unknown', category: 'Other',
       }));
-      return { ...bet, event_name: eventName, category };
+      return {
+        ...bet,
+        event_name:  eventName,
+        category,
+        // ── FIXED: runner_name frontend se aa raha hai (runnerName field) ──
+        runner_name: bet.runnerName || bet.runner_name || '',
+      };
     }),
   );
 
@@ -56,6 +62,7 @@ async function placeBets(req, res) {
       user_id:      userId,
       market_id:    bet.marketId,
       selection_id: bet.selectionId,
+      runner_name:  bet.runner_name || '',   // ── FIXED: DB mein save karo ──
       event_name:   bet.event_name,
       category:     bet.category,
       side:         bet.side,
@@ -105,8 +112,18 @@ async function placeBets(req, res) {
       const { matchedSize, status, executedPrice } = evaluateMatch(order.toJSON(), runner);
       if (status === ORDER_STATUS.MATCHED) {
         await order.update({ matched: matchedSize, status, price: executedPrice });
-        if (global.io)
-          global.io.to(`match_${order.market_id}`).emit('ordersUpdated', { userId, order: order.toJSON() });
+
+        // ── FIXED: socket emit newOrders array format mein, runnerName ke saath ──
+        if (global.io) {
+          global.io.to(`match_${order.market_id}`).emit('ordersUpdated', {
+            userId,
+            newOrders: [{
+              ...order.toJSON(),
+              runnerName: order.runner_name || '',
+            }],
+          });
+        }
+
         logger.info(`Immediately matched order ${order.request_id}`);
       }
     } catch (e) {
@@ -136,8 +153,25 @@ async function placeBets(req, res) {
     const liable = o.side === BET_SIDE.BACK
       ? parseFloat(size.toFixed(2))
       : parseFloat(((price - 1) * size).toFixed(2));
-    return { ...o.toJSON(), profit, liable };
+    return {
+      ...o.toJSON(),
+      profit,
+      liable,
+      runnerName: o.runner_name || '',  // ── FIXED: response mein bhi bhejo ──
+    };
   });
+
+  // ── FIXED: bet place hone ke baad bhi socket emit karo (PENDING status ke liye) ──
+  if (global.io) {
+    global.io.to(`match_${normalized[0]?.market_id}`).emit('ordersUpdated', {
+      userId,
+      newOrders: betsWithPnL.map(o => ({
+        ...o,
+        status: o.status || ORDER_STATUS.PENDING,
+        runnerName: o.runner_name || o.runnerName || '',
+      })),
+    });
+  }
 
   return sendSuccess(res, {
     orders:  betsWithPnL,
@@ -264,16 +298,6 @@ async function triggerAutoMatch(req, res) {
 
    Body: { winningSelectionId, commissionPct? }
    commissionPct: 0-100 (default 0)
-
-   Settlement flow:
-   1. BACK winner → credit stake + profit
-   2. BACK loser  → nothing (stake already held)
-   3. LAY winner  → nothing (liability already held)
-   4. LAY loser   → credit stake (bookmaker won)
-   5. Commission on positive net profit only
-   6. Transaction record banao
-   7. Orders → SETTLED
-   8. recalculate remaining liability
 ────────────────────────────────────────────────────────────── */
 async function settleMarket(req, res) {
   const { marketId } = req.params;
@@ -288,8 +312,6 @@ async function settleMarket(req, res) {
 
 /* ─────────────────────────────────────────────────────────────
    voidMarket — Admin route: Market cancel/void
-
-   Sab active bets cancel, liable wapas
 ────────────────────────────────────────────────────────────── */
 async function voidMarket(req, res) {
   const { marketId } = req.params;
@@ -299,8 +321,6 @@ async function voidMarket(req, res) {
 
 /* ─────────────────────────────────────────────────────────────
    getMarketRunnerPnL — Frontend ke liye per-runner P&L
-
-   Returns: { [selectionId]: { profit, liability, net } }
 ────────────────────────────────────────────────────────────── */
 async function getMarketRunnerPnL(req, res) {
   const { marketId } = req.params;
@@ -327,8 +347,8 @@ async function getOrdersByEvent(req, res) {
     id:           String(o.request_id),
     marketId:     o.market_id,
     selectionId:  String(o.selection_id),
+    runnerName:   o.runner_name || o.event_name || '',  // ── FIXED ──
     eventName:    o.event_name || '',
-    runnerName:   o.runner_name || o.event_name || '',   // ← runner name for bets panel
     side:         o.side,
     price:        parseFloat(o.price),
     size:         parseFloat(o.size),
@@ -352,6 +372,8 @@ async function getOrdersByEvent(req, res) {
  * Enrich a raw order object with real-time profit/liable values.
  * profit  = agar yeh bet jeeti to kitna milega
  * liable  = agar yeh bet haari to kitna jayega
+ *
+ * ── FIXED: runnerName field add kiya taake frontend display kar sake ──
  */
 function enrichOrderWithPnL(order) {
   const price  = parseFloat(order.price);
@@ -362,8 +384,12 @@ function enrichOrderWithPnL(order) {
   const liable = order.side === BET_SIDE.BACK
     ? parseFloat(size.toFixed(2))
     : parseFloat(((price - 1) * size).toFixed(2));
-  // runner_name field ko runnerName ke naam se bhi expose karo
-  return { ...order, profit, liable, runnerName: order.runner_name || order.event_name || '' };
+  return {
+    ...order,
+    profit,
+    liable,
+    runnerName: order.runner_name || order.event_name || '',  // ── FIXED ──
+  };
 }
 
 module.exports = {
