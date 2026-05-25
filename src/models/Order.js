@@ -1,5 +1,4 @@
 'use strict';
-
 const { DataTypes, Model } = require('sequelize');
 const { sequelize } = require('../config/database');
 const { ORDER_STATUS, BET_SIDE } = require('../config/constants');
@@ -31,6 +30,11 @@ Order.init(
       allowNull: false,
     },
     event_name: {
+      type: DataTypes.STRING(255),
+      allowNull: true,
+    },
+    // ── ADDED: Runner name store karo (e.g. "Mert Alkaya") ──
+    runner_name: {
       type: DataTypes.STRING(255),
       allowNull: true,
     },
