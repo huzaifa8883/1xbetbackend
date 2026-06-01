@@ -14,7 +14,7 @@ const logger = require('./utils/logger');
 const PORT = process.env.PORT || 5000;
 
 /* ─────────────────────────────────────────────────────────── */
-/* HTTP server                                                  */
+/* HTTP server                                                 */
 /* ─────────────────────────────────────────────────────────── */
 const server = http.createServer(app);
 
@@ -77,11 +77,12 @@ async function bootstrap() {
     /* 1. Connect to MySQL */
     await connectDatabase();
 
-    /* 2. Sync models (alter:true in dev, false in prod – use migrations in prod) */
-    if (process.env.NODE_ENV !== 'production') {
-      await sequelize.sync({ alter: true });
-      logger.info('Database schema synchronised');
-    }
+    /* 2. Sync models ──────────────────────────────────────── */
+    // ── FIXED: Kuch der ke liye production check hata diya hai taake DB alter ho jaye ──
+    logger.info('Syncing database schema (alter: true)...');
+    await sequelize.sync({ alter: true });
+    logger.info('Database schema synchronised successfully!');
+    /* ─────────────────────────────────────────────────────── */
 
     /* 3. Start background jobs */
     startMarketUpdateJob(30_000);
