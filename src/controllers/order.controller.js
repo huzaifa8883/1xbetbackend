@@ -46,7 +46,7 @@ async function placeBets(req, res) {
         ...bet,
         event_name:  eventName,
         category,
-        // ── FIXED: runner_name frontend se aa raha hai (runnerName field) ──
+        // ── FIXED: Kisi bhi surat mein event_name yahan map nahi hona chahiye ──
         runner_name: bet.runnerName || bet.runner_name || '',
       };
     }),
@@ -62,7 +62,7 @@ async function placeBets(req, res) {
       user_id:      userId,
       market_id:    bet.marketId,
       selection_id: bet.selectionId,
-      runner_name:  bet.runner_name || '',   // ── FIXED: DB mein save karo ──
+      runner_name:  bet.runner_name || '',   // ── FIXED: DB mein exact player name save hoga ──
       event_name:   bet.event_name,
       category:     bet.category,
       side:         bet.side,
@@ -113,7 +113,7 @@ async function placeBets(req, res) {
       if (status === ORDER_STATUS.MATCHED) {
         await order.update({ matched: matchedSize, status, price: executedPrice });
 
-        // ── FIXED: socket emit newOrders array format mein, runnerName ke saath ──
+        // ── FIXED: Socket emission format ──
         if (global.io) {
           global.io.to(`match_${order.market_id}`).emit('ordersUpdated', {
             userId,
@@ -157,18 +157,18 @@ async function placeBets(req, res) {
       ...o.toJSON(),
       profit,
       liable,
-      runnerName: o.runner_name || '',  // ── FIXED: response mein bhi bhejo ──
+      runnerName: o.runner_name || '',  // ── FIXED: Response mein strictly player name bhej rahe hain ──
     };
   });
 
-  // ── FIXED: bet place hone ke baad bhi socket emit karo (PENDING status ke liye) ──
+  // ── FIXED: Bet placement socket fallback ──
   if (global.io) {
     global.io.to(`match_${normalized[0]?.market_id}`).emit('ordersUpdated', {
       userId,
       newOrders: betsWithPnL.map(o => ({
         ...o,
         status: o.status || ORDER_STATUS.PENDING,
-        runnerName: o.runner_name || o.runnerName || '',
+        runnerName: o.runner_name || '',
       })),
     });
   }
@@ -215,7 +215,7 @@ async function getAllOrders(req, res) {
     order:  [['created_at', 'DESC']],
   });
   return sendSuccess(res, {
-    orders:     rows.map(o => enrichOrderWithPnL(o.toJSON())),
+    orders:      rows.map(o => enrichOrderWithPnL(o.toJSON())),
     pagination: { total: count, page: parseInt(page, 10), limit: parseInt(limit, 10) },
   });
 }
@@ -295,9 +295,6 @@ async function triggerAutoMatch(req, res) {
 
 /* ─────────────────────────────────────────────────────────────
    settleMarket — Admin route
-
-   Body: { winningSelectionId, commissionPct? }
-   commissionPct: 0-100 (default 0)
 ────────────────────────────────────────────────────────────── */
 async function settleMarket(req, res) {
   const { marketId } = req.params;
@@ -347,7 +344,7 @@ async function getOrdersByEvent(req, res) {
     id:           String(o.request_id),
     marketId:     o.market_id,
     selectionId:  String(o.selection_id),
-    runnerName:   o.runner_name || o.event_name || '',  // ── FIXED ──
+    runnerName:   o.runner_name || '',  // ── FIXED: Removed event_name fallback ──
     eventName:    o.event_name || '',
     side:         o.side,
     price:        parseFloat(o.price),
@@ -370,10 +367,7 @@ async function getOrdersByEvent(req, res) {
 
 /**
  * Enrich a raw order object with real-time profit/liable values.
- * profit  = agar yeh bet jeeti to kitna milega
- * liable  = agar yeh bet haari to kitna jayega
- *
- * ── FIXED: runnerName field add kiya taake frontend display kar sake ──
+ * ── FIXED: Removed event_name fallback from runnerName mapping ──
  */
 function enrichOrderWithPnL(order) {
   const price  = parseFloat(order.price);
@@ -388,7 +382,7 @@ function enrichOrderWithPnL(order) {
     ...order,
     profit,
     liable,
-    runnerName: order.runner_name || order.event_name || '',  // ── FIXED ──
+    runnerName: order.runner_name || '',  // ── FIXED: Strictly returns database runner_name ──
   };
 }
 
