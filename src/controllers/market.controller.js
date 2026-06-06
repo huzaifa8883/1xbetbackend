@@ -17,27 +17,31 @@ const logger = require('../utils/logger');
 
 function buildOddsPayload(runners, books) {
   return runners.map((runner) => {
-    const rb  = books?.runners?.find((r) => r.selectionId === runner.selectionId);
-    const md  = runner.metadata || {};          // Betfair RUNNER_METADATA
-    // Silk image: Betfair serves from https://content.betfair.com/feeds_images/Horses/SilkColours/
-    const silkFile = md.COLOURS_FILENAME || null;
-    const silkUrl  = silkFile
-      ? `https://content.betfair.com/feeds_images/Horses/SilkColours/${silkFile}`
-      : null;
+    const rb = books?.runners?.find((r) => r.selectionId === runner.selectionId);
+
+    // RUNNER_METADATA fields — horse race aur greyhound ke liye
+    const meta = runner.metadata || {};
+    const clothNumber = runner.metadata?.CLOTH_NUMBER || runner.metadata?.cloth_number || null;
+    const jockeyName  = runner.metadata?.JOCKEY_NAME  || runner.metadata?.jockey_name  || null;
+    const trainerName = runner.metadata?.TRAINER_NAME || runner.metadata?.trainer_name || null;
+    const silkUrl     = runner.metadata?.SILK_URL      || runner.metadata?.silk_url     || null;
+    const stallDraw   = runner.metadata?.STALL_DRAW    || runner.metadata?.stall_draw   || null;
+
     return {
       selectionId:  runner.selectionId,
       runnerName:   runner.runnerName,
       sortPriority: runner.sortPriority,
-      back: rb?.ex?.availableToBack?.slice(0, 3) || [],
-      lay:  rb?.ex?.availableToLay?.slice(0, 3)  || [],
-      status:          rb?.status            || 'ACTIVE',
-      lastPriceTraded: rb?.lastPriceTraded   || null,
-      // Horse Race / Greyhound metadata
-      clothNumber:  md.CLOTH_NUMBER          || runner.clothNumber  || null,
-      jockeyName:   md.JOCKEY_NAME           || runner.jockeyName   || null,
-      trainerName:  md.TRAINER_NAME          || runner.trainerName  || null,
-      silkColor:    silkUrl,
-      metadataDict: Object.keys(md).length > 0 ? md : null,
+      back:  rb?.ex?.availableToBack?.slice(0, 3) || [],
+      lay:   rb?.ex?.availableToLay?.slice(0, 3)  || [],
+      status: rb?.status || 'ACTIVE',
+      lastPriceTraded: rb?.lastPriceTraded || null,
+      // Metadata fields for horse/greyhound runner display
+      clothNumber,
+      jockeyName,
+      trainerName,
+      silkUrl,
+      stallDraw,
+      metadataDict: Object.keys(meta).length > 0 ? meta : null,
     };
   });
 }
@@ -90,7 +94,7 @@ async function fetchSportMarkets(sportKey, eventTypeId, overrides = {}) {
     marketTypeCodes: marketTypes,
   };
 
-  const catalogues = await listMarketCatalogue(catalogueFilter, maxResults, ['EVENT', 'RUNNER_METADATA', 'COMPETITION']);
+  const catalogues = await listMarketCatalogue(catalogueFilter, maxResults, ['EVENT', 'RUNNER_METADATA', 'COMPETITION', 'RUNNER_DESCRIPTION']);
   if (!catalogues.length) return [];
 
   // Chunk books (Betfair max 200 per request)
@@ -275,7 +279,7 @@ async function getMarketData(req, res) {
 
   // Step 1: Main market ka catalog lo — eventId nikalna hai
   const [catalogues, mainBooks] = await Promise.all([
-    listMarketCatalogue({ marketIds: [marketId] }, '1', ['EVENT', 'RUNNER_METADATA']),
+    listMarketCatalogue({ marketIds: [marketId] }, '1', ['EVENT', 'RUNNER_DESCRIPTION']),
     listMarketBook([marketId]),
   ]);
 
@@ -283,59 +287,42 @@ async function getMarketData(req, res) {
   const mainBook = mainBooks?.[0];
   if (!mainBook) return sendError(res, 'Market not found', 404);
 
-  // Runner name + metadata map for main market
+  // Runner name map for main market
   const runnerMap = {};
-  const runnerMetaMap = {};
-  (catalog?.runners || []).forEach(r => {
-    runnerMap[r.selectionId] = r.runnerName;
-    runnerMetaMap[r.selectionId] = r.metadata || {};
-  });
+  (catalog?.runners || []).forEach(r => { runnerMap[r.selectionId] = r.runnerName; });
 
   // Helper: book ko mv2.min.js ka expected shape mein convert karo
-  function bookToMarketBook(book, rMap, metaMap = {}) {
+  function bookToMarketBook(book, rMap) {
     return {
       id:             book.marketId,
       betDelay:       book.betDelay       || 0,
       totalMatched:   book.totalMatched   || 0,
       marketStatus:   book.status         || 'OPEN',
       bettingAllowed: true,
-      runners: (book.runners || []).map(r => {
-        const md = metaMap[r.selectionId] || {};
-        const silkFile = md.COLOURS_FILENAME || null;
-        const silkUrl  = silkFile
-          ? `https://content.betfair.com/feeds_images/Horses/SilkColours/${silkFile}`
-          : null;
-        return {
-          id:     r.selectionId,
-          name:   rMap[r.selectionId] || '',
-          price1: r.ex?.availableToBack?.[0]?.price || 0,
-          price2: r.ex?.availableToBack?.[1]?.price || 0,
-          price3: r.ex?.availableToBack?.[2]?.price || 0,
-          size1:  r.ex?.availableToBack?.[0]?.size  || 0,
-          size2:  r.ex?.availableToBack?.[1]?.size  || 0,
-          size3:  r.ex?.availableToBack?.[2]?.size  || 0,
-          lay1:   r.ex?.availableToLay?.[0]?.price  || 0,
-          lay2:   r.ex?.availableToLay?.[1]?.price  || 0,
-          lay3:   r.ex?.availableToLay?.[2]?.price  || 0,
-          ls1:    r.ex?.availableToLay?.[0]?.size   || 0,
-          ls2:    r.ex?.availableToLay?.[1]?.size   || 0,
-          ls3:    r.ex?.availableToLay?.[2]?.size   || 0,
-          status:      r.status || 'ACTIVE',
-          // Horse/Greyhound jockey & silk data
-          clothNumber: md.CLOTH_NUMBER  || null,
-          jockeyName:  md.JOCKEY_NAME   || null,
-          trainerName: md.TRAINER_NAME  || null,
-          silkColor:   silkUrl,
-          metadataDict: Object.keys(md).length > 0 ? md : null,
-        };
-      }),
+      runners: (book.runners || []).map(r => ({
+        id:     r.selectionId,
+        name:   rMap[r.selectionId] || '',
+        price1: r.ex?.availableToBack?.[0]?.price || 0,
+        price2: r.ex?.availableToBack?.[1]?.price || 0,
+        price3: r.ex?.availableToBack?.[2]?.price || 0,
+        size1:  r.ex?.availableToBack?.[0]?.size  || 0,
+        size2:  r.ex?.availableToBack?.[1]?.size  || 0,
+        size3:  r.ex?.availableToBack?.[2]?.size  || 0,
+        lay1:   r.ex?.availableToLay?.[0]?.price  || 0,
+        lay2:   r.ex?.availableToLay?.[1]?.price  || 0,
+        lay3:   r.ex?.availableToLay?.[2]?.price  || 0,
+        ls1:    r.ex?.availableToLay?.[0]?.size   || 0,
+        ls2:    r.ex?.availableToLay?.[1]?.size   || 0,
+        ls3:    r.ex?.availableToLay?.[2]?.size   || 0,
+        status: r.status || 'ACTIVE',
+      })),
       timestamp: book.lastMatchTime || '0001-01-01T00:00:00',
       winnerIDs: [],
     };
   }
 
   // Step 2: Main market book — always included
-  const marketBooks = [bookToMarketBook(mainBook, runnerMap, runnerMetaMap)];
+  const marketBooks = [bookToMarketBook(mainBook, runnerMap)];
 
   // Step 3: Saare sub-markets bhi fetch karo (usi event ke)
   // mv2.min.js ProcessSubMarkets() ko marketBooks mein SAARE markets chahiye
@@ -347,7 +334,7 @@ async function getMarketData(req, res) {
       const subCatalogues = await listMarketCatalogue(
         { eventIds: [String(eventId)] },
         '200',
-        ['RUNNER_METADATA'],
+        ['RUNNER_DESCRIPTION'],
       );
 
       const subMarketIds = subCatalogues
@@ -370,13 +357,9 @@ async function getMarketData(req, res) {
 
         allSubBooks.forEach(subBook => {
           const subCat = subCatalogMap[subBook.marketId];
-          const subRunnerMap  = {};
-          const subMetaMap    = {};
-          (subCat?.runners || []).forEach(r => {
-            subRunnerMap[r.selectionId] = r.runnerName;
-            subMetaMap[r.selectionId]   = r.metadata || {};
-          });
-          marketBooks.push(bookToMarketBook(subBook, subRunnerMap, subMetaMap));
+          const subRunnerMap = {};
+          (subCat?.runners || []).forEach(r => { subRunnerMap[r.selectionId] = r.runnerName; });
+          marketBooks.push(bookToMarketBook(subBook, subRunnerMap));
         });
 
         logger.info(`getMarketData: returning ${marketBooks.length} books (1 main + ${allSubBooks.length} sub)`);
@@ -396,7 +379,7 @@ async function getMarketCatalog2(req, res) {
 
   const [catalogues, books] = await Promise.all([
     listMarketCatalogue({ marketIds: [marketId] }, '1', [
-      'EVENT', 'MARKET_START_TIME', 'RUNNER_DESCRIPTION',
+      'EVENT', 'MARKET_START_TIME', 'RUNNER_DESCRIPTION', 'RUNNER_METADATA',
       'COMPETITION', 'MARKET_DESCRIPTION', 'EVENT_TYPE',
     ]),
     listMarketBook([marketId]),
@@ -478,24 +461,20 @@ async function getMarketCatalog2(req, res) {
     betDelay:            book.betDelay,
     rules:               catalog.description?.rules || '',
     sport: { name: sportName, image: iconMap[sportName] || 'default.svg', active: true },
-    runners: (catalog.runners || []).map(r => {
-      const md = r.metadata || {};
-      const silkFile = md.COLOURS_FILENAME || null;
-      return {
-        selectionId:  r.selectionId,
-        runnerName:   r.runnerName,
-        handicap:     r.handicap,
-        sortPriority: r.sortPriority,
-        status:       'ACTIVE',
-        clothNumber:  md.CLOTH_NUMBER || null,
-        jockeyName:   md.JOCKEY_NAME  || null,
-        trainerName:  md.TRAINER_NAME || null,
-        silkColor:    silkFile
-          ? `https://content.betfair.com/feeds_images/Horses/SilkColours/${silkFile}`
-          : null,
-        metadataDict: Object.keys(md).length > 0 ? md : null,
-      };
-    }),
+    runners: (catalog.runners || []).map(r => ({
+      selectionId:  r.selectionId,
+      runnerName:   r.runnerName,
+      handicap:     r.handicap,
+      sortPriority: r.sortPriority,
+      status:       'ACTIVE',
+      // Metadata for horse/greyhound runner display
+      clothNumber:  r.metadata?.CLOTH_NUMBER || r.metadata?.cloth_number || null,
+      jockeyName:   r.metadata?.JOCKEY_NAME  || r.metadata?.jockey_name  || null,
+      trainerName:  r.metadata?.TRAINER_NAME || r.metadata?.trainer_name || null,
+      silkUrl:      r.metadata?.SILK_URL     || r.metadata?.silk_url     || null,
+      stallDraw:    r.metadata?.STALL_DRAW   || r.metadata?.stall_draw   || null,
+      metadataDict: r.metadata && Object.keys(r.metadata).length > 0 ? r.metadata : null,
+    })),
     // ✅ subMarkets — mv2.min.js isko read karta hai BookmakerMarkets,
     //    TossMarkets, FancyMarkets etc. populate karne ke liye
     subMarkets,
