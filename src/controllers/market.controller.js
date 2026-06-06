@@ -179,7 +179,18 @@ async function getLiveHorse(req, res) {
       maxResults: 200,
       hoursAhead: 24,
     });
-    return sendSuccess(res, data);
+
+    // Deduplicate: same track (match name) + same start minute = duplicate event
+    const seen = new Set();
+    const deduped = data.filter(d => {
+      const timeKey = d.startTime ? d.startTime.substring(0, 16) : ''; // YYYY-MM-DDTHH:MM
+      const key = `${d.match}__${timeKey}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    return sendSuccess(res, deduped);
   } catch (err) {
     logger.error(`getLiveHorse error: ${err.message}`);
     return sendError(res, 'Failed to fetch horse racing data', 500);
