@@ -288,7 +288,7 @@ async function settleEventBets(marketId, winningSelectionId, { commissionPct = 0
     });
 
     await Order.update(
-      { status: ORDER_STATUS.SETTLED, settled_at: new Date(), winning_selection_id: String(winningSelectionId) },
+      { status: ORDER_STATUS.SETTLED, settled_at: new Date() },
       { where: { user_id: userId, market_id: marketId, status: ORDER_STATUS.MATCHED } },
     );
 
