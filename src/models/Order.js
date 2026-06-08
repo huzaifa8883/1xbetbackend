@@ -68,6 +68,11 @@ Order.init(
       allowNull: false,
       defaultValue: 0,
     },
+    winning_selection_id: {
+  type: DataTypes.STRING,
+  allowNull: true,
+  defaultValue: null,
+},
     status: {
       type: DataTypes.ENUM(...Object.values(ORDER_STATUS)),
       allowNull: false,
