@@ -18,12 +18,24 @@ const { evaluateMatch } = require('../services/matching.service');
 const logger = require('../utils/logger');
 
 /* ─────────────────────────────────────────────────────────────
+   computeSettlementPnL — settled order ka net P&L calculate karo
+   Returns positive = profit, negative = loss
+────────────────────────────────────────────────────────────── */
+function computeSettlementPnL(order) {
+  const price  = parseFloat(order.price);
+  const size   = parseFloat(order.matched > 0 ? order.matched : order.size);
+  const isWin  = String(order.selection_id) === String(order.winning_selection_id);
+
+  if (order.side === BET_SIDE.BACK) {
+    return isWin ? parseFloat(((price - 1) * size).toFixed(2)) : -parseFloat(size.toFixed(2));
+  } else {
+    // LAY
+    return isWin ? -parseFloat(((price - 1) * size).toFixed(2)) : parseFloat(size.toFixed(2));
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
    placeBets  — Bet lagao
-
-   BACK:  stake kata wallet se
-   LAY:   liability = (price-1)*stake kata wallet se
-
-   Balance check: tentative liability > available funds → reject
 ────────────────────────────────────────────────────────────── */
 async function placeBets(req, res) {
   const bets   = req.body;
@@ -46,7 +58,6 @@ async function placeBets(req, res) {
         ...bet,
         event_name:  eventName,
         category,
-        // ── FIXED: Kisi bhi surat mein event_name yahan map nahi hona chahiye ──
         runner_name: bet.runnerName || bet.runner_name || '',
       };
     }),
@@ -62,7 +73,7 @@ async function placeBets(req, res) {
       user_id:      userId,
       market_id:    bet.marketId,
       selection_id: bet.selectionId,
-      runner_name:  bet.runner_name || '',   // ── FIXED: DB mein exact player name save hoga ──
+      runner_name:  bet.runner_name || '',
       event_name:   bet.event_name,
       category:     bet.category,
       side:         bet.side,
@@ -94,7 +105,6 @@ async function placeBets(req, res) {
 
   const created = await Order.bulkCreate(normalized);
 
-  // BET_PLACED transaction — actual liability deducted
   const thisLiability = normalized.reduce((sum, b) => sum + b.liable, 0);
   await Transaction.create({
     user_id:     userId,
@@ -104,7 +114,6 @@ async function placeBets(req, res) {
     status:      'completed',
   });
 
-  // Immediately try to match
   const matchTasks = created.map(async (order) => {
     try {
       const runner = await getRunnerBook(order.market_id, order.selection_id);
@@ -112,8 +121,6 @@ async function placeBets(req, res) {
       const { matchedSize, status, executedPrice } = evaluateMatch(order.toJSON(), runner);
       if (status === ORDER_STATUS.MATCHED) {
         await order.update({ matched: matchedSize, status, price: executedPrice });
-
-        // ── FIXED: Socket emission format ──
         if (global.io) {
           global.io.to(`match_${order.market_id}`).emit('ordersUpdated', {
             userId,
@@ -123,7 +130,6 @@ async function placeBets(req, res) {
             }],
           });
         }
-
         logger.info(`Immediately matched order ${order.request_id}`);
       }
     } catch (e) {
@@ -143,7 +149,6 @@ async function placeBets(req, res) {
   const preliminaryWallet = Math.max(0, walletBalance - thisLiability);
   const preliminaryLiable = (parseFloat(user.liable) || 0) + thisLiability;
 
-  // Compute preliminary profit/liable for each bet (for bet slip display)
   const betsWithPnL = created.map(o => {
     const price  = parseFloat(o.price);
     const size   = parseFloat(o.size);
@@ -157,11 +162,10 @@ async function placeBets(req, res) {
       ...o.toJSON(),
       profit,
       liable,
-      runnerName: o.runner_name || '',  // ── FIXED: Response mein strictly player name bhej rahe hain ──
+      runnerName: o.runner_name || '',
     };
   });
 
-  // ── FIXED: Bet placement socket fallback ──
   if (global.io) {
     global.io.to(`match_${normalized[0]?.market_id}`).emit('ordersUpdated', {
       userId,
@@ -191,7 +195,7 @@ async function getPendingOrders(req, res) {
 }
 
 /* ─────────────────────────────────────────────────────────────
-   getMatchedOrders — with per-order profit/liable
+   getMatchedOrders — MATCHED status wali bets (SETTLED nahi)
 ────────────────────────────────────────────────────────────── */
 async function getMatchedOrders(req, res) {
   const where = { user_id: req.user.id, status: ORDER_STATUS.MATCHED };
@@ -202,12 +206,21 @@ async function getMatchedOrders(req, res) {
 }
 
 /* ─────────────────────────────────────────────────────────────
-   getAllOrders
+   getAllOrders — MATCHED + PENDING bets (bet history page)
+   SETTLED bets yahan NAHI aayenge — unke liye /settled route hai
 ────────────────────────────────────────────────────────────── */
 async function getAllOrders(req, res) {
   const { status, page = 1, limit = 50 } = req.query;
+  const { Op } = require('sequelize');
   const where = { user_id: req.user.id };
-  if (status) where.status = status;
+
+  if (status) {
+    where.status = status;
+  } else {
+    // Default: sirf active bets (PENDING + MATCHED), SETTLED excluded
+    where.status = { [Op.in]: [ORDER_STATUS.PENDING, ORDER_STATUS.MATCHED] };
+  }
+
   const { count, rows } = await Order.findAndCountAll({
     where,
     limit:  parseInt(limit, 10),
@@ -215,13 +228,45 @@ async function getAllOrders(req, res) {
     order:  [['created_at', 'DESC']],
   });
   return sendSuccess(res, {
-    orders:      rows.map(o => enrichOrderWithPnL(o.toJSON())),
+    orders: rows.map(o => enrichOrderWithPnL(o.toJSON())),
     pagination: { total: count, page: parseInt(page, 10), limit: parseInt(limit, 10) },
   });
 }
 
 /* ─────────────────────────────────────────────────────────────
-   cancelOrder — PENDING order cancel karo, liable wapas
+   getSettledOrders — SETTLED bets (statement/ledger page ke liye)
+   winningSelectionId aur settlementPnL include karta hai
+────────────────────────────────────────────────────────────── */
+async function getSettledOrders(req, res) {
+  const { page = 1, limit = 100 } = req.query;
+  const where = { user_id: req.user.id, status: ORDER_STATUS.SETTLED };
+
+  const { count, rows } = await Order.findAndCountAll({
+    where,
+    limit:  parseInt(limit, 10),
+    offset: (parseInt(page, 10) - 1) * parseInt(limit, 10),
+    order:  [['settled_at', 'DESC']],
+  });
+
+  return sendSuccess(res, {
+    orders: rows.map(o => {
+      const raw = o.toJSON();
+      return {
+        ...enrichOrderWithPnL(raw),
+        settled_at:           raw.settled_at || null,
+        winning_selection_id: raw.winning_selection_id || null,
+        // Net P&L for this bet
+        settlementPnL: raw.winning_selection_id
+          ? computeSettlementPnL(raw)
+          : null,
+      };
+    }),
+    pagination: { total: count, page: parseInt(page, 10), limit: parseInt(limit, 10) },
+  });
+}
+
+/* ─────────────────────────────────────────────────────────────
+   cancelOrder
 ────────────────────────────────────────────────────────────── */
 async function cancelOrder(req, res) {
   const order = await Order.findOne({
@@ -308,7 +353,7 @@ async function settleMarket(req, res) {
 }
 
 /* ─────────────────────────────────────────────────────────────
-   voidMarket — Admin route: Market cancel/void
+   voidMarket
 ────────────────────────────────────────────────────────────── */
 async function voidMarket(req, res) {
   const { marketId } = req.params;
@@ -317,7 +362,7 @@ async function voidMarket(req, res) {
 }
 
 /* ─────────────────────────────────────────────────────────────
-   getMarketRunnerPnL — Frontend ke liye per-runner P&L
+   getMarketRunnerPnL
 ────────────────────────────────────────────────────────────── */
 async function getMarketRunnerPnL(req, res) {
   const { marketId } = req.params;
@@ -341,22 +386,25 @@ async function getOrdersByEvent(req, res) {
     ...(limit > 0 ? { limit } : {}),
   });
   const formatted = orders.map(o => ({
-    id:           String(o.request_id),
-    marketId:     o.market_id,
-    selectionId:  String(o.selection_id),
-    runnerName:   o.runner_name || '',  // ── FIXED: Removed event_name fallback ──
-    eventName:    o.event_name || '',
-    side:         o.side,
-    price:        parseFloat(o.price),
-    size:         parseFloat(o.size),
-    matched:      parseFloat(o.matched),
-    liable:       parseFloat(o.liable),
-    profit:       o.side === BET_SIDE.BACK
-                    ? parseFloat(((parseFloat(o.price) - 1) * parseFloat(o.matched || o.size)).toFixed(2))
-                    : parseFloat(parseFloat(o.matched || o.size).toFixed(2)),
-    status:       o.status,
-    placedDate:   o.created_at,
-    settledAt:    o.settled_at,
+    id:                   String(o.request_id),
+    marketId:             o.market_id,
+    selectionId:          String(o.selection_id),
+    runnerName:           o.runner_name || '',
+    eventName:            o.event_name || '',
+    side:                 o.side,
+    price:                parseFloat(o.price),
+    size:                 parseFloat(o.size),
+    matched:              parseFloat(o.matched),
+    liable:               parseFloat(o.liable),
+    profit:               o.side === BET_SIDE.BACK
+                            ? parseFloat(((parseFloat(o.price) - 1) * parseFloat(o.matched || o.size)).toFixed(2))
+                            : parseFloat(parseFloat(o.matched || o.size).toFixed(2)),
+    status:               o.status,
+    placedDate:           o.created_at,
+    settled_at:           o.settled_at || null,
+    winning_selection_id: o.winning_selection_id || null,
+    settlementPnL:        o.status === ORDER_STATUS.SETTLED && o.winning_selection_id
+                            ? computeSettlementPnL(o.toJSON()) : null,
   }));
   return sendSuccess(res, { orders: formatted });
 }
@@ -364,11 +412,6 @@ async function getOrdersByEvent(req, res) {
 /* ─────────────────────────────────────────────────────────────
    HELPERS
 ────────────────────────────────────────────────────────────── */
-
-/**
- * Enrich a raw order object with real-time profit/liable values.
- * ── FIXED: Removed event_name fallback from runnerName mapping ──
- */
 function enrichOrderWithPnL(order) {
   const price  = parseFloat(order.price);
   const size   = parseFloat(order.matched > 0 ? order.matched : order.size);
@@ -382,7 +425,7 @@ function enrichOrderWithPnL(order) {
     ...order,
     profit,
     liable,
-    runnerName: order.runner_name || '',  // ── FIXED: Strictly returns database runner_name ──
+    runnerName: order.runner_name || '',
   };
 }
 
@@ -391,6 +434,7 @@ module.exports = {
   getPendingOrders,
   getMatchedOrders,
   getAllOrders,
+  getSettledOrders,
   cancelOrder,
   cancelAllPendingOrders,
   triggerAutoMatch,
