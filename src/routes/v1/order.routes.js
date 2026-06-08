@@ -8,6 +8,7 @@ const {
   getPendingOrders,
   getMatchedOrders,
   getAllOrders,
+  getSettledOrders,
   cancelOrder,
   cancelAllPendingOrders,
   triggerAutoMatch,
@@ -22,11 +23,13 @@ router.post('/',                              authenticate(), placeBets);
 router.get('/pending',                        authenticate(), getPendingOrders);
 router.get('/matched',                        authenticate(), getMatchedOrders);
 router.get('/all',                            authenticate(), getAllOrders);
+// ✅ NEW: Settled bets — statement/ledger page ke liye
+router.get('/settled',                        authenticate(), getSettledOrders);
 router.get('/event',                          authenticate(), getOrdersByEvent);
 router.post('/cancel-all',                    authenticate(), cancelAllPendingOrders);
 router.post('/:requestId/cancel',             authenticate(), cancelOrder);
 
-// ── Market P&L — per-runner breakdown for frontend ────────
+// ── Market P&L ─────────────────────────────────────────────
 router.get('/pnl/:marketId',                  authenticate(), getMarketRunnerPnL);
 
 // ── Admin / internal routes ────────────────────────────────
