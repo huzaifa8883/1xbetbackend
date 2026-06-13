@@ -111,3 +111,17 @@ app.use(notFoundHandler);
 app.use(errorHandler);
 
 module.exports = app;
+/* ─────────────────────────────────────────────────────────── */
+/* Auto-Settlement Service                                      */
+/* Market CLOSED hone par automatically bets settle karo       */
+/* ─────────────────────────────────────────────────────────── */
+// Sirf production/staging mein chalaao (test mein disable)
+if (process.env.NODE_ENV !== 'test') {
+  try {
+    const { startAutoSettlement } = require('./services/autoSettle.service');
+    startAutoSettlement();
+  } catch (e) {
+    // logger already required above
+    logger.error('[AutoSettle] Failed to start:', e.message);
+  }
+}
