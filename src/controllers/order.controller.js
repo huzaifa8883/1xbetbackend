@@ -214,14 +214,11 @@ async function getAllOrders(req, res) {
   const { Op } = require('sequelize');
   const where = { user_id: req.user.id };
 
-  // SETTLED bets yahan kabhi nahi aayein — unke liye /orders/settled route hai
-  // status param se bhi SETTLED/CANCELLED force nahi ho sakta
-  const ALLOWED_STATUSES = [ORDER_STATUS.PENDING, ORDER_STATUS.MATCHED];
-  if (status && ALLOWED_STATUSES.includes(status.toUpperCase())) {
-    where.status = status.toUpperCase();
+  if (status) {
+    where.status = status;
   } else {
-    // Default: sirf active bets (PENDING + MATCHED)
-    where.status = { [Op.in]: ALLOWED_STATUSES };
+    // Default: sirf active bets (PENDING + MATCHED), SETTLED excluded
+    where.status = { [Op.in]: [ORDER_STATUS.PENDING, ORDER_STATUS.MATCHED] };
   }
 
   const { count, rows } = await Order.findAndCountAll({
@@ -432,6 +429,24 @@ function enrichOrderWithPnL(order) {
   };
 }
 
+/* ─────────────────────────────────────────────────────────────
+   autoSettleMarket
+   Betfair se winner detect karo aur settle karo
+   POST /orders/auto-settle/:marketId
+────────────────────────────────────────────────────────────── */
+async function autoSettleMarket(req, res) {
+  const { marketId } = req.params;
+
+  try {
+    const { manualSettle } = require('../services/autoSettle.service');
+    await manualSettle(marketId);
+    return sendSuccess(res, null, `Auto-settle triggered for market ${marketId}`);
+  } catch (err) {
+    logger.error(`autoSettleMarket error: ${err.message}`);
+    return sendError(res, `Auto-settle failed: ${err.message}`, 500);
+  }
+}
+
 module.exports = {
   placeBets,
   getPendingOrders,
@@ -445,4 +460,5 @@ module.exports = {
   voidMarket,
   getMarketRunnerPnL,
   getOrdersByEvent,
+  autoSettleMarket,
 };
