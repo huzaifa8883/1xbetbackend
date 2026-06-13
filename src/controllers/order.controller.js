@@ -214,11 +214,14 @@ async function getAllOrders(req, res) {
   const { Op } = require('sequelize');
   const where = { user_id: req.user.id };
 
-  if (status) {
-    where.status = status;
+  // SETTLED bets yahan kabhi nahi aayein — unke liye /orders/settled route hai
+  // status param se bhi SETTLED/CANCELLED force nahi ho sakta
+  const ALLOWED_STATUSES = [ORDER_STATUS.PENDING, ORDER_STATUS.MATCHED];
+  if (status && ALLOWED_STATUSES.includes(status.toUpperCase())) {
+    where.status = status.toUpperCase();
   } else {
-    // Default: sirf active bets (PENDING + MATCHED), SETTLED excluded
-    where.status = { [Op.in]: [ORDER_STATUS.PENDING, ORDER_STATUS.MATCHED] };
+    // Default: sirf active bets (PENDING + MATCHED)
+    where.status = { [Op.in]: ALLOWED_STATUSES };
   }
 
   const { count, rows } = await Order.findAndCountAll({
