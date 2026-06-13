@@ -16,6 +16,7 @@ const {
   voidMarket,
   getMarketRunnerPnL,
   getOrdersByEvent,
+  autoSettleMarket,
 } = require('../../controllers/order.controller');
 
 // ── User routes ────────────────────────────────────────────
@@ -36,5 +37,7 @@ router.get('/pnl/:marketId',                  authenticate(), getMarketRunnerPnL
 router.post('/auto-match/:marketId',          triggerAutoMatch);
 router.post('/settle/:marketId',              authenticate(), settleMarket);
 router.post('/void/:marketId',                authenticate(), voidMarket);
+// ── Auto-settle: betfair se winner detect kar ke settle karo ──
+router.post('/auto-settle/:marketId',         authenticate(), autoSettleMarket);
 
 module.exports = router;
