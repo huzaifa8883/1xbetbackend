@@ -66,6 +66,14 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
 async function listMarketBook(marketIds = [], priceProjection = { priceData: ['EX_BEST_OFFERS'], virtualise: true }) {
   return jsonRpc('SportsAPING/v1.0/listMarketBook', { marketIds, priceProjection });
 }
+async function listMarketProfitAndLoss(marketIds = []) {
+  return jsonRpc('SportsAPING/v1.0/listMarketProfitAndLoss', {
+    marketIds,
+    includeSettledBets: true,
+    includeBspBets: true,
+    netOfCommission: false,
+  });
+}
 
 /* ── getEventDetails (orders.js compatible) ─────────────── */
 async function getEventDetails(marketId) {
