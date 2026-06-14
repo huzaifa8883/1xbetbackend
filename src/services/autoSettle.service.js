@@ -10,8 +10,12 @@
 
    V2 APPROACH — Teen tarike se winner detect karo:
    1. runner.status === 'WINNER'           (betfair ne declare kiya)
-   2. runner.lastPriceTraded === 1.0       (1.0 pe settle = winner)  
+   2. runner.lastPriceTraded === 1.0       (1.0 pe settle = winner)
    3. runner.sp.nearPrice === 1.0          (SP near 1.0 = winner)
+
+   FALLBACK — agar catalog2 404 de (market Betfair se "current
+   markets" se drop hochuki hai), to listMarketProfitAndLoss se
+   winner detect karo.
 
    FILE LOCATION: services/autoSettle.service.js
    USAGE in app.js:
@@ -24,7 +28,6 @@ const { Order }           = require('../models');
 const { ORDER_STATUS }    = require('../config/constants');
 const { settleEventBets } = require('./order.service');
 const { listMarketProfitAndLoss } = require('./betfair.service');
-
 const logger              = require('../utils/logger');
 
 // ── Config ────────────────────────────────────────────────────────
@@ -94,31 +97,7 @@ function detectWinner(catalog) {
       return { winningSelectionId: selId };
     }
   }
-/* ─────────────────────────────────────────────────────────────────
-   detectWinnerFromPnL — jab catalog2 404 de (market Betfair se gayab
-   ho gayi), listMarketProfitAndLoss se winner nikaalo.
-   Winner = jis runner ka 'profit' > 0 hai (ya position > 0)
-──────────────────────────────────────────────────────────────────*/
-async function detectWinnerFromPnL(marketId) {
-  try {
-    const results = await listMarketProfitAndLoss([marketId]);
-    const market   = results?.[0];
-    if (!market) return null;
 
-    const profits = market.profitAndLosses || [];
-    if (!profits.length) return null;
-
-    const winner = profits.find(p => Number(p.ifWin) > 0);
-    if (!winner) return null;
-
-    const selId = String(winner.selectionId);
-    logger.info(`[AutoSettle] Winner via listMarketProfitAndLoss: market=${marketId} selId=${selId}`);
-    return { winningSelectionId: selId };
-  } catch (e) {
-    logger.warn(`[AutoSettle] listMarketProfitAndLoss failed for ${marketId}: ${e.message}`);
-    return null;
-  }
-}
   // ── Method 2: lastPriceTraded === 1.0 (winner always settles at 1) ──
   const lptWinner = runners.find(r => {
     const lpt = parseFloat(r.lastPriceTraded || r.LastPriceTraded || 0);
@@ -156,6 +135,32 @@ async function detectWinnerFromPnL(marketId) {
   // Winner detect nahi hua — betfair ne abhi declare nahi kiya
   logger.debug(`[AutoSettle] Market ${catalog.marketId || '?'} CLOSED but no winner yet`);
   return null;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   detectWinnerFromPnL — jab catalog2 404 de (market Betfair se gayab
+   ho gayi), listMarketProfitAndLoss se winner nikaalo.
+   Winner = jis runner ka 'ifWin' > 0 hai
+──────────────────────────────────────────────────────────────────*/
+async function detectWinnerFromPnL(marketId) {
+  try {
+    const results = await listMarketProfitAndLoss([marketId]);
+    const market   = results?.[0];
+    if (!market) return null;
+
+    const profits = market.profitAndLosses || [];
+    if (!profits.length) return null;
+
+    const winner = profits.find(p => Number(p.ifWin) > 0);
+    if (!winner) return null;
+
+    const selId = String(winner.selectionId);
+    logger.info(`[AutoSettle] Winner via listMarketProfitAndLoss: market=${marketId} selId=${selId}`);
+    return { winningSelectionId: selId };
+  } catch (e) {
+    logger.warn(`[AutoSettle] listMarketProfitAndLoss failed for ${marketId}: ${e.message}`);
+    return null;
+  }
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -197,6 +202,7 @@ async function processMarket(marketId) {
     _inProgress.delete(marketId);
   }
 }
+
 /* ─────────────────────────────────────────────────────────────────
    pollAndSettle  — har interval pe DB se active markets lo
 ──────────────────────────────────────────────────────────────────*/
