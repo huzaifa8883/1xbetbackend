@@ -27,8 +27,22 @@ const { Op }              = require('sequelize');
 const { Order }           = require('../models');
 const { ORDER_STATUS }    = require('../config/constants');
 const { settleEventBets } = require('./order.service');
-const { listMarketProfitAndLoss } = require('./betfair.service');
 const logger              = require('../utils/logger');
+
+// ── Safe import: betfair.service se listMarketProfitAndLoss ──
+// Lazy require se bachne ke liye yahan direct import + fallback guard
+let listMarketProfitAndLoss;
+try {
+  const bfService = require('./betfair.service');
+  listMarketProfitAndLoss = bfService.listMarketProfitAndLoss;
+  if (typeof listMarketProfitAndLoss !== 'function') {
+    throw new Error('listMarketProfitAndLoss exported value is not a function');
+  }
+} catch (e) {
+  logger.error('[AutoSettle] betfair.service import failed: ' + e.message);
+  // Fallback: no-op so server doesn't crash
+  listMarketProfitAndLoss = async () => null;
+}
 
 // ── Config ────────────────────────────────────────────────────────
 const POLL_INTERVAL  = parseInt(process.env.AUTO_SETTLE_INTERVAL_MS     || '10000', 10);
