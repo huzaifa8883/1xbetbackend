@@ -114,4 +114,5 @@ module.exports = {
   listEvents,
   listMarketCatalogue,
   listMarketBook,
+  listMarketProfitAndLoss
 };
