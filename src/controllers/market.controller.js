@@ -459,6 +459,7 @@ async function getMarketCatalog2(req, res) {
     status:              book.status,
     isTurnInPlayEnabled: book.isTurnInPlay,
     betDelay:            book.betDelay,
+    maxBetSize:          book.maxBetSize ?? book.totalMatched ?? 0,
     rules:               catalog.description?.rules || '',
     sport: { name: sportName, image: iconMap[sportName] || 'default.svg', active: true },
     runners: (catalog.runners || []).map(r => ({
@@ -606,7 +607,7 @@ async function getEventMarkets(req, res) {
         status:      book?.status      || 'OPEN',
         status2:     null,
         inPlay:      book?.inPlay      || false,
-        maxBetSize:  book?.totalMatched || 0,
+        maxBetSize:  book?.maxBetSize  ?? book?.totalMatched ?? 0,
         bettingType: market.description?.bettingType || 'ODDS',
         eventTypeId: market.eventType?.id || null,
         runners:     buildOddsPayload(market.runners || [], book),
