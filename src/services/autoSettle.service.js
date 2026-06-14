@@ -23,6 +23,8 @@ const { Op }              = require('sequelize');
 const { Order }           = require('../models');
 const { ORDER_STATUS }    = require('../config/constants');
 const { settleEventBets } = require('./order.service');
+const { listMarketProfitAndLoss } = require('./betfair.service');
+
 const logger              = require('../utils/logger');
 
 // ── Config ────────────────────────────────────────────────────────
@@ -92,7 +94,31 @@ function detectWinner(catalog) {
       return { winningSelectionId: selId };
     }
   }
+/* ─────────────────────────────────────────────────────────────────
+   detectWinnerFromPnL — jab catalog2 404 de (market Betfair se gayab
+   ho gayi), listMarketProfitAndLoss se winner nikaalo.
+   Winner = jis runner ka 'profit' > 0 hai (ya position > 0)
+──────────────────────────────────────────────────────────────────*/
+async function detectWinnerFromPnL(marketId) {
+  try {
+    const results = await listMarketProfitAndLoss([marketId]);
+    const market   = results?.[0];
+    if (!market) return null;
 
+    const profits = market.profitAndLosses || [];
+    if (!profits.length) return null;
+
+    const winner = profits.find(p => Number(p.ifWin) > 0);
+    if (!winner) return null;
+
+    const selId = String(winner.selectionId);
+    logger.info(`[AutoSettle] Winner via listMarketProfitAndLoss: market=${marketId} selId=${selId}`);
+    return { winningSelectionId: selId };
+  } catch (e) {
+    logger.warn(`[AutoSettle] listMarketProfitAndLoss failed for ${marketId}: ${e.message}`);
+    return null;
+  }
+}
   // ── Method 2: lastPriceTraded === 1.0 (winner always settles at 1) ──
   const lptWinner = runners.find(r => {
     const lpt = parseFloat(r.lastPriceTraded || r.LastPriceTraded || 0);
@@ -142,7 +168,12 @@ async function processMarket(marketId) {
 
   try {
     const catalog = await fetchMarketCatalog(marketId);
-    const result  = detectWinner(catalog);
+    let result    = detectWinner(catalog);
+
+    // ── Fallback: catalog2 404 (market Betfair se drop hochuki) ──
+    if (!result) {
+      result = await detectWinnerFromPnL(marketId);
+    }
 
     if (!result) return; // not closed or no winner yet
 
@@ -166,7 +197,6 @@ async function processMarket(marketId) {
     _inProgress.delete(marketId);
   }
 }
-
 /* ─────────────────────────────────────────────────────────────────
    pollAndSettle  — har interval pe DB se active markets lo
 ──────────────────────────────────────────────────────────────────*/
