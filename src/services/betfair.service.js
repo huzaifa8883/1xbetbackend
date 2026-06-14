@@ -41,7 +41,8 @@ async function jsonRpc(method, params) {
     headers: { 'X-Application': APP_KEY, 'X-Authentication': token, 'Content-Type': 'application/json' }
   });
   const result = resp.data[0]?.result;
-  if (!result) throw new Error(`No result from Betfair: ${method}`);
+  const error  = resp.data[0]?.error;
+  if (!result) throw new Error(`No result from Betfair: ${method} - error: ${JSON.stringify(error)}`);
   return result;
 }
 
@@ -66,6 +67,7 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
 async function listMarketBook(marketIds = [], priceProjection = { priceData: ['EX_BEST_OFFERS'], virtualise: true }) {
   return jsonRpc('SportsAPING/v1.0/listMarketBook', { marketIds, priceProjection });
 }
+
 async function listMarketProfitAndLoss(marketIds = []) {
   return jsonRpc('SportsAPING/v1.0/listMarketProfitAndLoss', {
     marketIds,
@@ -114,5 +116,5 @@ module.exports = {
   listEvents,
   listMarketCatalogue,
   listMarketBook,
-  listMarketProfitAndLoss
+  listMarketProfitAndLoss,
 };
