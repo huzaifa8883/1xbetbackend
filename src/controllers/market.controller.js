@@ -15,7 +15,7 @@ const logger = require('../utils/logger');
 
 /* ── Helpers ────────────────────────────────────────────── */
 
-function buildOddsPayload(runners, books) {
+function buildOddsPayload(runners, books, sportKey = 'horse') {
   return runners.map((runner) => {
     const rb = books?.runners?.find((r) => r.selectionId === runner.selectionId);
 
@@ -27,19 +27,42 @@ function buildOddsPayload(runners, books) {
     const sortPriority = runner.sortPriority || null;
     const posNum = parseInt(clothNumber) || parseInt(sortPriority) || 1;
 
-    // Standard racing cloth colors (position-based fallback)
+    // Standard racing cloth colors (horse race position-based fallback)
     const RACE_COLORS = [
       '#E63946','#FFFFFF','#1D3557','#F4D03F','#2ECC71','#111111','#F39C12','#8E44AD',
       '#16A085','#E74C3C','#3498DB','#F1C40F','#E67E22','#1ABC9C','#95A5A6','#2C3E50',
       '#C0392B','#7F8C8D','#27AE60','#D35400',
     ];
-    const clothColor = RACE_COLORS[(posNum - 1) % RACE_COLORS.length];
+
+    // Standard greyhound trap colors — fixed worldwide (Australia/AU 8-trap format):
+    // 1 Red, 2 Blue, 3 White, 4 Black, 5 Orange, 6 Black & White stripes, 7 Green, 8 Pink
+    // (greyhounds don't get individual silk images — colors are trap-fixed, not horse-specific)
+    const GREYHOUND_COLORS = [
+      '#E63946', // 1 Red
+      '#1D3557', // 2 Blue
+      '#FFFFFF', // 3 White
+      '#111111', // 4 Black
+      '#F39C12', // 5 Orange
+      '#111111', // 6 Black & White stripes (pattern flag below overrides display)
+      '#2ECC71', // 7 Green
+      '#FF8FB1', // 8 Pink
+    ];
+    const GREYHOUND_STRIPED_TRAPS = [6]; // trap number(s) that render as black/white stripes, not solid
+
+    const isGreyhound = sportKey === 'greyhound';
+    const clothColor = isGreyhound
+      ? GREYHOUND_COLORS[(posNum - 1) % GREYHOUND_COLORS.length]
+      : RACE_COLORS[(posNum - 1) % RACE_COLORS.length];
+    const isStriped = isGreyhound && GREYHOUND_STRIPED_TRAPS.includes(posNum);
 
     // Silk image URL — Betfair RUNNER_METADATA mein asal field COLOURS_FILENAME_URL hai
     // (SILK_URL naam ki field exist nahi karti — wo purana/galat assumption tha)
     // Format: https://content.betfair.com/feeds_images/Horses/SilkColours/...
-    const silkUrl =
-      meta.COLOURS_FILENAME_URL || meta.colours_filename_url || meta.ColoursFilenameUrl || null;
+    // Greyhound races mein ye field generally nahi aati (trap color hi badge hai), is
+    // liye horse race ke liye hi silkUrl bharo — greyhound ke liye hamesha trap color use hoga.
+    const silkUrl = isGreyhound
+      ? null
+      : (meta.COLOURS_FILENAME_URL || meta.colours_filename_url || meta.ColoursFilenameUrl || null);
 
     const jockeyName  = meta.JOCKEY_NAME  || meta.jockey_name  || meta.JockeyName  || null;
     const trainerName = meta.TRAINER_NAME || meta.trainer_name || meta.TrainerName || null;
@@ -59,7 +82,8 @@ function buildOddsPayload(runners, books) {
       // Cloth
       clothNumber,
       clothColor,   // always set — fallback color agar silk image na ho
-      // Silk image — BPExch ki tarah Betfair URL se image show hogi
+      clothStriped: isStriped,  // true => UI ko black/white diagonal stripe pattern banana hai
+      // Silk image — BPExch ki tarah Betfair URL se image show hogi (horse race only)
       silkUrl,
       // Jockey / trainer
       jockeyName,
@@ -144,7 +168,7 @@ async function fetchSportMarkets(sportKey, eventTypeId, overrides = {}) {
       marketStatus:   book?.status || 'UNKNOWN',
       inPlay:         book?.inPlay || false,
       totalMatched:   book?.totalMatched || 0,
-      runners:        buildOddsPayload(market.runners || [], book),
+      runners:        buildOddsPayload(market.runners || [], book, sportKey),
       competitionId:  market.competition?.id   || null,
       competitionName: market.competition?.name || null,
     };
@@ -267,7 +291,7 @@ async function getLiveHorse(req, res) {
         marketStatus:    book?.status || 'UNKNOWN',
         inPlay:          book?.inPlay || false,
         totalMatched:    book?.totalMatched || 0,
-        runners:         buildOddsPayload(market.runners || [], book),
+        runners:         buildOddsPayload(market.runners || [], book, 'horse'),
         competitionId:   market.competition?.id   || null,
         competitionName: market.competition?.name || null,
       };
@@ -349,7 +373,7 @@ async function getLiveGreyhound(req, res) {
         marketStatus:    book?.status || 'UNKNOWN',
         inPlay:          book?.inPlay || false,
         totalMatched:    book?.totalMatched || 0,
-        runners:         buildOddsPayload(market.runners || [], book),
+        runners:         buildOddsPayload(market.runners || [], book, 'greyhound'),
         competitionId:   market.competition?.id   || null,
         competitionName: market.competition?.name || null,
       };
@@ -399,13 +423,15 @@ async function getLiveSport(req, res) {
   const data = catalogues.map(market => {
     const book  = books.find(b => b.marketId === market.marketId);
     const event = events.find(e => e.event.id === market.event?.id);
+    // Greyhound ka Betfair eventTypeId 4339 hai — isi se trap-color scheme decide hoti hai
+    const detectedSportKey = (market.eventType?.id || eventTypeIds) === '4339' ? 'greyhound' : 'horse';
     return {
       marketId:     market.marketId,
       match:        event?.event.name || 'Unknown',
       startTime:    event?.event.openDate || '',
       inPlay:       book?.inPlay || false,
       totalMatched: book?.totalMatched || 0,
-      runners:      buildOddsPayload(market.runners || [], book),
+      runners:      buildOddsPayload(market.runners || [], book, detectedSportKey),
       marketBook:   book || null,
     };
   });
@@ -756,6 +782,10 @@ async function getEventMarkets(req, res) {
       const marketType = market.description?.marketType || '';
       const marketName = market.marketName || '';
 
+      // Greyhound ka Betfair eventTypeId 4339 hai — isi se trap-color scheme decide hoti hai
+      const evtTypeId = market.eventType?.id || null;
+      const detectedSportKey = evtTypeId === '4339' ? 'greyhound' : 'horse';
+
       return {
         marketId:    market.marketId,
         marketName,
@@ -765,8 +795,8 @@ async function getEventMarkets(req, res) {
         inPlay:      book?.inPlay      || false,
         maxBetSize:  book?.maxBetSize  ?? book?.totalMatched ?? 0,
         bettingType: market.description?.bettingType || 'ODDS',
-        eventTypeId: market.eventType?.id || null,
-        runners:     buildOddsPayload(market.runners || [], book),
+        eventTypeId: evtTypeId,
+        runners:     buildOddsPayload(market.runners || [], book, detectedSportKey),
       };
     });
 
