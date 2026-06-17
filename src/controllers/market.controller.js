@@ -190,21 +190,78 @@ async function getLiveTennis(req, res) {
 
 async function getLiveHorse(req, res) {
   try {
-    const data = await fetchSportMarkets('horse', 7, {
-      marketTypes: 'WIN',
-      maxResults: 200,
-      hoursAhead: 24,
+    const cfg = await getSportCfg('horse');
+    if (cfg && cfg.is_active === false) return sendSuccess(res, []);
+
+    const maxResults = String(cfg?.max_results ?? 200);
+    const hoursAhead = cfg?.hours_ahead ?? 24;
+
+    const now  = new Date();
+    // ✅ from: 5 min peeche (inplay races cover karne ke liye)
+    const from = new Date(now.getTime() - 5 * 60_000).toISOString();
+    const to   = new Date(now.getTime() + hoursAhead * 3600_000).toISOString();
+
+    const eventFilter = {
+      eventTypeIds: ['7'],
+      marketStartTime: { from, to },
+    };
+    if (cfg?.allowed_countries)       eventFilter.marketCountries = cfg.allowed_countries.split(',').map(s => s.trim());
+    if (cfg?.allowed_competition_ids) eventFilter.competitionIds  = cfg.allowed_competition_ids.split(',').map(s => s.trim());
+
+    const events = await listEvents(eventFilter);
+    if (!events.length) return sendSuccess(res, []);
+
+    const catalogues = await listMarketCatalogue(
+      { eventIds: events.map(e => e.event.id), marketTypeCodes: ['WIN'] },
+      maxResults,
+      ['EVENT', 'RUNNER_METADATA', 'COMPETITION', 'RUNNER_DESCRIPTION', 'MARKET_START_TIME']
+    );
+    if (!catalogues.length) return sendSuccess(res, []);
+
+    // Books fetch in chunks
+    const CHUNK = 200;
+    const allMarketIds = catalogues.map(m => m.marketId);
+    let allBooks = [];
+    for (let i = 0; i < allMarketIds.length; i += CHUNK) {
+      const books = await listMarketBook(allMarketIds.slice(i, i + CHUNK)).catch(() => []);
+      allBooks = allBooks.concat(books);
+    }
+
+    // ✅ Map — marketStartTime use karo (race-specific, more accurate than event.openDate)
+    const mapped = catalogues.map(market => {
+      const book  = allBooks.find(b => b.marketId === market.marketId);
+      const event = events.find(e => e.event.id === market.event?.id);
+      const startTime = market.marketStartTime || event?.event.openDate || '';
+
+      return {
+        marketId:        market.marketId,
+        match:           event?.event.name || market.marketName || 'Unknown',
+        startTime,
+        marketStatus:    book?.status || 'UNKNOWN',
+        inPlay:          book?.inPlay || false,
+        totalMatched:    book?.totalMatched || 0,
+        runners:         buildOddsPayload(market.runners || [], book),
+        competitionId:   market.competition?.id   || null,
+        competitionName: market.competition?.name || null,
+      };
     });
 
-    // Deduplicate: same track (match name) + same start minute = duplicate event
+    // ✅ Filter: sirf future + recently started (5 min grace period)
+    const cutoff = new Date(now.getTime() - 5 * 60_000);
+    const filtered = mapped.filter(d => d.startTime && new Date(d.startTime) >= cutoff);
+
+    // ✅ Deduplicate: same track + same minute
     const seen = new Set();
-    const deduped = data.filter(d => {
-      const timeKey = d.startTime ? d.startTime.substring(0, 16) : ''; // YYYY-MM-DDTHH:MM
+    const deduped = filtered.filter(d => {
+      const timeKey = d.startTime ? d.startTime.substring(0, 16) : '';
       const key = `${d.match}__${timeKey}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
+
+    // ✅ Sort ascending — nearest race pehle
+    deduped.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
 
     return sendSuccess(res, deduped);
   } catch (err) {
@@ -215,18 +272,76 @@ async function getLiveHorse(req, res) {
 
 async function getLiveGreyhound(req, res) {
   try {
-    const data = await fetchSportMarkets('greyhound', 4339, {
-      marketTypes: 'WIN',
-      maxResults: 200,
-      hoursAhead: 12,
+    const cfg = await getSportCfg('greyhound');
+    if (cfg && cfg.is_active === false) return sendSuccess(res, []);
+
+    const maxResults = String(cfg?.max_results ?? 200);
+    const hoursAhead = cfg?.hours_ahead ?? 12;
+
+    const now  = new Date();
+    // ✅ from: 5 min peeche (inplay races cover karne ke liye)
+    const from = new Date(now.getTime() - 5 * 60_000).toISOString();
+    const to   = new Date(now.getTime() + hoursAhead * 3600_000).toISOString();
+
+    const eventFilter = {
+      eventTypeIds: ['4339'],
+      marketStartTime: { from, to },
+    };
+    if (cfg?.allowed_countries)       eventFilter.marketCountries = cfg.allowed_countries.split(',').map(s => s.trim());
+    if (cfg?.allowed_competition_ids) eventFilter.competitionIds  = cfg.allowed_competition_ids.split(',').map(s => s.trim());
+
+    const events = await listEvents(eventFilter);
+    if (!events.length) return sendSuccess(res, []);
+
+    const catalogues = await listMarketCatalogue(
+      { eventIds: events.map(e => e.event.id), marketTypeCodes: ['WIN'] },
+      maxResults,
+      ['EVENT', 'RUNNER_METADATA', 'COMPETITION', 'RUNNER_DESCRIPTION', 'MARKET_START_TIME']
+    );
+    if (!catalogues.length) return sendSuccess(res, []);
+
+    // Books fetch in chunks
+    const CHUNK = 200;
+    const allMarketIds = catalogues.map(m => m.marketId);
+    let allBooks = [];
+    for (let i = 0; i < allMarketIds.length; i += CHUNK) {
+      const books = await listMarketBook(allMarketIds.slice(i, i + CHUNK)).catch(() => []);
+      allBooks = allBooks.concat(books);
+    }
+
+    // ✅ Map — marketStartTime use karo (race-specific time)
+    const mapped = catalogues.map(market => {
+      const book  = allBooks.find(b => b.marketId === market.marketId);
+      const event = events.find(e => e.event.id === market.event?.id);
+      const startTime = market.marketStartTime || event?.event.openDate || '';
+
+      return {
+        marketId:        market.marketId,
+        match:           event?.event.name || market.marketName || 'Unknown',
+        startTime,
+        marketStatus:    book?.status || 'UNKNOWN',
+        inPlay:          book?.inPlay || false,
+        totalMatched:    book?.totalMatched || 0,
+        runners:         buildOddsPayload(market.runners || [], book),
+        competitionId:   market.competition?.id   || null,
+        competitionName: market.competition?.name || null,
+      };
     });
 
+    // ✅ Filter: sirf future + recently started (5 min grace period)
+    const cutoff = new Date(now.getTime() - 5 * 60_000);
+    const filtered = mapped.filter(d => d.startTime && new Date(d.startTime) >= cutoff);
+
+    // ✅ Deduplicate by marketId
     const seen = new Set();
-    const deduped = data.filter(d => {
+    const deduped = filtered.filter(d => {
       if (seen.has(d.marketId)) return false;
       seen.add(d.marketId);
       return true;
     });
+
+    // ✅ Sort ascending — nearest race pehle
+    deduped.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
 
     return sendSuccess(res, deduped);
   } catch (err) {
