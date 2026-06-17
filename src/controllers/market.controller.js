@@ -757,7 +757,7 @@ async function getEventMarkets(req, res) {
     const catalogues = await listMarketCatalogue(
       { eventIds: [String(eventId)] },
       '200',  // Betfair max 200
-      ['EVENT', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION', 'RUNNER_METADATA'],
+      ['EVENT', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION', 'RUNNER_METADATA', 'MARKET_START_TIME'],
     );
 
     if (!catalogues.length) {
@@ -796,6 +796,9 @@ async function getEventMarkets(req, res) {
         maxBetSize:  book?.maxBetSize  ?? book?.totalMatched ?? 0,
         bettingType: market.description?.bettingType || 'ODDS',
         eventTypeId: evtTypeId,
+        // ✅ Match/race ka asal scheduled start time — Betfair MARKET_START_TIME projection se.
+        //    Iske bina race timer (Remaining/Elapsed) aur header date kabhi sahi nahi banenge.
+        marketStartTime: market.marketStartTime || null,
         runners:     buildOddsPayload(market.runners || [], book, detectedSportKey),
       };
     });
