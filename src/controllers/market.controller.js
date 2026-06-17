@@ -35,9 +35,11 @@ function buildOddsPayload(runners, books) {
     ];
     const clothColor = RACE_COLORS[(posNum - 1) % RACE_COLORS.length];
 
-    // SILK_URL — Betfair se jockey/greyhound vest ki image URL
-    // Format: https://content.betfair.com/feeds_images/Horses/SilkColours/... ya CDN URL
-    const silkUrl = meta.SILK_URL || meta.silk_url || meta.SilkUrl || null;
+    // Silk image URL — Betfair RUNNER_METADATA mein asal field COLOURS_FILENAME_URL hai
+    // (SILK_URL naam ki field exist nahi karti — wo purana/galat assumption tha)
+    // Format: https://content.betfair.com/feeds_images/Horses/SilkColours/...
+    const silkUrl =
+      meta.COLOURS_FILENAME_URL || meta.colours_filename_url || meta.ColoursFilenameUrl || null;
 
     const jockeyName  = meta.JOCKEY_NAME  || meta.jockey_name  || meta.JockeyName  || null;
     const trainerName = meta.TRAINER_NAME || meta.trainer_name || meta.TrainerName || null;
@@ -620,7 +622,7 @@ async function getMarketCatalog2(req, res) {
         status:       'ACTIVE',
         clothNumber:  cNum,
         clothColor:   RACE_COLORS[(posN - 1) % RACE_COLORS.length],
-        silkUrl:      m2.SILK_URL     || m2.silk_url     || m2.SilkUrl     || null,
+        silkUrl:      m2.COLOURS_FILENAME_URL || m2.colours_filename_url || m2.ColoursFilenameUrl || null,
         jockeyName:   m2.JOCKEY_NAME  || m2.jockey_name  || m2.JockeyName  || null,
         trainerName:  m2.TRAINER_NAME || m2.trainer_name || m2.TrainerName || null,
         stallDraw:    m2.STALL_DRAW   || m2.stall_draw   || m2.StallDraw   || null,
