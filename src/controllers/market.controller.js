@@ -21,11 +21,15 @@ function buildOddsPayload(runners, books) {
 
     // RUNNER_METADATA fields — horse race aur greyhound ke liye
     const meta = runner.metadata || {};
-    const clothNumber = runner.metadata?.CLOTH_NUMBER || runner.metadata?.cloth_number || null;
-    const jockeyName  = runner.metadata?.JOCKEY_NAME  || runner.metadata?.jockey_name  || null;
-    const trainerName = runner.metadata?.TRAINER_NAME || runner.metadata?.trainer_name || null;
-    const silkUrl     = runner.metadata?.SILK_URL      || runner.metadata?.silk_url     || null;
-    const stallDraw   = runner.metadata?.STALL_DRAW    || runner.metadata?.stall_draw   || null;
+    const clothNumber  = runner.metadata?.CLOTH_NUMBER  || runner.metadata?.cloth_number  || null;
+    const jockeyName   = runner.metadata?.JOCKEY_NAME   || runner.metadata?.jockey_name   || null;
+    const trainerName  = runner.metadata?.TRAINER_NAME  || runner.metadata?.trainer_name  || null;
+    const silkUrl      = runner.metadata?.SILK_URL       || runner.metadata?.silk_url      || null;
+    const stallDraw    = runner.metadata?.STALL_DRAW     || runner.metadata?.stall_draw    || null;
+    // Betfair runner cloth colours — COLOUR_1 = primary, COLOUR_2 = secondary, COLOUR_3 = tertiary
+    const colour1      = runner.metadata?.COLOUR_1       || runner.metadata?.colour_1      || null;
+    const colour2      = runner.metadata?.COLOUR_2       || runner.metadata?.colour_2      || null;
+    const colour3      = runner.metadata?.COLOUR_3       || runner.metadata?.colour_3      || null;
 
     return {
       selectionId:  runner.selectionId,
@@ -41,6 +45,9 @@ function buildOddsPayload(runners, books) {
       trainerName,
       silkUrl,
       stallDraw,
+      colour1,
+      colour2,
+      colour3,
       metadataDict: Object.keys(meta).length > 0 ? meta : null,
     };
   });
@@ -237,6 +244,8 @@ async function getLiveHorse(req, res) {
         marketId:        market.marketId,
         match:           event?.event.name || market.marketName || 'Unknown',
         startTime,
+        marketStartTime: startTime,   // ← explicit alias (frontend uses this field)
+        venue:           market.description?.venue || event?.event.venue || null,
         marketStatus:    book?.status || 'UNKNOWN',
         inPlay:          book?.inPlay || false,
         totalMatched:    book?.totalMatched || 0,
@@ -319,6 +328,8 @@ async function getLiveGreyhound(req, res) {
         marketId:        market.marketId,
         match:           event?.event.name || market.marketName || 'Unknown',
         startTime,
+        marketStartTime: startTime,   // ← explicit alias (frontend uses this field)
+        venue:           market.description?.venue || event?.event.venue || null,
         marketStatus:    book?.status || 'UNKNOWN',
         inPlay:          book?.inPlay || false,
         totalMatched:    book?.totalMatched || 0,
