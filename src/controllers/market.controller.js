@@ -65,7 +65,7 @@ async function fetchSportMarkets(sportKey, eventTypeId, overrides = {}) {
   const hoursAhead    = cfg?.hours_ahead  ?? overrides.hoursAhead  ?? 24;
 
   const now = new Date();
-  const from = new Date(now.getTime() - 2 * 3600_000).toISOString();
+  const from = new Date(now.getTime() - 30 * 60_000).toISOString();  // 30 min pehle (inplay races cover karne ke liye)
   const to   = new Date(now.getTime() + hoursAhead * 3600_000).toISOString();
 
   // Build event filter
