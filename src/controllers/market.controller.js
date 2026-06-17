@@ -20,34 +20,81 @@ function buildOddsPayload(runners, books) {
     const rb = books?.runners?.find((r) => r.selectionId === runner.selectionId);
 
     // RUNNER_METADATA fields — horse race aur greyhound ke liye
-    const meta = runner.metadata || {};
-    const clothNumber  = runner.metadata?.CLOTH_NUMBER  || runner.metadata?.cloth_number  || null;
-    const jockeyName   = runner.metadata?.JOCKEY_NAME   || runner.metadata?.jockey_name   || null;
-    const trainerName  = runner.metadata?.TRAINER_NAME  || runner.metadata?.trainer_name  || null;
-    const silkUrl      = runner.metadata?.SILK_URL       || runner.metadata?.silk_url      || null;
-    const stallDraw    = runner.metadata?.STALL_DRAW     || runner.metadata?.stall_draw    || null;
-    // Betfair runner cloth colours — COLOUR_1 = primary, COLOUR_2 = secondary, COLOUR_3 = tertiary
-    const colour1      = runner.metadata?.COLOUR_1       || runner.metadata?.colour_1      || null;
-    const colour2      = runner.metadata?.COLOUR_2       || runner.metadata?.colour_2      || null;
-    const colour3      = runner.metadata?.COLOUR_3       || runner.metadata?.colour_3      || null;
+    // Betfair metadata kuch services mein runner.metadata, kuch mein runner.runnerMetadata ke tor pe aata hai
+    const meta = runner.metadata || runner.runnerMetadata || {};
+
+    // CLOTH_NUMBER — Betfair mein string hota hai (e.g. "1", "2", "3")
+    // Kuch tracks pe clothNumber nahi hota — tab sortPriority use karo
+    const clothNumber = meta.CLOTH_NUMBER
+      || meta.cloth_number
+      || meta.ClothNumber
+      || runner.clothNumber
+      || null;
+
+    // sortPriority — always present from Betfair, 1-indexed
+    const sortPriority = runner.sortPriority || null;
+
+    // Effective position number — cloth number pehle, warna sort priority
+    const posNum = parseInt(clothNumber) || parseInt(sortPriority) || 1;
+
+    // Standard international racing cloth colors (by position/cloth number)
+    // Ye hi BPExch aur actual racecourses mein use hoti hain
+    const RACE_COLORS = [
+      '#E63946',  // 1  — Red
+      '#FFFFFF',  // 2  — White
+      '#1D3557',  // 3  — Dark Blue
+      '#F4D03F',  // 4  — Yellow
+      '#2ECC71',  // 5  — Green
+      '#111111',  // 6  — Black
+      '#F39C12',  // 7  — Orange
+      '#8E44AD',  // 8  — Purple
+      '#16A085',  // 9  — Teal
+      '#E74C3C',  // 10 — Crimson
+      '#3498DB',  // 11 — Sky Blue
+      '#F1C40F',  // 12 — Gold
+      '#E67E22',  // 13 — Dark Orange
+      '#1ABC9C',  // 14 — Turquoise
+      '#95A5A6',  // 15 — Silver
+      '#2C3E50',  // 16 — Dark Navy
+      '#C0392B',  // 17 — Dark Red
+      '#7F8C8D',  // 18 — Gray
+      '#27AE60',  // 19 — Dark Green
+      '#D35400',  // 20 — Brown Orange
+    ];
+    const clothColor = RACE_COLORS[(posNum - 1) % RACE_COLORS.length];
+
+    const jockeyName  = meta.JOCKEY_NAME  || meta.jockey_name  || meta.JockeyName  || null;
+    const trainerName = meta.TRAINER_NAME || meta.trainer_name || meta.TrainerName || null;
+    // SILK_URL — Betfair se jockey ki silk ka image URL aata hai (hex color nahi)
+    const silkUrl     = meta.SILK_URL     || meta.silk_url     || meta.SilkUrl     || null;
+    const stallDraw   = meta.STALL_DRAW   || meta.stall_draw   || meta.StallDraw   || null;
+    const age         = meta.AGE          || meta.age          || null;
+    const weight      = meta.WEIGHT_VALUE || meta.weight_value || null;
+    const form        = meta.FORM         || meta.form         || null;
+    const officialRating = meta.OFFICIAL_RATING || meta.official_rating || null;
 
     return {
-      selectionId:  runner.selectionId,
-      runnerName:   runner.runnerName,
-      sortPriority: runner.sortPriority,
+      selectionId:   runner.selectionId,
+      runnerName:    runner.runnerName,
+      sortPriority,
       back:  rb?.ex?.availableToBack?.slice(0, 3) || [],
       lay:   rb?.ex?.availableToLay?.slice(0, 3)  || [],
       status: rb?.status || 'ACTIVE',
       lastPriceTraded: rb?.lastPriceTraded || null,
-      // Metadata fields for horse/greyhound runner display
+      // Cloth / color
       clothNumber,
+      clothColor,     // ← derived color: always present, never null
+      // Jockey / trainer info
       jockeyName,
       trainerName,
-      silkUrl,
+      silkUrl,        // Betfair silk image URL (for silk image display)
       stallDraw,
-      colour1,
-      colour2,
-      colour3,
+      // Extra race info
+      age,
+      weight,
+      form,
+      officialRating,
+      // Raw metadata (for debugging / future use)
       metadataDict: Object.keys(meta).length > 0 ? meta : null,
     };
   });
@@ -244,8 +291,6 @@ async function getLiveHorse(req, res) {
         marketId:        market.marketId,
         match:           event?.event.name || market.marketName || 'Unknown',
         startTime,
-        marketStartTime: startTime,   // ← explicit alias (frontend uses this field)
-        venue:           market.description?.venue || event?.event.venue || null,
         marketStatus:    book?.status || 'UNKNOWN',
         inPlay:          book?.inPlay || false,
         totalMatched:    book?.totalMatched || 0,
@@ -328,8 +373,6 @@ async function getLiveGreyhound(req, res) {
         marketId:        market.marketId,
         match:           event?.event.name || market.marketName || 'Unknown',
         startTime,
-        marketStartTime: startTime,   // ← explicit alias (frontend uses this field)
-        venue:           market.description?.venue || event?.event.venue || null,
         marketStatus:    book?.status || 'UNKNOWN',
         inPlay:          book?.inPlay || false,
         totalMatched:    book?.totalMatched || 0,
@@ -588,20 +631,36 @@ async function getMarketCatalog2(req, res) {
     maxBetSize:          book.maxBetSize ?? book.totalMatched ?? 0,
     rules:               catalog.description?.rules || '',
     sport: { name: sportName, image: iconMap[sportName] || 'default.svg', active: true },
-    runners: (catalog.runners || []).map(r => ({
-      selectionId:  r.selectionId,
-      runnerName:   r.runnerName,
-      handicap:     r.handicap,
-      sortPriority: r.sortPriority,
-      status:       'ACTIVE',
-      // Metadata for horse/greyhound runner display
-      clothNumber:  r.metadata?.CLOTH_NUMBER || r.metadata?.cloth_number || null,
-      jockeyName:   r.metadata?.JOCKEY_NAME  || r.metadata?.jockey_name  || null,
-      trainerName:  r.metadata?.TRAINER_NAME || r.metadata?.trainer_name || null,
-      silkUrl:      r.metadata?.SILK_URL     || r.metadata?.silk_url     || null,
-      stallDraw:    r.metadata?.STALL_DRAW   || r.metadata?.stall_draw   || null,
-      metadataDict: r.metadata && Object.keys(r.metadata).length > 0 ? r.metadata : null,
-    })),
+    runners: (catalog.runners || []).map(r => {
+      const meta2 = r.metadata || r.runnerMetadata || {};
+      const cNum = meta2.CLOTH_NUMBER || meta2.cloth_number || meta2.ClothNumber || r.clothNumber || null;
+      const sP   = r.sortPriority || null;
+      const posN = parseInt(cNum) || parseInt(sP) || 1;
+      const RACE_COLORS = [
+        '#E63946','#FFFFFF','#1D3557','#F4D03F','#2ECC71','#111111','#F39C12','#8E44AD',
+        '#16A085','#E74C3C','#3498DB','#F1C40F','#E67E22','#1ABC9C','#95A5A6','#2C3E50',
+        '#C0392B','#7F8C8D','#27AE60','#D35400',
+      ];
+      return {
+        selectionId:  r.selectionId,
+        runnerName:   r.runnerName,
+        handicap:     r.handicap,
+        sortPriority: sP,
+        status:       'ACTIVE',
+        // Cloth / color
+        clothNumber:  cNum,
+        clothColor:   RACE_COLORS[(posN - 1) % RACE_COLORS.length],
+        // Metadata for horse/greyhound runner display
+        jockeyName:   meta2.JOCKEY_NAME  || meta2.jockey_name  || meta2.JockeyName  || null,
+        trainerName:  meta2.TRAINER_NAME || meta2.trainer_name || meta2.TrainerName || null,
+        silkUrl:      meta2.SILK_URL     || meta2.silk_url     || meta2.SilkUrl     || null,
+        stallDraw:    meta2.STALL_DRAW   || meta2.stall_draw   || meta2.StallDraw   || null,
+        age:          meta2.AGE          || meta2.age          || null,
+        form:         meta2.FORM         || meta2.form         || null,
+        officialRating: meta2.OFFICIAL_RATING || meta2.official_rating || null,
+        metadataDict: Object.keys(meta2).length > 0 ? meta2 : null,
+      };
+    }),
     // ✅ subMarkets — mv2.min.js isko read karta hai BookmakerMarkets,
     //    TossMarkets, FancyMarkets etc. populate karne ke liye
     subMarkets,
