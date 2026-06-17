@@ -166,7 +166,14 @@ async function fetchSportMarkets(sportKey, eventTypeId, overrides = {}) {
       match:          event?.event.name || market.marketName || 'Unknown',
       startTime:      event?.event.openDate || '',
       marketStatus:   book?.status || 'UNKNOWN',
-      inPlay:         book?.inPlay === true || book?.status === 'IN_PLAY',
+      inPlay:         (() => {
+        if (book?.inPlay === true) return true;
+        if (book?.status === 'IN_PLAY') return true;
+        // startTime past mein hai aur market OPEN hai = live match
+        const st = event?.event?.openDate;
+        if (st && new Date(st) <= new Date() && book?.status === 'OPEN') return true;
+        return false;
+      })(),
       totalMatched:   book?.totalMatched || 0,
       runners:        buildOddsPayload(market.runners || [], book, sportKey),
       competitionId:  market.competition?.id   || null,
@@ -228,7 +235,13 @@ async function getLiveTennis(req, res) {
       marketId:        market.marketId,
       match:           event?.event.name || 'Unknown',
       startTime:       event?.event.openDate || '',
-      inPlay:          book?.inPlay === true || book?.status === 'IN_PLAY',
+        inPlay:         (() => {
+          if (book?.inPlay === true) return true;
+          if (book?.status === 'IN_PLAY') return true;
+          const st = event?.event?.openDate || market?.marketStartTime;
+          if (st && new Date(st) <= new Date() && book?.status === 'OPEN') return true;
+          return false;
+        })(),
       totalMatched:    book?.totalMatched || 0,
       runners:         buildOddsPayload(market.runners || [], book),
       competitionId:   market.competition?.id   || null,
@@ -289,7 +302,13 @@ async function getLiveHorse(req, res) {
         match:           event?.event.name || market.marketName || 'Unknown',
         startTime,
         marketStatus:    book?.status || 'UNKNOWN',
-        inPlay:          book?.inPlay === true || book?.status === 'IN_PLAY',
+          inPlay:         (() => {
+          if (book?.inPlay === true) return true;
+          if (book?.status === 'IN_PLAY') return true;
+          const st = event?.event?.openDate || market?.marketStartTime;
+          if (st && new Date(st) <= new Date() && book?.status === 'OPEN') return true;
+          return false;
+        })(),
         totalMatched:    book?.totalMatched || 0,
         runners:         buildOddsPayload(market.runners || [], book, 'horse'),
         competitionId:   market.competition?.id   || null,
@@ -371,7 +390,13 @@ async function getLiveGreyhound(req, res) {
         match:           event?.event.name || market.marketName || 'Unknown',
         startTime,
         marketStatus:    book?.status || 'UNKNOWN',
-        inPlay:          book?.inPlay === true || book?.status === 'IN_PLAY',
+          inPlay:         (() => {
+          if (book?.inPlay === true) return true;
+          if (book?.status === 'IN_PLAY') return true;
+          const st = event?.event?.openDate || market?.marketStartTime;
+          if (st && new Date(st) <= new Date() && book?.status === 'OPEN') return true;
+          return false;
+        })(),
         totalMatched:    book?.totalMatched || 0,
         runners:         buildOddsPayload(market.runners || [], book, 'greyhound'),
         competitionId:   market.competition?.id   || null,
@@ -429,7 +454,13 @@ async function getLiveSport(req, res) {
       marketId:     market.marketId,
       match:        event?.event.name || 'Unknown',
       startTime:    event?.event.openDate || '',
-      inPlay:         book?.inPlay === true || book?.status === 'IN_PLAY',
+        inPlay:         (() => {
+          if (book?.inPlay === true) return true;
+          if (book?.status === 'IN_PLAY') return true;
+          const st = event?.event?.openDate || market?.marketStartTime;
+          if (st && new Date(st) <= new Date() && book?.status === 'OPEN') return true;
+          return false;
+        })(),
       totalMatched: book?.totalMatched || 0,
       runners:      buildOddsPayload(market.runners || [], book, detectedSportKey),
       marketBook:   book || null,
@@ -596,7 +627,7 @@ async function getMarketCatalog2(req, res) {
             marketName:  m.marketName,
             marketType:  m.description?.marketType || '',
             status:      sb?.status || 'OPEN',
-            inPlay:      sb?.inPlay || false,
+            inPlay:      (sb?.inPlay === true) || (sb?.status === 'IN_PLAY'),
             runners: (m.runners || []).map(r => {
               const rb = sb?.runners?.find(x => x.selectionId === r.selectionId);
               return {
@@ -792,7 +823,13 @@ async function getEventMarkets(req, res) {
         marketType,
         status:      book?.status      || 'OPEN',
         status2:     null,
-        inPlay:         book?.inPlay === true || book?.status === 'IN_PLAY',
+        inPlay:         (() => {
+          if (book?.inPlay === true) return true;
+          if (book?.status === 'IN_PLAY') return true;
+          const st = event?.event?.openDate || market?.marketStartTime;
+          if (st && new Date(st) <= new Date() && book?.status === 'OPEN') return true;
+          return false;
+        })(),
         maxBetSize:  book?.maxBetSize  ?? book?.totalMatched ?? 0,
         bettingType: market.description?.bettingType || 'ODDS',
         eventTypeId: evtTypeId,
