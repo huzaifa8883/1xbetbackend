@@ -20,81 +20,52 @@ function buildOddsPayload(runners, books) {
     const rb = books?.runners?.find((r) => r.selectionId === runner.selectionId);
 
     // RUNNER_METADATA fields — horse race aur greyhound ke liye
-    // Betfair metadata kuch services mein runner.metadata, kuch mein runner.runnerMetadata ke tor pe aata hai
+    // Betfair kuch responses mein metadata, kuch mein runnerMetadata key use karta hai
     const meta = runner.metadata || runner.runnerMetadata || {};
 
-    // CLOTH_NUMBER — Betfair mein string hota hai (e.g. "1", "2", "3")
-    // Kuch tracks pe clothNumber nahi hota — tab sortPriority use karo
-    const clothNumber = meta.CLOTH_NUMBER
-      || meta.cloth_number
-      || meta.ClothNumber
-      || runner.clothNumber
-      || null;
-
-    // sortPriority — always present from Betfair, 1-indexed
+    const clothNumber = meta.CLOTH_NUMBER || meta.cloth_number || meta.ClothNumber || null;
     const sortPriority = runner.sortPriority || null;
-
-    // Effective position number — cloth number pehle, warna sort priority
     const posNum = parseInt(clothNumber) || parseInt(sortPriority) || 1;
 
-    // Standard international racing cloth colors (by position/cloth number)
-    // Ye hi BPExch aur actual racecourses mein use hoti hain
+    // Standard racing cloth colors (position-based fallback)
     const RACE_COLORS = [
-      '#E63946',  // 1  — Red
-      '#FFFFFF',  // 2  — White
-      '#1D3557',  // 3  — Dark Blue
-      '#F4D03F',  // 4  — Yellow
-      '#2ECC71',  // 5  — Green
-      '#111111',  // 6  — Black
-      '#F39C12',  // 7  — Orange
-      '#8E44AD',  // 8  — Purple
-      '#16A085',  // 9  — Teal
-      '#E74C3C',  // 10 — Crimson
-      '#3498DB',  // 11 — Sky Blue
-      '#F1C40F',  // 12 — Gold
-      '#E67E22',  // 13 — Dark Orange
-      '#1ABC9C',  // 14 — Turquoise
-      '#95A5A6',  // 15 — Silver
-      '#2C3E50',  // 16 — Dark Navy
-      '#C0392B',  // 17 — Dark Red
-      '#7F8C8D',  // 18 — Gray
-      '#27AE60',  // 19 — Dark Green
-      '#D35400',  // 20 — Brown Orange
+      '#E63946','#FFFFFF','#1D3557','#F4D03F','#2ECC71','#111111','#F39C12','#8E44AD',
+      '#16A085','#E74C3C','#3498DB','#F1C40F','#E67E22','#1ABC9C','#95A5A6','#2C3E50',
+      '#C0392B','#7F8C8D','#27AE60','#D35400',
     ];
     const clothColor = RACE_COLORS[(posNum - 1) % RACE_COLORS.length];
 
+    // SILK_URL — Betfair se jockey/greyhound vest ki image URL
+    // Format: https://content.betfair.com/feeds_images/Horses/SilkColours/... ya CDN URL
+    const silkUrl = meta.SILK_URL || meta.silk_url || meta.SilkUrl || null;
+
     const jockeyName  = meta.JOCKEY_NAME  || meta.jockey_name  || meta.JockeyName  || null;
     const trainerName = meta.TRAINER_NAME || meta.trainer_name || meta.TrainerName || null;
-    // SILK_URL — Betfair se jockey ki silk ka image URL aata hai (hex color nahi)
-    const silkUrl     = meta.SILK_URL     || meta.silk_url     || meta.SilkUrl     || null;
     const stallDraw   = meta.STALL_DRAW   || meta.stall_draw   || meta.StallDraw   || null;
     const age         = meta.AGE          || meta.age          || null;
-    const weight      = meta.WEIGHT_VALUE || meta.weight_value || null;
     const form        = meta.FORM         || meta.form         || null;
     const officialRating = meta.OFFICIAL_RATING || meta.official_rating || null;
 
     return {
-      selectionId:   runner.selectionId,
-      runnerName:    runner.runnerName,
+      selectionId:  runner.selectionId,
+      runnerName:   runner.runnerName,
       sortPriority,
       back:  rb?.ex?.availableToBack?.slice(0, 3) || [],
       lay:   rb?.ex?.availableToLay?.slice(0, 3)  || [],
       status: rb?.status || 'ACTIVE',
       lastPriceTraded: rb?.lastPriceTraded || null,
-      // Cloth / color
+      // Cloth
       clothNumber,
-      clothColor,     // ← derived color: always present, never null
-      // Jockey / trainer info
+      clothColor,   // always set — fallback color agar silk image na ho
+      // Silk image — BPExch ki tarah Betfair URL se image show hogi
+      silkUrl,
+      // Jockey / trainer
       jockeyName,
       trainerName,
-      silkUrl,        // Betfair silk image URL (for silk image display)
       stallDraw,
-      // Extra race info
       age,
-      weight,
       form,
       officialRating,
-      // Raw metadata (for debugging / future use)
       metadataDict: Object.keys(meta).length > 0 ? meta : null,
     };
   });
@@ -632,8 +603,8 @@ async function getMarketCatalog2(req, res) {
     rules:               catalog.description?.rules || '',
     sport: { name: sportName, image: iconMap[sportName] || 'default.svg', active: true },
     runners: (catalog.runners || []).map(r => {
-      const meta2 = r.metadata || r.runnerMetadata || {};
-      const cNum = meta2.CLOTH_NUMBER || meta2.cloth_number || meta2.ClothNumber || r.clothNumber || null;
+      const m2 = r.metadata || r.runnerMetadata || {};
+      const cNum = m2.CLOTH_NUMBER || m2.cloth_number || m2.ClothNumber || null;
       const sP   = r.sortPriority || null;
       const posN = parseInt(cNum) || parseInt(sP) || 1;
       const RACE_COLORS = [
@@ -647,18 +618,16 @@ async function getMarketCatalog2(req, res) {
         handicap:     r.handicap,
         sortPriority: sP,
         status:       'ACTIVE',
-        // Cloth / color
         clothNumber:  cNum,
         clothColor:   RACE_COLORS[(posN - 1) % RACE_COLORS.length],
-        // Metadata for horse/greyhound runner display
-        jockeyName:   meta2.JOCKEY_NAME  || meta2.jockey_name  || meta2.JockeyName  || null,
-        trainerName:  meta2.TRAINER_NAME || meta2.trainer_name || meta2.TrainerName || null,
-        silkUrl:      meta2.SILK_URL     || meta2.silk_url     || meta2.SilkUrl     || null,
-        stallDraw:    meta2.STALL_DRAW   || meta2.stall_draw   || meta2.StallDraw   || null,
-        age:          meta2.AGE          || meta2.age          || null,
-        form:         meta2.FORM         || meta2.form         || null,
-        officialRating: meta2.OFFICIAL_RATING || meta2.official_rating || null,
-        metadataDict: Object.keys(meta2).length > 0 ? meta2 : null,
+        silkUrl:      m2.SILK_URL     || m2.silk_url     || m2.SilkUrl     || null,
+        jockeyName:   m2.JOCKEY_NAME  || m2.jockey_name  || m2.JockeyName  || null,
+        trainerName:  m2.TRAINER_NAME || m2.trainer_name || m2.TrainerName || null,
+        stallDraw:    m2.STALL_DRAW   || m2.stall_draw   || m2.StallDraw   || null,
+        age:          m2.AGE          || m2.age          || null,
+        form:         m2.FORM         || m2.form         || null,
+        officialRating: m2.OFFICIAL_RATING || m2.official_rating || null,
+        metadataDict: Object.keys(m2).length > 0 ? m2 : null,
       };
     }),
     // ✅ subMarkets — mv2.min.js isko read karta hai BookmakerMarkets,
