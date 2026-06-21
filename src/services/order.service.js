@@ -257,10 +257,11 @@ async function settleEventBets(marketId, winningSelectionId, { commissionPct = 0
           totalLoss += (price - 1) * effectiveSize;
         }
       } else {
+        // This runner lost
         if (bet.side === BET_SIDE.BACK) {
-          totalLoss += effectiveSize;
+          totalLoss += effectiveSize; // BACK on loser → stake lost
         } else {
-          totalWinCredit += effectiveSize + effectiveSize;
+          totalWinCredit += effectiveSize; // LAY on loser → credit = stake only (not double)
         }
       }
     }
