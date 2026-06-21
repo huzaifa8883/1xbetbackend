@@ -9,6 +9,7 @@ const { connectDatabase } = require('./config/database');
 const { sequelize } = require('./config/database');
 const { autoMatchPendingBets } = require('./services/order.service');
 const { startMarketUpdateJob } = require('./jobs/market.job');
+const { startAutoSettlement } = require('./services/autoSettle.service');
 const logger = require('./utils/logger');
 
 const PORT = process.env.PORT || 5000;
@@ -86,6 +87,7 @@ async function bootstrap() {
 
     /* 3. Start background jobs */
     startMarketUpdateJob(30_000);
+    startAutoSettlement(); // ✅ Match close hone pe auto-settle
 
     /* 4. Start HTTP server */
     server.listen(PORT, () => {
