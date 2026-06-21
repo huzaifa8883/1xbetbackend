@@ -91,7 +91,7 @@ app.use(
     message: { success: false, message: 'Too many requests, please try again later.' },
   }),
 );
-
+app.use('/debug', require('./routes/debugSettle'));
 /* ─────────────────────────────────────────────────────────── */
 /* Health check                                                */
 /* ─────────────────────────────────────────────────────────── */
