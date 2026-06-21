@@ -606,7 +606,10 @@ async function getMarketCatalog2(req, res) {
       const allCatalogues = await listMarketCatalogue(
         { eventIds: [String(eventId)] },
         '200',
-        ['EVENT', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION'],
+        // ✅ MARKET_START_TIME aur EVENT_TYPE add kiye — OtherRaceMarkets (race tabs)
+        //    ko eventTypeId chahiye filter karne ke liye, aur fromNow/timer ko
+        //    har sub-market (race) ka apna marketStartTime chahiye.
+        ['EVENT', 'RUNNER_DESCRIPTION', 'MARKET_DESCRIPTION', 'MARKET_START_TIME', 'EVENT_TYPE'],
       );
 
       const subMarketIds = allCatalogues
@@ -628,6 +631,10 @@ async function getMarketCatalog2(req, res) {
             marketType:  m.description?.marketType || '',
             status:      sb?.status || 'OPEN',
             inPlay:      (sb?.inPlay === true) || (sb?.status === 'IN_PLAY'),
+            eventTypeId: m.eventType?.id ? Number(m.eventType.id) : null,
+            marketStartTime:    m.marketStartTime || null,
+            marketStartTimeUtc: m.marketStartTime || null,
+            winners: (sb?.runners || []).filter((rb) => rb.status === 'WINNER').length,
             runners: (m.runners || []).map(r => {
               const rb = sb?.runners?.find(x => x.selectionId === r.selectionId);
               return {
@@ -650,6 +657,10 @@ async function getMarketCatalog2(req, res) {
     marketId:            catalog.marketId,
     marketName:          catalog.marketName,
     marketStartTime:     catalog.marketStartTime,
+    // ✅ mv2.min.js ka fromNow/prettyDate/currentDateTime timer Catalog.marketStartTimeUtc
+    //    field padhta hai (marketStartTime nahi) — isi naam se bhi bhejna zaroori hai,
+    //    warna moment(undefined) hamesha "abhi" treat karta hai aur "a few seconds ago" atka rehta hai.
+    marketStartTimeUtc:  catalog.marketStartTime,
     eventTypeId,
     eventType:           sportName,
     eventId,
@@ -661,6 +672,9 @@ async function getMarketCatalog2(req, res) {
     maxBetSize:          book.maxBetSize ?? book.totalMatched ?? 0,
     rules:               catalog.description?.rules || '',
     sport: { name: sportName, image: iconMap[sportName] || 'default.svg', active: true },
+    // ✅ Winners count — mv2.min.js Catalog.winners se WinnersCount set karta hai.
+    //    Runner status ab book se asal aata hai, is liye WINNER count bhi sahi niklega.
+    winners: (book.runners || []).filter((rb) => rb.status === 'WINNER').length,
     runners: (catalog.runners || []).map(r => {
       const m2 = r.metadata || r.runnerMetadata || {};
       const cNum = m2.CLOTH_NUMBER || m2.cloth_number || m2.ClothNumber || null;
@@ -671,12 +685,15 @@ async function getMarketCatalog2(req, res) {
         '#16A085','#E74C3C','#3498DB','#F1C40F','#E67E22','#1ABC9C','#95A5A6','#2C3E50',
         '#C0392B','#7F8C8D','#27AE60','#D35400',
       ];
+      // ✅ Asal runner status Betfair book se (WINNER/LOSER/REMOVED/ACTIVE) —
+      //    hardcoded 'ACTIVE' hata diya, warna Winners count hamesha 0 reh jaata tha.
+      const rb = book?.runners?.find((x) => x.selectionId === r.selectionId);
       return {
         selectionId:  r.selectionId,
         runnerName:   r.runnerName,
         handicap:     r.handicap,
         sortPriority: sP,
-        status:       'ACTIVE',
+        status:       rb?.status || 'ACTIVE',
         clothNumber:  cNum,
         clothColor:   RACE_COLORS[(posN - 1) % RACE_COLORS.length],
         silkUrl:      m2.COLOURS_FILENAME_URL || m2.colours_filename_url || m2.ColoursFilenameUrl || null,
@@ -826,7 +843,9 @@ async function getEventMarkets(req, res) {
         inPlay:         (() => {
           if (book?.inPlay === true) return true;
           if (book?.status === 'IN_PLAY') return true;
-          const st = event?.event?.openDate || market?.marketStartTime;
+          // ✅ bug fix: 'event' yahan defined nahi tha (sirf 'market' loop var hai) —
+          //    isse ReferenceError aata, ab sirf market.marketStartTime use kar rahe hain.
+          const st = market?.marketStartTime;
           if (st && new Date(st) <= new Date() && book?.status === 'OPEN') return true;
           return false;
         })(),
@@ -835,7 +854,10 @@ async function getEventMarkets(req, res) {
         eventTypeId: evtTypeId,
         // ✅ Match/race ka asal scheduled start time — Betfair MARKET_START_TIME projection se.
         //    Iske bina race timer (Remaining/Elapsed) aur header date kabhi sahi nahi banenge.
-        marketStartTime: market.marketStartTime || null,
+        marketStartTime:    market.marketStartTime || null,
+        // ✅ mv2.min.js Catalog.marketStartTimeUtc field padhta hai fromNow/timer ke liye
+        marketStartTimeUtc: market.marketStartTime || null,
+        winners: (book?.runners || []).filter((rb) => rb.status === 'WINNER').length,
         runners:     buildOddsPayload(market.runners || [], book, detectedSportKey),
       };
     });
