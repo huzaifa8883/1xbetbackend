@@ -14,14 +14,8 @@ const logger = require('./utils/logger');
 
 const PORT = process.env.PORT || 5000;
 
-/* ─────────────────────────────────────────────────────────── */
-/* HTTP server                                                 */
-/* ─────────────────────────────────────────────────────────── */
 const server = http.createServer(app);
 
-/* ─────────────────────────────────────────────────────────── */
-/* Socket.IO                                                   */
-/* ─────────────────────────────────────────────────────────── */
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map((o) => o.trim())
@@ -40,19 +34,16 @@ global.io = io;
 io.on('connection', (socket) => {
   logger.debug(`WS connected: ${socket.id}`);
 
-  /* Join a specific match room to receive live odds updates */
   socket.on('JoinMatch', (matchId) => {
     socket.join(`match_${matchId}`);
     logger.debug(`Socket ${socket.id} joined match_${matchId}`);
   });
 
-  /* Join personal user room to receive wallet/liability updates */
   socket.on('JoinUserRoom', (userId) => {
     socket.join(`user_${userId}`);
     logger.debug(`Socket ${socket.id} joined user_${userId}`);
   });
 
-  /* Client-triggered market update → auto-match pending bets */
   socket.on('updateMarket', async ({ marketId, selectionId }) => {
     if (!marketId) return;
     try {
@@ -70,26 +61,17 @@ io.on('connection', (socket) => {
   });
 });
 
-/* ─────────────────────────────────────────────────────────── */
-/* Bootstrap                                                   */
-/* ─────────────────────────────────────────────────────────── */
 async function bootstrap() {
   try {
-    /* 1. Connect to MySQL */
     await connectDatabase();
 
-    /* 2. Sync models ──────────────────────────────────────── */
-    // ── FIXED: Kuch der ke liye production check hata diya hai taake DB alter ho jaye ──
     logger.info('Syncing database schema (alter: true)...');
     await sequelize.sync({ alter: true });
     logger.info('Database schema synchronised successfully!');
-    /* ─────────────────────────────────────────────────────── */
 
-    /* 3. Start background jobs */
     startMarketUpdateJob(30_000);
-    startAutoSettlement(); // ✅ Har 10s: CLOSED markets auto-settle
+    startAutoSettlement();  // ✅ AUTO SETTLE START
 
-    /* 4. Start HTTP server */
     server.listen(PORT, () => {
       logger.info(`🚀 BetPro server running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`);
     });
@@ -99,9 +81,6 @@ async function bootstrap() {
   }
 }
 
-/* ─────────────────────────────────────────────────────────── */
-/* Graceful shutdown                                           */
-/* ─────────────────────────────────────────────────────────── */
 async function gracefulShutdown(signal) {
   logger.info(`Received ${signal}. Shutting down gracefully...`);
   server.close(async () => {
