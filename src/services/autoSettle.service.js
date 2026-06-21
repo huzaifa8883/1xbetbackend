@@ -1,17 +1,17 @@
 'use strict';
 
 /*
-  autoSettle.service.js  v3 — ROOT CAUSE FIX
+  autoSettle.service.js  v4 — FINAL FIX
 
-  PROBLEM:
-    catalog2 API mein `status` field NAHI hota.
-    CLOSED status aur WINNER runner sirf prices/markets/data se milta hai.
+  ROOT CAUSE:
+  - prices9.mgs11.com/markets/data → yeh third party server hai, iska response format
+    hume pata nahi tha. Ab seedha call karte hain aur SAARI possible fields check karte hain.
+  - catalog2 bhi apne backend pe hai - dono try karo
 
-  HOW IT WORKS:
-    Har 10s: DB se MATCHED orders wale market IDs lo
-    → prices/markets/data?id= hit karo
-    → Book.marketStatus === 'CLOSED' + Book.runners[].status === 'WINNER' check karo
-    → Winner mila? settleEventBets() call karo
+  STRATEGY: 3 methods try karo order mein:
+  1. prices9 /markets/data → Book.marketStatus=CLOSED + runner.status=WINNER
+  2. apna backend catalog2 → runner.lastPriceTraded <= 1.01
+  3. apna backend catalog2 → runner.status = WINNER (agar backend set karta ho)
 */
 
 const { Order }           = require('../models');
@@ -21,101 +21,178 @@ const logger              = require('../utils/logger');
 
 const POLL_MS        = parseInt(process.env.AUTO_SETTLE_INTERVAL_MS      || '10000', 10);
 const COMMISSION_PCT = parseFloat(process.env.AUTO_SETTLE_COMMISSION_PCT || '0');
-const PRICES_BASE    = process.env.PRICES_DATA_URL || 'https://prices9.mgs11.com/api/v1';
-const CATALOG_BASE   = process.env.PRICES_API_URL  || process.env.OWN_API_URL || 'https://1xbetbackend.work.gd/api/v1';
 
-const _busy    = new Set();   // race condition guard
-const _settled = new Set();   // session-level settled
+// prices9 = betfair live data server (frontend ke pricesUrl se liya)
+const PRICES_BASE  = 'https://prices9.mgs11.com/api/v1';
+// apna backend
+const OWN_BASE     = process.env.OWN_API_URL || process.env.PRICES_API_URL || 'https://1xbetbackend.work.gd/api/v1';
 
-/* ── safe fetch ── */
-async function safeFetch(url, ms = 7000) {
+const _busy    = new Set();
+const _settled = new Set();
+
+/* ── safe fetch — koi error nahi throw hoga ── */
+async function safeFetch(url, timeoutMs = 8000) {
   const ac = new AbortController();
-  const t  = setTimeout(() => ac.abort(), ms);
+  const t  = setTimeout(() => ac.abort(), timeoutMs);
   try {
     const r = await fetch(url, { signal: ac.signal });
     clearTimeout(t);
-    if (!r.ok) { logger.debug(`[AutoSettle] fetch ${url} → ${r.status}`); return null; }
-    return await r.json();
+    if (!r.ok) {
+      logger.debug(`[AutoSettle] HTTP ${r.status} for ${url}`);
+      return null;
+    }
+    const text = await r.text();
+    try { return JSON.parse(text); } catch { return null; }
   } catch (e) {
     clearTimeout(t);
-    logger.debug(`[AutoSettle] fetch error ${url}: ${e.message}`);
+    logger.debug(`[AutoSettle] fetch failed ${url}: ${e.message}`);
     return null;
   }
 }
 
-/* ── Step 1: prices/markets/data (Book API) — main method ── */
-async function winnerFromBookAPI(marketId) {
-  const json = await safeFetch(`${PRICES_BASE}/markets/data?id=${marketId}`);
+/* ──────────────────────────────────────────────────────────
+   METHOD 1: prices9 Book API
+   Response: { marketBooks: [{ id, marketStatus, runners: [{id, status}] }] }
+────────────────────────────────────────────────────────── */
+async function tryBookAPI(marketId) {
+  const json = await safeFetch(`${PRICES_BASE}/markets/data?id=${marketId}`, 6000);
   if (!json) return null;
 
-  const data  = (json.success && json.data) ? json.data : json;
-  const books = data.marketBooks || [];
-  // apna market dhundo
-  const book  = books.find(b => String(b.id) === String(marketId)) || books[0];
-  if (!book) return null;
+  // unwrap possible { success, data } wrapper
+  const payload = (json.success && json.data) ? json.data : json;
 
-  const status = (book.marketStatus || '').toUpperCase();
-  logger.debug(`[AutoSettle] Book API market=${marketId} status=${status}`);
-
-  if (status !== 'CLOSED') return null;
-
-  // WINNER runner dhundo — Book API mein id field hota hai (selectionId nahi)
-  const winner = (book.runners || []).find(r => (r.status || '').toUpperCase() === 'WINNER');
-  if (!winner) {
-    logger.info(`[AutoSettle] market=${marketId} CLOSED but no WINNER runner in Book yet`);
+  // marketBooks array
+  const books = payload.marketBooks || payload.MarketBooks || [];
+  if (!books.length) {
+    logger.debug(`[AutoSettle] prices9: no marketBooks for ${marketId}`);
     return null;
   }
 
-  const selId = String(winner.id || winner.selectionId || '');
+  // apna market ID match karo
+  const book = books.find(b =>
+    String(b.id || b.marketId || b.Id || '') === String(marketId)
+  ) || books[0];
+
+  if (!book) return null;
+
+  const mktStatus = (
+    book.marketStatus || book.MarketStatus || book.status || ''
+  ).toUpperCase();
+
+  logger.debug(`[AutoSettle] prices9 market=${marketId} status=${mktStatus}`);
+  if (mktStatus !== 'CLOSED') return null;
+
+  const runners = book.runners || book.Runners || [];
+  const winner  = runners.find(r =>
+    (r.status || r.Status || r.runnerStatus || '').toUpperCase() === 'WINNER'
+  );
+
+  if (!winner) {
+    logger.info(`[AutoSettle] prices9: ${marketId} CLOSED but no WINNER runner yet`);
+    return null;
+  }
+
+  // Book API mein runner ID = selectionId
+  const selId = String(winner.id || winner.selectionId || winner.Id || '');
   if (!selId) return null;
 
-  logger.info(`[AutoSettle] ✅ BookAPI winner: market=${marketId} sel=${selId}`);
+  logger.info(`[AutoSettle] ✅ prices9 WINNER: market=${marketId} runner=${selId}`);
   return selId;
 }
 
-/* ── Step 2: catalog2 fallback (lastPriceTraded=1) ── */
-async function winnerFromCatalog(marketId) {
-  const json = await safeFetch(`${CATALOG_BASE}/markets/catalog2?id=${marketId}`);
+/* ──────────────────────────────────────────────────────────
+   METHOD 2 & 3: apna catalog2
+   runners.lastPriceTraded <= 1.01  OR  runner.status=WINNER
+────────────────────────────────────────────────────────── */
+async function tryCatalogAPI(marketId) {
+  const json = await safeFetch(`${OWN_BASE}/markets/catalog2?id=${marketId}`, 8000);
   if (!json) return null;
 
   const catalog = (json.success && json.data) ? json.data : json;
-  const runners = catalog.runners || [];
 
-  const winner = runners.find(r => {
-    const lpt = parseFloat(r.lastPriceTraded || r.LastPriceTraded || 0);
-    return lpt > 0 && lpt <= 1.01;
-  });
-  if (!winner) return null;
+  // catalog level status (ho sakta hai ho)
+  const catStatus = (
+    catalog.status || catalog.marketStatus || catalog.Status || ''
+  ).toUpperCase();
 
-  const selId = String(winner.selectionId || winner.selection_id || '');
-  if (!selId) return null;
+  const runners = catalog.runners || catalog.Runners || [];
+  if (!runners.length) return null;
 
-  logger.info(`[AutoSettle] ✅ Catalog fallback winner: market=${marketId} sel=${selId}`);
-  return selId;
+  // Method 2: explicit WINNER status in catalog
+  const explicitWinner = runners.find(r =>
+    (r.status || r.Status || '').toUpperCase() === 'WINNER'
+  );
+  if (explicitWinner) {
+    const selId = String(explicitWinner.selectionId || explicitWinner.selection_id || '');
+    if (selId) {
+      logger.info(`[AutoSettle] ✅ catalog WINNER status: market=${marketId} sel=${selId}`);
+      return selId;
+    }
+  }
+
+  // Method 3: lastPriceTraded = 1.0 (winner always traded at 1.0)
+  // Yeh sirf CLOSED market mein hota hai
+  if (catStatus === 'CLOSED' || catStatus === '') {
+    const lptWinner = runners.find(r => {
+      const lpt = parseFloat(r.lastPriceTraded || r.LastPriceTraded || 0);
+      return lpt > 0 && lpt <= 1.01;
+    });
+    if (lptWinner) {
+      const selId = String(lptWinner.selectionId || lptWinner.selection_id || '');
+      if (selId) {
+        logger.info(`[AutoSettle] ✅ catalog lastPriceTraded=1.0: market=${marketId} sel=${selId}`);
+        return selId;
+      }
+    }
+
+    // Method 4: SP nearPrice = 1.0
+    const spWinner = runners.find(r => {
+      const np = parseFloat(r?.sp?.nearPrice || r?.sp?.NearPrice || r?.SP?.nearPrice || 0);
+      return np > 0 && np <= 1.01;
+    });
+    if (spWinner) {
+      const selId = String(spWinner.selectionId || spWinner.selection_id || '');
+      if (selId) {
+        logger.info(`[AutoSettle] ✅ catalog sp.nearPrice=1.0: market=${marketId} sel=${selId}`);
+        return selId;
+      }
+    }
+  }
+
+  return null;
 }
 
-/* ── Process one market ── */
+/* ──────────────────────────────────────────────────────────
+   processMarket — ek market check aur settle
+────────────────────────────────────────────────────────── */
 async function processMarket(marketId) {
   if (_busy.has(marketId) || _settled.has(marketId)) return;
   _busy.add(marketId);
+
   try {
-    // Try Book API first, then catalog fallback
-    const winSel = (await winnerFromBookAPI(marketId)) || (await winnerFromCatalog(marketId));
+    // Dono methods try karo
+    const winSel = (await tryBookAPI(marketId)) || (await tryCatalogAPI(marketId));
+
     if (!winSel) return;
 
     _settled.add(marketId);
-    logger.info(`[AutoSettle] Settling market=${marketId} winner=${winSel}`);
+    logger.info(`[AutoSettle] Settling market=${marketId} winner=${winSel} commission=${COMMISSION_PCT}%`);
+
     const result = await settleEventBets(marketId, winSel, { commissionPct: COMMISSION_PCT });
-    logger.info(`[AutoSettle] ✅ Done market=${marketId} — ${result.settled} users settled`);
+    logger.info(`[AutoSettle] ✅ market=${marketId} — ${result.settled} users settled`);
+
   } catch (err) {
-    _settled.delete(marketId);
-    logger.error(`[AutoSettle] ERROR market=${marketId}: ${err.message}`);
+    _settled.delete(marketId); // allow retry on error
+    logger.error(`[AutoSettle] processMarket error market=${marketId}: ${err.message}`);
+    logger.error(err.stack);
   } finally {
     _busy.delete(marketId);
   }
 }
 
-/* ── Poll DB every interval ── */
+/* ──────────────────────────────────────────────────────────
+   pollAndSettle — DB se MATCHED markets lo, check karo
+────────────────────────────────────────────────────────── */
 async function pollAndSettle() {
   try {
     const rows = await Order.findAll({
@@ -125,29 +202,39 @@ async function pollAndSettle() {
       raw:        true,
     });
 
-    const ids = rows.map(r => r.market_id).filter(id => !_settled.has(id));
+    const ids = rows
+      .map(r => r.market_id)
+      .filter(id => id && !_settled.has(id));
+
     if (!ids.length) return;
 
-    logger.debug(`[AutoSettle] Checking ${ids.length} market(s): ${ids.join(', ')}`);
+    logger.debug(`[AutoSettle] Polling ${ids.length} market(s): ${ids.join(', ')}`);
+
     for (let i = 0; i < ids.length; i += 5) {
       await Promise.all(ids.slice(i, i + 5).map(processMarket));
     }
   } catch (err) {
-    logger.error(`[AutoSettle] poll error: ${err.message}`);
+    logger.error(`[AutoSettle] pollAndSettle error: ${err.message}`);
   }
 }
 
-/* ── Manual trigger (for testing / admin) ── */
+/* ──────────────────────────────────────────────────────────
+   manualSettle — direct call for testing/admin
+────────────────────────────────────────────────────────── */
 async function manualSettle(marketId) {
+  logger.info(`[AutoSettle] manualSettle called for market=${marketId}`);
   _settled.delete(marketId);
+  _busy.delete(marketId);
   await processMarket(marketId);
 }
 
-/* ── Start (call once in server.js) ── */
+/* ──────────────────────────────────────────────────────────
+   startAutoSettlement — server.js ya app.js mein ek baar call karo
+────────────────────────────────────────────────────────── */
 function startAutoSettlement() {
-  logger.info(`[AutoSettle] v3 START — poll every ${POLL_MS/1000}s`);
-  logger.info(`[AutoSettle] BookAPI=${PRICES_BASE}  CatalogAPI=${CATALOG_BASE}`);
-  setTimeout(pollAndSettle, 3000);
+  logger.info(`[AutoSettle] v4 STARTED — interval=${POLL_MS/1000}s commission=${COMMISSION_PCT}%`);
+  logger.info(`[AutoSettle] prices9=${PRICES_BASE} | own=${OWN_BASE}`);
+  setTimeout(pollAndSettle, 5000);           // 5s baad first run
   setInterval(pollAndSettle, POLL_MS);
 }
 
