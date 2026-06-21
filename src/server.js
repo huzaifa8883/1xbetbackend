@@ -87,7 +87,7 @@ async function bootstrap() {
 
     /* 3. Start background jobs */
     startMarketUpdateJob(30_000);
-    startAutoSettlement(); // ✅ Match close hone pe auto-settle
+    startAutoSettlement(); // ✅ Har 10s: CLOSED markets auto-settle
 
     /* 4. Start HTTP server */
     server.listen(PORT, () => {
