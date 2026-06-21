@@ -217,8 +217,42 @@ async function settleEventBets(marketId, winningSelectionId, { commissionPct = 0
     where: { market_id: marketId, status: ORDER_STATUS.MATCHED },
   });
 
+  // ✅ Market settle ho raha hai — agar koi PENDING (unmatched) order isi market
+  // ka reh gaya ho to usko CANCEL karo, warna woh hamesha pending reh jayega
+  // aur uski liability wallet ko block karti rahegi.
+  const danglingPending = await Order.findAll({
+    where: { market_id: marketId, status: ORDER_STATUS.PENDING },
+  });
+
+  if (danglingPending.length) {
+    const pendingUserIds = [...new Set(danglingPending.map(o => String(o.user_id)))];
+
+    await Order.update(
+      { status: ORDER_STATUS.CANCELLED },
+      { where: { market_id: marketId, status: ORDER_STATUS.PENDING } },
+    );
+
+    for (const uid of pendingUserIds) {
+      await Transaction.create({
+        user_id:      uid,
+        type:         TRANSACTION_TYPE.BET_CANCELLED,
+        amount:       0,
+        description:  `Market ${marketId} settled — unmatched pending bet(s) auto-cancelled`,
+        status:       'completed',
+        reference_id: String(marketId),
+      });
+    }
+
+    logger.info(`[Settlement] market=${marketId}: ${danglingPending.length} dangling PENDING order(s) cancelled`);
+  }
+
   if (!matchedOrders.length) {
     logger.warn(`settleEventBets: No matched orders for market ${marketId}`);
+    // Dangling pending users ka liable bhi recalc karna zaroori hai
+    if (danglingPending.length) {
+      const pendingUserIds = [...new Set(danglingPending.map(o => String(o.user_id)))];
+      for (const uid of pendingUserIds) await recalculateLiability(uid);
+    }
     return { settled: 0, details: [] };
   }
 
@@ -334,7 +368,15 @@ async function settleEventBets(marketId, winningSelectionId, { commissionPct = 0
     );
   }
 
+  // ✅ Matched-order users + dangling-pending-only users — dono ka liability recalc
+  const pendingOnlyUserIds = danglingPending
+    .map(o => String(o.user_id))
+    .filter(uid => !byUser[uid]);
+
   for (const userId of Object.keys(byUser)) {
+    await recalculateLiability(userId);
+  }
+  for (const userId of [...new Set(pendingOnlyUserIds)]) {
     await recalculateLiability(userId);
   }
 
