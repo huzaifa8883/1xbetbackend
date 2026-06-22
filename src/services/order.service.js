@@ -1,20 +1,20 @@
 'use strict';
 
 const { Op } = require('sequelize');
+const { sequelize } = require('../config/database');
 const { User, Order, Transaction } = require('../models');
 const { getRunnerBook } = require('./betfair.service');
 const { evaluateMatch, calculateLiability, computeTotalLiability } = require('./matching.service');
 const { ORDER_STATUS, TRANSACTION_TYPE, BET_SIDE } = require('../config/constants');
 const logger = require('../utils/logger');
 
-/* ─────────────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════
    recalculateLiability
 
-   Invariant: totalFunds = wallet_balance + liable  (constant)
-   Naya wallet  = totalFunds - newLiability
-   Naya liable  = newLiability
-   Socket se frontend instantly update hota hai.
-────────────────────────────────────────────────────────────── */
+   Invariant: totalFunds = wallet_balance + liable (constant)
+   Naya wallet = totalFunds - newLiability
+   Naya liable = newLiability
+═══════════════════════════════════════════════════════════════ */
 async function recalculateLiability(userId) {
   const user = await User.findByPk(userId);
   if (!user) return null;
@@ -37,9 +37,8 @@ async function recalculateLiability(userId) {
   let totalLiability      = 0;
   const combinedRunnerPnL = {};
 
-  // ── MATCHED: Green-book market-wise ──────────────────────
+  // ── MATCHED: Green-book market-wise ─────────────────────────
   const marketIds = [...new Set(matched.map(o => o.market_id))];
-
   for (const marketId of marketIds) {
     const marketOrders = matched.filter(o => o.market_id === marketId);
     let globalPnL = 0;
@@ -70,7 +69,7 @@ async function recalculateLiability(userId) {
     totalLiability  += worstCase < 0 ? Math.abs(worstCase) : 0;
   }
 
-  // ── PENDING: simple per-bet liability ────────────────────
+  // ── PENDING: simple per-bet liability ───────────────────────
   for (const bet of pending) {
     const price = parseFloat(bet.price);
     const size  = parseFloat(bet.size);
@@ -99,14 +98,9 @@ async function recalculateLiability(userId) {
   return freshData;
 }
 
-/* ─────────────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════
    autoMatchPendingBets
-
-   Betfair se live runner data le ke PENDING bets match karta hai.
-   Match hone par recalculate + socket emit.
-
-   ── FIXED: socket emit newOrders[] array format mein, runnerName ke saath ──
-────────────────────────────────────────────────────────────── */
+═══════════════════════════════════════════════════════════════ */
 async function autoMatchPendingBets(marketId, selectionId) {
   try {
     const runner = await getRunnerBook(marketId, selectionId);
@@ -128,7 +122,6 @@ async function autoMatchPendingBets(marketId, selectionId) {
         await recalculateLiability(order.user_id);
 
         if (global.io) {
-          // ── FIXED: newOrders array format + runnerName field ──
           global.io.to(`match_${marketId}`).emit('ordersUpdated', {
             userId: order.user_id,
             newOrders: [{
@@ -137,10 +130,7 @@ async function autoMatchPendingBets(marketId, selectionId) {
             }],
           });
           global.io.to(`user_${order.user_id}`).emit('orderMatched', {
-            order: {
-              ...order.toJSON(),
-              runnerName: order.runner_name || '',
-            },
+            order: { ...order.toJSON(), runnerName: order.runner_name || '' },
           });
         }
 
@@ -152,17 +142,9 @@ async function autoMatchPendingBets(marketId, selectionId) {
   }
 }
 
-/* ─────────────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════
    calculateRunnerPnL  (per-user, per-market)
-
-   Har runner ke liye "agar yeh runner jeeta to kya hoga" calculate karta hai.
-   Returns: { [selectionId]: { profit, liability, net } }
-
-   BACK on winner  → profit  = (price-1)*size
-   BACK on loser   → loss    = size
-   LAY on winner   → loss    = (price-1)*size
-   LAY on loser    → profit  = size
-────────────────────────────────────────────────────────────── */
+═══════════════════════════════════════════════════════════════ */
 function calculateRunnerPnL(marketOrders) {
   const runners = [...new Set(marketOrders.map(o => String(o.selection_id)))];
   const result  = {};
@@ -177,11 +159,9 @@ function calculateRunnerPnL(marketOrders) {
       const sel   = String(bet.selection_id);
 
       if (sel === runnerId) {
-        // This runner wins:
         if (bet.side === BET_SIDE.BACK) profitIfWin += (price - 1) * size;
         else                            lossIfWin   += (price - 1) * size;
       } else {
-        // This runner wins, the other lost:
         if (bet.side === BET_SIDE.BACK) lossIfWin   += size;
         else                            profitIfWin += size;
       }
@@ -198,64 +178,44 @@ function calculateRunnerPnL(marketOrders) {
   return result;
 }
 
-/* ─────────────────────────────────────────────────────────────
-   settleEventBets  (Market Settlement)
+/* ═══════════════════════════════════════════════════════════════
+   settleEventBets  ← CORE SETTLEMENT FUNCTION
 
    winningSelectionId = jo runner jeet gaya
 
-   SETTLEMENT RULES:
-   BACK on winner  → credit = stake + (price-1)*stake
-   BACK on loser   → loss   = stake (already deducted)
-   LAY on winner   → loss   = (price-1)*stake (already deducted)
-   LAY on loser    → credit = stake (bookmaker wins)
+   SETTLEMENT RULES (Exchange):
+   ┌──────────────┬────────────┬──────────────────────────────┐
+   │ Bet Type     │ Result     │ Outcome                      │
+   ├──────────────┼────────────┼──────────────────────────────┤
+   │ BACK winner  │ Win        │ credit = stake + profit      │
+   │ BACK loser   │ Loss       │ stake already deducted       │
+   │ LAY winner   │ Loss       │ liability already deducted   │
+   │ LAY loser    │ Win        │ credit = stake (liability)   │
+   └──────────────┴────────────┴──────────────────────────────┘
 
-   Commission deducted from net profit only.
-   commissionPct = 0..100 (default 0)
-────────────────────────────────────────────────────────────── */
+   ALL DB changes wrapped in a single Sequelize transaction →
+   atomic: ya poora settle hoga ya kuch nahi.
+
+   Duplicate protection: MATCHED orders hi process honge.
+   Ek baar SETTLED ho gaye to dobara settle nahi honge.
+═══════════════════════════════════════════════════════════════ */
 async function settleEventBets(marketId, winningSelectionId, { commissionPct = 0 } = {}) {
+  // ── Step 1: Check karo — koi MATCHED order hai bhi? ─────────
   const matchedOrders = await Order.findAll({
     where: { market_id: marketId, status: ORDER_STATUS.MATCHED },
   });
 
-  // ✅ Market settle ho raha hai — agar koi PENDING (unmatched) order isi market
-  // ka reh gaya ho to usko CANCEL karo, warna woh hamesha pending reh jayega
-  // aur uski liability wallet ko block karti rahegi.
+  // Dangling PENDING orders bhi cancel karo (unmatched at close)
   const danglingPending = await Order.findAll({
     where: { market_id: marketId, status: ORDER_STATUS.PENDING },
   });
 
-  if (danglingPending.length) {
-    const pendingUserIds = [...new Set(danglingPending.map(o => String(o.user_id)))];
-
-    await Order.update(
-      { status: ORDER_STATUS.CANCELLED },
-      { where: { market_id: marketId, status: ORDER_STATUS.PENDING } },
-    );
-
-    for (const uid of pendingUserIds) {
-      await Transaction.create({
-        user_id:      uid,
-        type:         TRANSACTION_TYPE.BET_CANCELLED,
-        amount:       0,
-        description:  `Market ${marketId} settled — unmatched pending bet(s) auto-cancelled`,
-        status:       'completed',
-        reference_id: String(marketId),
-      });
-    }
-
-    logger.info(`[Settlement] market=${marketId}: ${danglingPending.length} dangling PENDING order(s) cancelled`);
-  }
-
-  if (!matchedOrders.length) {
-    logger.warn(`settleEventBets: No matched orders for market ${marketId}`);
-    // Dangling pending users ka liable bhi recalc karna zaroori hai
-    if (danglingPending.length) {
-      const pendingUserIds = [...new Set(danglingPending.map(o => String(o.user_id)))];
-      for (const uid of pendingUserIds) await recalculateLiability(uid);
-    }
+  if (!matchedOrders.length && !danglingPending.length) {
+    logger.warn(`[Settlement] No active orders for market ${marketId} — nothing to settle`);
     return { settled: 0, details: [] };
   }
 
+  // ── Step 2: Users group karo ─────────────────────────────────
   const byUser = {};
   for (const o of matchedOrders) {
     const uid = String(o.user_id);
@@ -264,123 +224,217 @@ async function settleEventBets(marketId, winningSelectionId, { commissionPct = 0
 
   let totalSettled = 0;
   const details    = [];
+  const nowDate    = new Date();
 
-  for (const [userId, bets] of Object.entries(byUser)) {
-    const user = await User.findByPk(userId);
-    if (!user) continue;
+  // ── Step 3: DB Transaction — atomic settlement ───────────────
+  await sequelize.transaction(async (t) => {
 
-    let totalWinCredit   = 0;
-    let totalLoss        = 0;
-    let totalLiableHeld  = 0;
+    // 3a. Dangling PENDING → CANCELLED (market band ho gayi)
+    if (danglingPending.length) {
+      const pendingUserIds = [...new Set(danglingPending.map(o => String(o.user_id)))];
+      await Order.update(
+        { status: ORDER_STATUS.CANCELLED },
+        {
+          where: { market_id: marketId, status: ORDER_STATUS.PENDING },
+          transaction: t,
+        },
+      );
 
-    for (const bet of bets) {
-      const price         = Number(bet.price);
-      const effectiveSize = Number(bet.matched) > 0 ? Number(bet.matched) : Number(bet.size);
-      const liableHeld    = bet.side === BET_SIDE.BACK
-        ? effectiveSize
-        : (price - 1) * effectiveSize;
-
-      totalLiableHeld += liableHeld;
-
-      const isWinner = String(bet.selection_id) === String(winningSelectionId);
-
-      if (isWinner) {
-        if (bet.side === BET_SIDE.BACK) {
-          totalWinCredit += effectiveSize + (price - 1) * effectiveSize;
-        } else {
-          totalLoss += (price - 1) * effectiveSize;
-        }
-      } else {
-        // This runner lost
-        if (bet.side === BET_SIDE.BACK) {
-          totalLoss += effectiveSize; // BACK on loser → stake lost
-        } else {
-          totalWinCredit += effectiveSize; // LAY on loser → credit = stake only (not double)
-        }
+      for (const uid of pendingUserIds) {
+        const pendingBetsForUser = danglingPending.filter(o => String(o.user_id) === uid);
+        await Transaction.create({
+          user_id:      uid,
+          type:         TRANSACTION_TYPE.BET_CANCELLED,
+          amount:       0,
+          description:  `Market closed — ${pendingBetsForUser.length} unmatched bet(s) auto-cancelled for market: ${pendingBetsForUser[0]?.event_name || marketId}`,
+          status:       'completed',
+          reference_id: String(marketId),
+        }, { transaction: t });
       }
+
+      logger.info(`[Settlement] market=${marketId}: ${danglingPending.length} dangling PENDING order(s) cancelled`);
     }
 
-    const grossProfit = totalWinCredit - totalLiableHeld - totalLoss;
-    const commission  = grossProfit > 0 ? parseFloat((grossProfit * commissionPct / 100).toFixed(2)) : 0;
-    const netCredit   = totalWinCredit - commission;
+    if (!matchedOrders.length) {
+      logger.warn(`[Settlement] market=${marketId}: only PENDING orders found, all cancelled. No matched bets to settle.`);
+      return;
+    }
 
-    const walletBefore = parseFloat(user.wallet_balance) || 0;
-    const liableBefore = parseFloat(user.liable) || 0;
+    // 3b. Per-user settlement ────────────────────────────────────
+    for (const [userId, bets] of Object.entries(byUser)) {
+      const user = await User.findByPk(userId, { transaction: t, lock: t.LOCK.UPDATE });
+      if (!user) {
+        logger.error(`[Settlement] user ${userId} not found — skipping`);
+        continue;
+      }
 
-    const newWallet = Math.max(0, walletBefore + totalLiableHeld + (netCredit - totalLiableHeld));
-    const newLiable = Math.max(0, liableBefore - totalLiableHeld);
+      let totalWinCredit  = 0;
+      let totalLoss       = 0;
+      let totalLiableHeld = 0;
 
-    await user.update({ wallet_balance: newWallet, liable: newLiable });
+      // ── Calculate each bet result ──────────────────────────
+      for (const bet of bets) {
+        const price         = Number(bet.price);
+        const effectiveSize = Number(bet.matched) > 0 ? Number(bet.matched) : Number(bet.size);
+        const isWinner      = String(bet.selection_id) === String(winningSelectionId);
 
-    const txnAmount = netCredit - totalLiableHeld;
-    await Transaction.create({
-      user_id:      userId,
-      type:         TRANSACTION_TYPE.BET_SETTLEMENT,
-      amount:       parseFloat(txnAmount.toFixed(2)),
-      description:  `Settlement: market ${marketId}, winner ${winningSelectionId}. Gross profit: ${grossProfit.toFixed(2)}, Commission: ${commission.toFixed(2)}`,
-      status:       'completed',
-      reference_id: String(marketId),
-    });
+        // Liability held for this bet (already locked in wallet earlier)
+        const liableHeld = bet.side === BET_SIDE.BACK
+          ? effectiveSize
+          : (price - 1) * effectiveSize;
 
-    await Order.update(
-      { status: ORDER_STATUS.SETTLED, settled_at: new Date(), winning_selection_id: String(winningSelectionId) },
-      { where: { user_id: userId, market_id: marketId, status: ORDER_STATUS.MATCHED } },
-    );
+        totalLiableHeld += liableHeld;
 
-    const runnerPnLMap = calculateRunnerPnL(bets.map(b => b.toJSON()));
+        if (isWinner) {
+          if (bet.side === BET_SIDE.BACK) {
+            // Back on winner: get back stake + profit
+            totalWinCredit += effectiveSize + (price - 1) * effectiveSize;
+          } else {
+            // Lay on winner: pay liability (already held, so just track loss)
+            totalLoss += (price - 1) * effectiveSize;
+          }
+        } else {
+          // Runner lost
+          if (bet.side === BET_SIDE.BACK) {
+            // Back on loser: stake lost
+            totalLoss += effectiveSize;
+          } else {
+            // Lay on loser: collect the stake as profit
+            totalWinCredit += effectiveSize;
+          }
+        }
+      }
 
-    if (global.io) {
-      global.io.to(`user_${userId}`).emit('userUpdated', {
-        wallet_balance: newWallet,
-        liable:         newLiable,
+      // ── Commission on net profit only ──────────────────────
+      const grossProfit = totalWinCredit - totalLiableHeld;
+      const commission  = grossProfit > 0
+        ? parseFloat((grossProfit * commissionPct / 100).toFixed(2))
+        : 0;
+      const netCredit   = totalWinCredit - commission;
+
+      // ── Wallet update ───────────────────────────────────────
+      const walletBefore = parseFloat(user.wallet_balance) || 0;
+      const liableBefore = parseFloat(user.liable) || 0;
+
+      // Release liable, credit winnings
+      const newWallet = Math.max(0, walletBefore + netCredit);
+      const newLiable = Math.max(0, liableBefore - totalLiableHeld);
+
+      await user.update(
+        { wallet_balance: newWallet, liable: newLiable },
+        { transaction: t },
+      );
+
+      // ── Mark orders as SETTLED ──────────────────────────────
+      await Order.update(
+        {
+          status:               ORDER_STATUS.SETTLED,
+          settled_at:           nowDate,
+          winning_selection_id: String(winningSelectionId),
+        },
+        {
+          where: {
+            user_id:   userId,
+            market_id: marketId,
+            status:    ORDER_STATUS.MATCHED,
+          },
+          transaction: t,
+        },
+      );
+
+      // ── Transaction record — Statement mein dikhega ─────────
+      const txnAmount = netCredit - totalLiableHeld;
+      const matchName = bets[0]?.event_name || `Market ${marketId}`;
+      const betSummary = bets.map(b => {
+        const isW    = String(b.selection_id) === String(winningSelectionId);
+        const sz     = Number(b.matched) > 0 ? Number(b.matched) : Number(b.size);
+        const pnl    = b.side === BET_SIDE.BACK
+          ? (isW ? +((Number(b.price) - 1) * sz).toFixed(2) : -(sz.toFixed(2)))
+          : (isW ? -((Number(b.price) - 1) * sz).toFixed(2) : +(sz.toFixed(2)));
+        const rName  = b.runner_name || `Sel-${b.selection_id}`;
+        return `${b.side} ${rName}@${b.price} Stake:${sz} P&L:${pnl >= 0 ? '+' : ''}${pnl}`;
+      }).join(' | ');
+
+      await Transaction.create({
+        user_id:      userId,
+        type:         TRANSACTION_TYPE.BET_SETTLEMENT,
+        amount:       parseFloat(txnAmount.toFixed(2)),
+        description:  `SETTLED | Match: ${matchName} | WinnerId: ${winningSelectionId} | ${betSummary} | GrossP&L: ${grossProfit >= 0 ? '+' : ''}${grossProfit.toFixed(2)} | Commission: -${commission.toFixed(2)} | NetCredit: ${netCredit.toFixed(2)}`,
+        status:       'completed',
+        reference_id: String(marketId),
+      }, { transaction: t });
+
+      // ── Collect details for response + socket ───────────────
+      const runnerPnLMap = calculateRunnerPnL(bets.map(b => b.toJSON ? b.toJSON() : b));
+      details.push({
+        userId,
+        grossProfit:    parseFloat(grossProfit.toFixed(2)),
+        commission,
+        netCredit:      parseFloat(netCredit.toFixed(2)),
+        totalLoss:      parseFloat(totalLoss.toFixed(2)),
+        liableReleased: parseFloat(totalLiableHeld.toFixed(2)),
+        walletBefore,
+        walletAfter:    newWallet,
+        runnerPnL:      runnerPnLMap,
+      });
+
+      totalSettled++;
+      logger.info(
+        `[Settlement] userId=${userId} market=${marketId}: ` +
+        `gross=${grossProfit.toFixed(2)} commission=${commission.toFixed(2)} ` +
+        `net=${netCredit.toFixed(2)} loss=${totalLoss.toFixed(2)} ` +
+        `liableReleased=${totalLiableHeld.toFixed(2)} ` +
+        `walletBefore=${walletBefore.toFixed(2)} walletAfter=${newWallet.toFixed(2)}`
+      );
+    }
+  }); // ← sequelize transaction ends here — all or nothing
+
+  // ── Step 4: Liability recalculate (remaining active orders) ──
+  // Transaction ke bahar — pure DB writes ho gaye hain
+  const allAffectedUsers = [
+    ...Object.keys(byUser),
+    ...danglingPending.map(o => String(o.user_id)).filter(uid => !byUser[uid]),
+  ];
+  const uniqueUsers = [...new Set(allAffectedUsers)];
+
+  for (const userId of uniqueUsers) {
+    try {
+      await recalculateLiability(userId);
+    } catch (e) {
+      logger.warn(`[Settlement] recalcLiability failed for userId=${userId}: ${e.message}`);
+    }
+  }
+
+  // ── Step 5: Socket notifications ─────────────────────────────
+  if (global.io) {
+    // Per-user settlement notification
+    for (const d of details) {
+      global.io.to(`user_${d.userId}`).emit('userUpdated', {
+        wallet_balance: d.walletAfter,
+        liable:         Math.max(0, (parseFloat((await User.findByPk(d.userId, { raw: true }))?.liable) || 0)),
         event:          'settlement',
         marketId,
         winningSelectionId,
         settlement: {
-          grossProfit:    parseFloat(grossProfit.toFixed(2)),
-          commission,
-          netCredit:      parseFloat(netCredit.toFixed(2)),
-          totalLoss:      parseFloat(totalLoss.toFixed(2)),
-          totalWinCredit: parseFloat(totalWinCredit.toFixed(2)),
-          liableReleased: totalLiableHeld,
+          grossProfit:    d.grossProfit,
+          commission:     d.commission,
+          netCredit:      d.netCredit,
+          totalLoss:      d.totalLoss,
+          liableReleased: d.liableReleased,
+          walletBefore:   d.walletBefore,
+          walletAfter:    d.walletAfter,
         },
-        runnerPnL: runnerPnLMap,
+        runnerPnL: d.runnerPnL,
+      });
+
+      // Tell client to remove settled bets from Matched Bets section
+      global.io.to(`user_${d.userId}`).emit('betsSettled', {
+        marketId,
+        winningSelectionId,
       });
     }
 
-    details.push({
-      userId,
-      grossProfit:    parseFloat(grossProfit.toFixed(2)),
-      commission,
-      netCredit:      parseFloat(netCredit.toFixed(2)),
-      totalLoss:      parseFloat(totalLoss.toFixed(2)),
-      liableReleased: parseFloat(totalLiableHeld.toFixed(2)),
-      walletBefore,
-      walletAfter:    newWallet,
-      runnerPnL:      runnerPnLMap,
-    });
-
-    totalSettled++;
-    logger.info(
-      `Settled userId=${userId}: grossProfit=${grossProfit.toFixed(2)}, ` +
-      `commission=${commission.toFixed(2)}, netCredit=${netCredit.toFixed(2)}, ` +
-      `loss=${totalLoss.toFixed(2)}, liableReleased=${totalLiableHeld.toFixed(2)}`
-    );
-  }
-
-  // ✅ Matched-order users + dangling-pending-only users — dono ka liability recalc
-  const pendingOnlyUserIds = danglingPending
-    .map(o => String(o.user_id))
-    .filter(uid => !byUser[uid]);
-
-  for (const userId of Object.keys(byUser)) {
-    await recalculateLiability(userId);
-  }
-  for (const userId of [...new Set(pendingOnlyUserIds)]) {
-    await recalculateLiability(userId);
-  }
-
-  if (global.io) {
+    // Broadcast to match room
     global.io.to(`match_${marketId}`).emit('marketSettled', {
       marketId,
       winningSelectionId,
@@ -388,16 +442,13 @@ async function settleEventBets(marketId, winningSelectionId, { commissionPct = 0
     });
   }
 
-  logger.info(`Settlement complete for market ${marketId}: ${totalSettled} users settled`);
+  logger.info(`[Settlement] ✅ Complete for market=${marketId}: ${totalSettled} users settled, ${danglingPending.length} pending cancelled`);
   return { settled: totalSettled, details };
 }
 
-/* ─────────────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════
    voidMarketBets  — Market VOID / Cancel karo
-
-   Har user ka MATCHED aur PENDING bets cancel karo.
-   Poora liable wapas wallet mein dalo.
-────────────────────────────────────────────────────────────── */
+═══════════════════════════════════════════════════════════════ */
 async function voidMarketBets(marketId) {
   const affectedOrders = await Order.findAll({
     where: {
@@ -419,32 +470,35 @@ async function voidMarketBets(marketId) {
 
   let totalVoided = 0;
 
-  for (const [userId, bets] of Object.entries(byUser)) {
-    const user = await User.findByPk(userId);
-    if (!user) continue;
+  await sequelize.transaction(async (t) => {
+    for (const [userId, bets] of Object.entries(byUser)) {
+      const user = await User.findByPk(userId, { transaction: t });
+      if (!user) continue;
 
-    await Order.update(
-      { status: ORDER_STATUS.CANCELLED },
-      {
-        where: {
-          user_id:   userId,
-          market_id: marketId,
-          status:    { [Op.in]: [ORDER_STATUS.PENDING, ORDER_STATUS.MATCHED] },
+      await Order.update(
+        { status: ORDER_STATUS.CANCELLED },
+        {
+          where: {
+            user_id:   userId,
+            market_id: marketId,
+            status:    { [Op.in]: [ORDER_STATUS.PENDING, ORDER_STATUS.MATCHED] },
+          },
+          transaction: t,
         },
-      }
-    );
+      );
 
-    await Transaction.create({
-      user_id:      userId,
-      type:         TRANSACTION_TYPE.BET_CANCELLED,
-      amount:       0,
-      description:  `VOID: market ${marketId} cancelled — all ${bets.length} bets voided`,
-      status:       'completed',
-      reference_id: String(marketId),
-    });
+      await Transaction.create({
+        user_id:      userId,
+        type:         TRANSACTION_TYPE.BET_CANCELLED,
+        amount:       0,
+        description:  `VOID | Market: ${bets[0]?.event_name || marketId} — ${bets.length} bet(s) voided and stake returned`,
+        status:       'completed',
+        reference_id: String(marketId),
+      }, { transaction: t });
 
-    totalVoided++;
-  }
+      totalVoided++;
+    }
+  });
 
   for (const userId of Object.keys(byUser)) {
     const freshData = await recalculateLiability(userId);
@@ -465,9 +519,9 @@ async function voidMarketBets(marketId) {
   return { voided: totalVoided };
 }
 
-/* ─────────────────────────────────────────────────────────────
-   getMarketPnLSummary  — Market ke liye per-runner PnL summary
-────────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   getMarketPnLSummary
+═══════════════════════════════════════════════════════════════ */
 async function getMarketPnLSummary(marketId, userId) {
   const orders = await Order.findAll({
     where: {
@@ -479,7 +533,6 @@ async function getMarketPnLSummary(marketId, userId) {
   });
 
   if (!orders.length) return {};
-
   return calculateRunnerPnL(orders);
 }
 
