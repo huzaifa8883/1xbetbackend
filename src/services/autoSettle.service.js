@@ -1,33 +1,37 @@
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════
-   autoSettle.service.js  v5
+   autoSettle.service.js  v5  — CATALOG2-FIRST SETTLEMENT
 
-   COMPLETE REWRITE — Reliable, near-real-time settlement
+   ROOT CAUSE OF BUG:
+   Previous versions relied ONLY on Betfair listMarketBook to
+   detect the winner. But Greyhound/Horse Race markets disappear
+   from Betfair API within minutes of closing (DSC-0018 error),
+   so winner was never found → bets never settled.
 
-   HOW IT WORKS:
-   ─────────────
-   1. Every POLL_INTERVAL ms: find all markets with MATCHED bets
-   2. For each market: ask Betfair if it's CLOSED + who won
-   3. If CLOSED + winner found → settleEventBets() atomically
-   4. Duplicate protection: _settled Set + DB SETTLED status check
-   5. Error handling per-market: one market failure won't block others
+   THE FIX — 3-layer winner detection (fastest to slowest):
+   ─────────────────────────────────────────────────────────
+   Layer 1: Catalog2 API (OUR backend) — runners[].status=WINNER
+            Fastest. Always works. Market close ke saath hi
+            catalog2 update ho jaata hai winner ke saath.
 
-   BETFAIR ERRORS HANDLED:
-   ─────────────────────────
-   • DSC-0018 (market removed) → try listMarketProfitAndLoss
-   • TOO_MANY_REQUESTS         → skip this cycle, retry next poll
-   • Network errors            → log + skip, retry next poll
+   Layer 2: Betfair listMarketBook — backup if catalog2 slow
+            Works while market is still on Betfair exchange.
 
-   ENV CONFIG:
-   ─────────────
-   AUTO_SETTLE_INTERVAL_MS       = 15000   (default 15 sec)
-   AUTO_SETTLE_COMMISSION_PCT    = 0       (default 0%)
-   AUTO_SETTLE_BATCH_SIZE        = 40      (Betfair API limit)
+   Layer 3: Betfair listMarketProfitAndLoss — last resort
+            Works even after market is removed from Betfair.
+
+   FLOW:
+   ─────
+   Every POLL_INTERVAL: find all markets with MATCHED bets
+   → For each: try Layer1 → Layer2 → Layer3
+   → Winner mila? → settleEventBets() atomically
+   → Duplicate protection: _settled cache + DB status check
 ═══════════════════════════════════════════════════════════════ */
 
-const { Op }              = require('sequelize');
-const { Order }           = require('../models');
+const axios           = require('axios');
+const { Op }          = require('sequelize');
+const { Order }       = require('../models');
 const { ORDER_STATUS }    = require('../config/constants');
 const { settleEventBets } = require('./order.service');
 const logger              = require('../utils/logger');
@@ -38,11 +42,11 @@ try {
   const bf = require('./betfair.service');
   listMarketBook          = bf.listMarketBook;
   listMarketProfitAndLoss = bf.listMarketProfitAndLoss;
-  if (typeof listMarketBook          !== 'function') throw new Error('listMarketBook not a function');
-  if (typeof listMarketProfitAndLoss !== 'function') throw new Error('listMarketProfitAndLoss not a function');
+  if (typeof listMarketBook          !== 'function') throw new Error('listMarketBook not fn');
+  if (typeof listMarketProfitAndLoss !== 'function') throw new Error('listMarketProfitAndLoss not fn');
   logger.info('[AutoSettle v5] betfair.service loaded OK');
 } catch (e) {
-  logger.error('[AutoSettle v5] betfair.service import failed: ' + e.message);
+  logger.warn('[AutoSettle v5] betfair.service unavailable: ' + e.message + ' — will use Catalog2 only');
   listMarketBook          = async () => [];
   listMarketProfitAndLoss = async () => null;
 }
@@ -52,22 +56,22 @@ const POLL_INTERVAL  = parseInt(process.env.AUTO_SETTLE_INTERVAL_MS     || '1500
 const COMMISSION_PCT = parseFloat(process.env.AUTO_SETTLE_COMMISSION_PCT || '0');
 const BATCH_SIZE     = parseInt(process.env.AUTO_SETTLE_BATCH_SIZE       || '40',   10);
 
+// Catalog2 API base URL — same server, internal call
+const CATALOG2_BASE  = process.env.CATALOG2_BASE_URL
+  || process.env.API_BASE_URL
+  || 'https://1xbetbackend.work.gd/api/v1';
+
 // ── Error patterns ───────────────────────────────────────────
 const DSC_0018_RE = /DSC-0018/i;
 const TMR_RE      = /TOO_MANY_REQUESTS|ANGX-0008/i;
 
 // ── In-memory caches ─────────────────────────────────────────
-// _settled: markets already fully settled — don't re-process
-// _inProgress: currently being settled — prevent race condition
-// _betfairGone: DSC-0018 markets — use PnL endpoint only
-const _settled    = new Set();
-const _inProgress = new Set();
-const _betfairGone = new Set();
+const _settled     = new Set();   // fully settled markets
+const _inProgress  = new Set();   // currently settling (race guard)
+const _betfairGone = new Set();   // DSC-0018 markets — skip Betfair book
 
 /* ═══════════════════════════════════════════════════════════════
-   rebuildSettledCache
-   On startup: pre-load already settled markets into _settled
-   so we don't waste API calls on them.
+   rebuildSettledCache — startup mein already-settled markets load
 ═══════════════════════════════════════════════════════════════ */
 async function rebuildSettledCache() {
   try {
@@ -78,87 +82,177 @@ async function rebuildSettledCache() {
       raw:        true,
     });
     rows.forEach(r => _settled.add(r.market_id));
-    logger.info(`[AutoSettle v5] Startup cache: ${_settled.size} already-settled markets loaded`);
+    logger.info(`[AutoSettle v5] Startup: ${_settled.size} already-settled markets in cache`);
   } catch (e) {
     logger.warn('[AutoSettle v5] rebuildSettledCache error: ' + e.message);
   }
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   detectWinnerFromBook
-   Betfair CLOSED book se winner selectionId nikalo.
-   Returns: string selectionId | null
+   LAYER 1: detectWinnerFromCatalog2
+   ─────────────────────────────────
+   Tumhara apna /markets/catalog2?id=xxx API call karo.
+   Response mein runners[].status === 'WINNER' ya
+   runners[].isWinner === true hota hai jab market close hoti hai.
+
+   Yeh SABSE RELIABLE hai kyunki:
+   - Betfair pe depend nahi
+   - Market close hone ke saath hi update hota hai
+   - Greyhound, Horse Race, Cricket — sab ke liye kaam karta hai
+═══════════════════════════════════════════════════════════════ */
+async function detectWinnerFromCatalog2(marketId) {
+  try {
+    const url = `${CATALOG2_BASE}/markets/catalog2?id=${encodeURIComponent(marketId)}`;
+    const res  = await axios.get(url, { timeout: 8000 });
+
+    const catalog = (res.data?.success && res.data?.data) ? res.data.data : res.data;
+    if (!catalog) return null;
+
+    const mktStatus = (catalog.status || '').toUpperCase();
+
+    // ── METHOD A: Runner status === WINNER (Betfair book still available) ──
+    const runners = catalog.runners || [];
+    const byStatus = runners.find(r =>
+      (r.status || '').toUpperCase() === 'WINNER' ||
+      r.isWinner === true ||
+      r.won === true
+    );
+    if (byStatus) {
+      const winSel = String(byStatus.selectionId || byStatus.selection_id || byStatus.id || '');
+      if (winSel) {
+        logger.info(`[AutoSettle v5] ✅ Catalog2 winner (status): market=${marketId} sel=${winSel} runner="${byStatus.runnerName || byStatus.name}"`);
+        return winSel;
+      }
+    }
+
+    // ── If market not CLOSED yet, skip ──
+    if (mktStatus !== 'CLOSED') {
+      logger.debug(`[AutoSettle v5] Catalog2: market=${marketId} status=${mktStatus} — not closed yet`);
+      return null;
+    }
+
+    // Market CLOSED hai lekin runner.status=WINNER nahi mila
+    // (Betfair ne book remove kar di — book null tha, sab ACTIVE dikh rahe hain)
+    // ── METHOD B: prices9 /markets/Data API se winner nikalo ──
+    // prices9 ke MarketData mein WINNER runner hota hai even after Betfair closes
+    logger.debug(`[AutoSettle v5] Catalog2: market=${marketId} CLOSED but no WINNER status — trying prices9 Data API`);
+
+    try {
+      const PRICES_BASE = process.env.PRICES_DATA_URL || 'https://prices9.mgs11.com/api/v1';
+      const dataRes = await axios.get(`${PRICES_BASE}/markets/data?id=${encodeURIComponent(marketId)}`, { timeout: 6000 });
+      const data    = (dataRes.data?.success && dataRes.data?.data) ? dataRes.data.data : dataRes.data;
+      const books   = data?.marketBooks || (Array.isArray(data) ? data : []);
+      const book    = books.find(b => String(b.id || b.marketId) === String(marketId)) || books[0];
+
+      if (book) {
+        const bookStatus = (book.marketStatus || book.status || '').toUpperCase();
+        if (bookStatus === 'CLOSED') {
+          // id field (prices9) ya selectionId (standard)
+          const winner = (book.runners || []).find(r => (r.status || '').toUpperCase() === 'WINNER');
+          if (winner) {
+            const winSel = String(winner.id || winner.selectionId || '');
+            if (winSel) {
+              logger.info(`[AutoSettle v5] ✅ prices9 Data API winner: market=${marketId} sel=${winSel}`);
+              return winSel;
+            }
+          }
+
+          // lastPriceTraded ≤ 1.01 fallback
+          const byLPT = (book.runners || []).find(r => {
+            const lpt = parseFloat(r.lastPriceTraded || 0);
+            return lpt > 0 && lpt <= 1.01;
+          });
+          if (byLPT) {
+            const winSel = String(byLPT.id || byLPT.selectionId || '');
+            if (winSel) {
+              logger.info(`[AutoSettle v5] ✅ prices9 Data API winner (LPT): market=${marketId} sel=${winSel}`);
+              return winSel;
+            }
+          }
+        }
+      }
+    } catch (pricesErr) {
+      logger.debug(`[AutoSettle v5] prices9 Data API failed [${marketId}]: ${pricesErr.message}`);
+    }
+
+    // ── METHOD C: winners count > 0 → sortPriority=1 fallback ──
+    if (catalog.winners > 0) {
+      const bySort = runners.find(r =>
+        r.sortPriority === 1 || r.position === 1 || r.finishingPosition === 1
+      );
+      if (bySort) {
+        const winSel = String(bySort.selectionId || bySort.selection_id || bySort.id || '');
+        if (winSel) {
+          logger.info(`[AutoSettle v5] ✅ Catalog2 winner (sortPriority): market=${marketId} sel=${winSel}`);
+          return winSel;
+        }
+      }
+    }
+
+    logger.debug(`[AutoSettle v5] Catalog2+prices9: market=${marketId} CLOSED — winner still undetermined`);
+    return null;
+
+  } catch (e) {
+    logger.warn(`[AutoSettle v5] Catalog2 fetch failed [${marketId}]: ${e.message}`);
+    return null;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   LAYER 2: detectWinnerFromBook (Betfair listMarketBook)
 ═══════════════════════════════════════════════════════════════ */
 function detectWinnerFromBook(book) {
   if (!book) return null;
-  const status = (book.status || '').toUpperCase();
-  if (status !== 'CLOSED') return null;
+  if ((book.status || '').toUpperCase() !== 'CLOSED') return null;
 
   const runners = book.runners || [];
 
-  // Method 1: status === 'WINNER'
+  // status === 'WINNER'
   const byStatus = runners.find(r => (r.status || '').toUpperCase() === 'WINNER');
-  if (byStatus) {
-    logger.debug(`[AutoSettle v5] Winner by status: sel=${byStatus.selectionId}`);
-    return String(byStatus.selectionId);
-  }
+  if (byStatus) return String(byStatus.selectionId);
 
-  // Method 2: lastPriceTraded ≤ 1.01 (settled at near-evens = winner)
+  // lastPriceTraded ≤ 1.01
   const byPrice = runners.find(r => {
     const lpt = parseFloat(r.lastPriceTraded || 0);
     return lpt > 0 && lpt <= 1.01;
   });
-  if (byPrice) {
-    logger.debug(`[AutoSettle v5] Winner by lastPriceTraded: sel=${byPrice.selectionId}`);
-    return String(byPrice.selectionId);
-  }
+  if (byPrice) return String(byPrice.selectionId);
 
   return null;
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   detectWinnerFromPnL
-   Betfair listMarketProfitAndLoss se winner detect karo.
-   Used when: (a) DSC-0018 or (b) book has no winner signal.
+   LAYER 3: detectWinnerFromPnL (Betfair listMarketProfitAndLoss)
 ═══════════════════════════════════════════════════════════════ */
 async function detectWinnerFromPnL(marketId) {
   try {
     const results = await listMarketProfitAndLoss([marketId]);
     const market  = results?.[0];
     if (!market) return null;
-
-    // Runner with positive ifWin = winner
     const winner = (market.profitAndLosses || []).find(p => Number(p.ifWin) > 0);
     if (!winner) return null;
-
-    logger.info(`[AutoSettle v5] Winner via PnL endpoint: market=${marketId} sel=${winner.selectionId}`);
+    logger.info(`[AutoSettle v5] Winner via PnL: market=${marketId} sel=${winner.selectionId}`);
     return String(winner.selectionId);
   } catch (e) {
-    if (TMR_RE.test(e.message)) {
-      logger.warn(`[AutoSettle v5] PnL rate-limited for ${marketId} — will retry next poll`);
-    } else {
-      logger.warn(`[AutoSettle v5] detectWinnerFromPnL failed [${marketId}]: ${e.message}`);
-    }
+    if (TMR_RE.test(e.message)) logger.warn(`[AutoSettle v5] PnL rate-limited [${marketId}]`);
+    else logger.warn(`[AutoSettle v5] PnL failed [${marketId}]: ${e.message}`);
     return null;
   }
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   doSettle — actually settle a market (with duplicate guard)
+   doSettle — duplicate-safe settlement trigger
 ═══════════════════════════════════════════════════════════════ */
 async function doSettle(marketId, winSel) {
-  if (_settled.has(marketId)) {
-    logger.debug(`[AutoSettle v5] market=${marketId} already in settled cache — skip`);
-    return;
-  }
+  if (_settled.has(marketId)) return; // in-memory cache hit
 
-  // DB-level duplicate check — in case cache was rebuilt without this entry
+  // DB-level check: koi order already SETTLED hai to skip
   const alreadySettled = await Order.count({
     where: { market_id: marketId, status: ORDER_STATUS.SETTLED },
   });
   if (alreadySettled > 0) {
-    logger.debug(`[AutoSettle v5] market=${marketId} already settled in DB — adding to cache and skipping`);
-    _settled.add(marketId);
+    _settled.add(marketId); // cache mein daal do
+    logger.debug(`[AutoSettle v5] market=${marketId} already settled in DB — skipping`);
     return;
   }
 
@@ -168,14 +262,14 @@ async function doSettle(marketId, winSel) {
     logger.info(`[AutoSettle v5] ✅ Settled market=${marketId} winner=${winSel} users=${result.settled}`);
     return result;
   } catch (err) {
-    _settled.delete(marketId); // rollback optimistic lock on error
+    _settled.delete(marketId); // rollback on error so retry happens next poll
     logger.error(`[AutoSettle v5] ❌ settleEventBets error [${marketId}]: ${err.message}`);
     throw err;
   }
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   processOneMarket — single market settle karne ki koshish
+   processOneMarket — 3-layer winner detection for one market
 ═══════════════════════════════════════════════════════════════ */
 async function processOneMarket(marketId) {
   if (_settled.has(marketId) || _inProgress.has(marketId)) return;
@@ -184,12 +278,15 @@ async function processOneMarket(marketId) {
   try {
     let winSel = null;
 
-    if (_betfairGone.has(marketId)) {
-      // Betfair ne already DSC-0018 diya — sirf PnL try karo
-      winSel = await detectWinnerFromPnL(marketId);
-      if (winSel) _betfairGone.delete(marketId);
-    } else {
-      // Normal path: listMarketBook
+    // ── LAYER 1: Catalog2 (our own API — always try first) ───
+    winSel = await detectWinnerFromCatalog2(marketId);
+    if (winSel) {
+      await doSettle(marketId, winSel);
+      return;
+    }
+
+    // ── LAYER 2: Betfair listMarketBook ──────────────────────
+    if (!_betfairGone.has(marketId)) {
       try {
         const books = await listMarketBook([marketId], {
           priceData:  ['LAST_PRICE_TRADED'],
@@ -198,46 +295,41 @@ async function processOneMarket(marketId) {
         const book = books?.[0];
 
         if (!book) {
-          // Betfair ne return nahi kiya — treat as gone
           _betfairGone.add(marketId);
-          logger.debug(`[AutoSettle v5] market=${marketId} not returned by Betfair — marked gone`);
-          return;
-        }
-
-        const bookStatus = (book.status || '').toUpperCase();
-        if (bookStatus === 'CLOSED') {
-          winSel = detectWinnerFromBook(book);
-          if (!winSel) {
-            // CLOSED but no clear winner in book — try PnL as fallback
-            logger.debug(`[AutoSettle v5] market=${marketId} CLOSED but no winner in book — trying PnL`);
-            winSel = await detectWinnerFromPnL(marketId);
-          }
         } else {
-          // Market still open/suspended — not ready yet
-          logger.debug(`[AutoSettle v5] market=${marketId} status=${bookStatus} — not closed yet`);
-          return;
+          const bookStatus = (book.status || '').toUpperCase();
+          if (bookStatus === 'CLOSED') {
+            winSel = detectWinnerFromBook(book);
+          } else {
+            // Market still open on Betfair — not ready
+            return;
+          }
         }
       } catch (e) {
         if (DSC_0018_RE.test(e.message)) {
           _betfairGone.add(marketId);
-          logger.info(`[AutoSettle v5] DSC-0018 for ${marketId} — marking gone, trying PnL`);
-          winSel = await detectWinnerFromPnL(marketId);
-          if (winSel) _betfairGone.delete(marketId);
+          logger.debug(`[AutoSettle v5] market=${marketId} DSC-0018 — marked gone`);
         } else if (TMR_RE.test(e.message)) {
-          logger.warn(`[AutoSettle v5] Rate limited for ${marketId} — skipping this cycle`);
+          logger.warn(`[AutoSettle v5] Rate-limited for ${marketId} — skip this cycle`);
           return;
         } else {
-          logger.error(`[AutoSettle v5] listMarketBook error [${marketId}]: ${e.message}`);
-          return;
+          logger.warn(`[AutoSettle v5] listMarketBook error [${marketId}]: ${e.message}`);
         }
       }
     }
 
-    // Winner mil gaya — settle karo!
     if (winSel) {
       await doSettle(marketId, winSel);
+      return;
+    }
+
+    // ── LAYER 3: PnL endpoint ────────────────────────────────
+    winSel = await detectWinnerFromPnL(marketId);
+    if (winSel) {
+      await doSettle(marketId, winSel);
+      if (_betfairGone.has(marketId)) _betfairGone.delete(marketId);
     } else {
-      logger.debug(`[AutoSettle v5] market=${marketId}: CLOSED but winner not determinable yet`);
+      logger.debug(`[AutoSettle v5] market=${marketId}: winner not determinable yet — will retry next poll`);
     }
 
   } finally {
@@ -246,25 +338,23 @@ async function processOneMarket(marketId) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   pollAndSettle — main loop (runs every POLL_INTERVAL ms)
-
-   1. DB se MATCHED bets wale sab unique market IDs lo
+   pollAndSettle — main loop
+   Har POLL_INTERVAL ms mein:
+   1. DB se MATCHED bets wale sab market IDs nikalo
    2. Already settled / in-progress skip karo
-   3. Betfair API mein batch mein bhejo (BATCH_SIZE at a time)
-   4. Per-market result check + settle if CLOSED
+   3. Har market ke liye 3-layer winner detection karo
 ═══════════════════════════════════════════════════════════════ */
 let _pollRunning = false;
 
 async function pollAndSettle() {
-  // Prevent overlapping poll runs
   if (_pollRunning) {
-    logger.debug('[AutoSettle v5] Previous poll still running — skipping this cycle');
+    logger.debug('[AutoSettle v5] Previous poll still running — skipping');
     return;
   }
   _pollRunning = true;
 
   try {
-    // Get all markets with unsettled MATCHED bets
+    // Find all markets with unsettled MATCHED bets
     const rows = await Order.findAll({
       attributes: ['market_id'],
       where:      { status: ORDER_STATUS.MATCHED },
@@ -274,86 +364,26 @@ async function pollAndSettle() {
 
     if (!rows.length) return;
 
-    const pendingMarkets = rows
+    const pending = rows
       .map(r => r.market_id)
       .filter(mid => !_settled.has(mid) && !_inProgress.has(mid));
 
-    if (!pendingMarkets.length) return;
+    if (!pending.length) return;
 
-    logger.debug(`[AutoSettle v5] Poll: ${pendingMarkets.length} markets with MATCHED bets to check`);
+    logger.debug(`[AutoSettle v5] Poll: checking ${pending.length} markets with MATCHED bets`);
 
-    // Batch process (Betfair limit = 40 per call)
-    for (let i = 0; i < pendingMarkets.length; i += BATCH_SIZE) {
-      const batch = pendingMarkets.slice(i, i + BATCH_SIZE);
-
-      // Split: gone markets (PnL only) vs active markets (Betfair book)
-      const goneBatch   = batch.filter(mid => _betfairGone.has(mid));
-      const activeBatch = batch.filter(mid => !_betfairGone.has(mid));
-
-      // Active markets: try batch listMarketBook first (faster, 1 API call)
-      if (activeBatch.length) {
-        try {
-          const books = await listMarketBook(activeBatch, {
-            priceData:  ['LAST_PRICE_TRADED'],
-            virtualise: false,
-          });
-
-          const returnedIds = new Set(books.map(b => b.marketId));
-
-          // Markets Betfair ne return nahi kiye → gone
-          for (const mid of activeBatch) {
-            if (!returnedIds.has(mid)) {
-              _betfairGone.add(mid);
-              logger.debug(`[AutoSettle v5] market=${mid} not in batch response — marked gone`);
-            }
-          }
-
-          // Process returned books
-          for (const book of books) {
-            const mid = book.marketId;
-            if (_settled.has(mid) || _inProgress.has(mid)) continue;
-
-            const bookStatus = (book.status || '').toUpperCase();
-            if (bookStatus !== 'CLOSED') continue;
-
-            // Process asynchronously so one slow settle doesn't block others
-            processOneMarket(mid).catch(e =>
-              logger.error(`[AutoSettle v5] processOneMarket error [${mid}]: ${e.message}`)
-            );
-          }
-        } catch (e) {
-          if (DSC_0018_RE.test(e.message)) {
-            // Batch had a bad marketId — fall back to individual processing
-            logger.warn(`[AutoSettle v5] DSC-0018 in batch — processing ${activeBatch.length} markets individually`);
-            for (const mid of activeBatch) {
-              processOneMarket(mid).catch(err =>
-                logger.error(`[AutoSettle v5] Individual processOneMarket error [${mid}]: ${err.message}`)
-              );
-            }
-          } else if (TMR_RE.test(e.message)) {
-            logger.warn('[AutoSettle v5] Rate-limited on batch listMarketBook — skipping this cycle');
-          } else {
-            logger.error(`[AutoSettle v5] Batch listMarketBook error: ${e.message}`);
-          }
-        }
-      }
-
-      // Gone markets: PnL endpoint (batched, 5 at a time to respect rate limits)
-      if (goneBatch.length) {
-        for (let j = 0; j < goneBatch.length; j += 5) {
-          const chunk = goneBatch.slice(j, j + 5);
-          await Promise.all(chunk.map(mid =>
-            processOneMarket(mid).catch(e =>
-              logger.error(`[AutoSettle v5] processOneMarket(gone) error [${mid}]: ${e.message}`)
-            )
-          ));
-          if (j + 5 < goneBatch.length) await _sleep(2000);
-        }
-      }
-
-      // Brief pause between batches to respect Betfair rate limits
-      if (i + BATCH_SIZE < pendingMarkets.length) await _sleep(1500);
+    // Process all markets in parallel (limited concurrency)
+    // Catalog2 calls are internal — no rate limit concern
+    const CONCURRENCY = 10;
+    for (let i = 0; i < pending.length; i += CONCURRENCY) {
+      const chunk = pending.slice(i, i + CONCURRENCY);
+      await Promise.all(chunk.map(mid =>
+        processOneMarket(mid).catch(e =>
+          logger.error(`[AutoSettle v5] processOneMarket error [${mid}]: ${e.message}`)
+        )
+      ));
     }
+
   } catch (err) {
     logger.error(`[AutoSettle v5] pollAndSettle error: ${err.message}`);
   } finally {
@@ -361,16 +391,10 @@ async function pollAndSettle() {
   }
 }
 
-function _sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-
 /* ═══════════════════════════════════════════════════════════════
-   manualSettle — Admin / fallback trigger
-   Force-settle a specific market (clears cache first)
+   manualSettle — admin/fallback, can pass winner directly
 ═══════════════════════════════════════════════════════════════ */
 async function manualSettle(marketId, winningSelectionId = null) {
-  // Clear caches for fresh attempt
   _settled.delete(marketId);
   _inProgress.delete(marketId);
   _betfairGone.delete(marketId);
@@ -378,29 +402,21 @@ async function manualSettle(marketId, winningSelectionId = null) {
   let winSel = winningSelectionId;
 
   if (!winSel) {
-    // Try Betfair book
+    // Try all 3 layers
+    winSel = await detectWinnerFromCatalog2(marketId);
+  }
+  if (!winSel) {
     try {
-      const books = await listMarketBook([marketId], {
-        priceData:  ['LAST_PRICE_TRADED'],
-        virtualise: false,
-      });
+      const books = await listMarketBook([marketId], { priceData: ['LAST_PRICE_TRADED'], virtualise: false });
       winSel = detectWinnerFromBook(books?.[0]);
     } catch (e) {
-      if (DSC_0018_RE.test(e.message)) {
-        logger.info(`[AutoSettle v5] manualSettle: DSC-0018 for ${marketId} — trying PnL`);
-      } else {
-        logger.warn(`[AutoSettle v5] manualSettle: listMarketBook failed: ${e.message}`);
-      }
-    }
-
-    // Fallback to PnL if book didn't give winner
-    if (!winSel) {
-      winSel = await detectWinnerFromPnL(marketId);
+      if (!DSC_0018_RE.test(e.message)) logger.warn(`[AutoSettle v5] manualSettle book error: ${e.message}`);
     }
   }
+  if (!winSel) winSel = await detectWinnerFromPnL(marketId);
 
   if (!winSel) {
-    logger.warn(`[AutoSettle v5] manualSettle: could not determine winner for market=${marketId}`);
+    logger.warn(`[AutoSettle v5] manualSettle: winner not found for market=${marketId}`);
     return { settled: 0, reason: 'winner_not_found' };
   }
 
@@ -408,22 +424,18 @@ async function manualSettle(marketId, winningSelectionId = null) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   startAutoSettlement — called from server.js on startup
+   startAutoSettlement
 ═══════════════════════════════════════════════════════════════ */
 function startAutoSettlement() {
-  logger.info(`[AutoSettle v5] Starting — poll_interval=${POLL_INTERVAL/1000}s, commission=${COMMISSION_PCT}%, batch_size=${BATCH_SIZE}`);
-
+  logger.info(
+    `[AutoSettle v5] Starting — interval=${POLL_INTERVAL/1000}s ` +
+    `commission=${COMMISSION_PCT}% catalog2_base=${CATALOG2_BASE}`
+  );
   rebuildSettledCache().then(() => {
-    // First poll after 10 seconds (let server fully boot)
-    setTimeout(pollAndSettle, 10_000);
-    // Then every POLL_INTERVAL
+    setTimeout(pollAndSettle, 5_000);      // first poll after 5s
     setInterval(pollAndSettle, POLL_INTERVAL);
-    logger.info(`[AutoSettle v5] ✅ Running — next poll in 10s, then every ${POLL_INTERVAL/1000}s`);
+    logger.info(`[AutoSettle v5] ✅ Running — first poll in 5s, then every ${POLL_INTERVAL/1000}s`);
   });
 }
 
-module.exports = {
-  startAutoSettlement,
-  pollAndSettle,
-  manualSettle,
-};
+module.exports = { startAutoSettlement, pollAndSettle, manualSettle };
