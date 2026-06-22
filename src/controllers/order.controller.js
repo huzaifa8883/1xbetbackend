@@ -242,8 +242,13 @@ async function getAllOrders(req, res) {
    winningSelectionId aur settlementPnL include karta hai
 ────────────────────────────────────────────────────────────── */
 async function getSettledOrders(req, res) {
-  const { page = 1, limit = 100 } = req.query;
+  const { page = 1, limit = 100, marketId, eventName } = req.query;
+  const { Op } = require('sequelize');
   const where = { user_id: req.user.id, status: ORDER_STATUS.SETTLED };
+
+  // Optional filters
+  if (marketId && marketId !== 'undefined') where.market_id = marketId;
+  if (eventName) where.event_name = { [Op.like]: `%${eventName}%` };
 
   const { count, rows } = await Order.findAndCountAll({
     where,
