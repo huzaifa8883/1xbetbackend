@@ -585,8 +585,11 @@ async function getMarketCatalog2(req, res) {
   ]);
 
   const catalog = catalogues?.[0];
-  const book    = books?.[0];
-  if (!catalog || !book) return sendError(res, 'Market not found', 404);
+  const book    = books?.[0] || null;
+
+  // catalog nahi mila → genuine 404
+  // book null hona normal hai — Betfair closed/removed markets ko hata deta hai
+  if (!catalog) return sendError(res, 'Market not found', 404);
 
   const eventTypeId = String(catalog.eventType?.id || '');
   const sportName   = SPORT_MAP[eventTypeId] || catalog.eventType?.name || 'Unknown';
@@ -657,24 +660,21 @@ async function getMarketCatalog2(req, res) {
     marketId:            catalog.marketId,
     marketName:          catalog.marketName,
     marketStartTime:     catalog.marketStartTime,
-    // ✅ mv2.min.js ka fromNow/prettyDate/currentDateTime timer Catalog.marketStartTimeUtc
-    //    field padhta hai (marketStartTime nahi) — isi naam se bhi bhejna zaroori hai,
-    //    warna moment(undefined) hamesha "abhi" treat karta hai aur "a few seconds ago" atka rehta hai.
     marketStartTimeUtc:  catalog.marketStartTime,
     eventTypeId,
     eventType:           sportName,
     eventId,
     eventName:           catalog.event?.name,
     competitionId:       catalog.competition?.id,
-    status:              book.status,
-    isTurnInPlayEnabled: book.isTurnInPlay,
-    betDelay:            book.betDelay,
-    maxBetSize:          book.maxBetSize ?? book.totalMatched ?? 0,
+    // ✅ book null = Betfair ne market remove kar di = CLOSED ho gayi
+    status:              book?.status || 'CLOSED',
+    isTurnInPlayEnabled: book?.isTurnInPlay ?? false,
+    betDelay:            book?.betDelay ?? 0,
+    maxBetSize:          book?.maxBetSize ?? book?.totalMatched ?? 0,
     rules:               catalog.description?.rules || '',
     sport: { name: sportName, image: iconMap[sportName] || 'default.svg', active: true },
-    // ✅ Winners count — mv2.min.js Catalog.winners se WinnersCount set karta hai.
-    //    Runner status ab book se asal aata hai, is liye WINNER count bhi sahi niklega.
-    winners: (book.runners || []).filter((rb) => rb.status === 'WINNER').length,
+    // ✅ Winners: book runners se nikalo — book null ho to 0
+    winners: (book?.runners || []).filter((rb) => rb.status === 'WINNER').length,
     runners: (catalog.runners || []).map(r => {
       const m2 = r.metadata || r.runnerMetadata || {};
       const cNum = m2.CLOTH_NUMBER || m2.cloth_number || m2.ClothNumber || null;
@@ -685,14 +685,13 @@ async function getMarketCatalog2(req, res) {
         '#16A085','#E74C3C','#3498DB','#F1C40F','#E67E22','#1ABC9C','#95A5A6','#2C3E50',
         '#C0392B','#7F8C8D','#27AE60','#D35400',
       ];
-      // ✅ Asal runner status Betfair book se (WINNER/LOSER/REMOVED/ACTIVE) —
-      //    hardcoded 'ACTIVE' hata diya, warna Winners count hamesha 0 reh jaata tha.
       const rb = book?.runners?.find((x) => x.selectionId === r.selectionId);
       return {
         selectionId:  r.selectionId,
         runnerName:   r.runnerName,
         handicap:     r.handicap,
         sortPriority: sP,
+        // ✅ book null ho to status ACTIVE rakho — winner Betfair PnL/prices se detect hoga
         status:       rb?.status || 'ACTIVE',
         clothNumber:  cNum,
         clothColor:   RACE_COLORS[(posN - 1) % RACE_COLORS.length],
