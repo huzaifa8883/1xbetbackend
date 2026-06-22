@@ -189,7 +189,9 @@ async function placeBets(req, res) {
 ────────────────────────────────────────────────────────────── */
 async function getPendingOrders(req, res) {
   const where = { user_id: req.user.id, status: ORDER_STATUS.PENDING };
-  if (req.query.marketId) where.market_id = req.query.marketId;
+  // Support both ?marketId= and ?matchId=
+  const filterById = req.query.marketId || req.query.matchId;
+  if (filterById) where.market_id = filterById;
   const orders = await Order.findAll({ where, order: [['created_at', 'DESC']] });
   return sendSuccess(res, { orders: orders.map(o => enrichOrderWithPnL(o.toJSON())) });
 }
@@ -199,7 +201,9 @@ async function getPendingOrders(req, res) {
 ────────────────────────────────────────────────────────────── */
 async function getMatchedOrders(req, res) {
   const where = { user_id: req.user.id, status: ORDER_STATUS.MATCHED };
-  if (req.query.marketId) where.market_id = req.query.marketId;
+  // Support both ?marketId= and ?matchId= for sub-market compatibility
+  const filterById = req.query.marketId || req.query.matchId;
+  if (filterById) where.market_id = filterById;
   const orders = await Order.findAll({ where, order: [['created_at', 'DESC']] });
   const enriched = orders.map(o => enrichOrderWithPnL(o.toJSON()));
   return sendSuccess(res, { orders: enriched });
