@@ -66,7 +66,7 @@ async function bootstrap() {
     await connectDatabase();
 
     logger.info('Syncing database schema (alter: true)...');
-    await sequelize.sync({ alter: true });
+    await sequelize.sync({ alter: false });
     logger.info('Database schema synchronised successfully!');
 
     startMarketUpdateJob(30_000);
