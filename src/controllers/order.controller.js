@@ -263,9 +263,12 @@ async function getSettledOrders(req, res) {
       const raw = o.toJSON();
       return {
         ...enrichOrderWithPnL(raw),
-        settled_at:           raw.settled_at || null,
+        marketId:             raw.market_id   || null,
+        selectionId:          raw.selection_id || null,
+        eventName:            raw.event_name  || null,
+        category:             raw.category    || null,
+        settled_at:           raw.settled_at  || null,
         winning_selection_id: raw.winning_selection_id || null,
-        // Net P&L for this bet
         settlementPnL: raw.winning_selection_id
           ? computeSettlementPnL(raw)
           : null,
