@@ -86,20 +86,22 @@ async function placeBets(req, res) {
     };
   });
 
-  const existingOrders = await Order.findAll({
-    where: { user_id: userId, status: [ORDER_STATUS.PENDING, ORDER_STATUS.MATCHED] },
-    raw: true,
-  });
-
-  const tentativeLiability = computeTotalLiability([...existingOrders, ...normalized]);
-  const walletBalance      = parseFloat(user.wallet_balance) || 0;
-  const positiveRunnerPnL  = Object.values(user.runner_pnl || {})
+  // FIX: Sirf naye bets ki liability calculate karo.
+  // user.wallet_balance PEHLE SE existing liable deduct ke baad ka balance hai,
+  // isliye existingOrders dobara add karna double-counting tha.
+  // Example: LAY @ 8.8, stake 2000 => newLiable = 15,600
+  //          wallet = 39,000 => 15,600 <= 39,000 bet allow honi chahiye
+  const newLiability      = computeTotalLiability(normalized);
+  const walletBalance     = parseFloat(user.wallet_balance) || 0;
+  const positiveRunnerPnL = Object.values(user.runner_pnl || {})
     .filter(v => (typeof v === 'object' ? v.net > 0 : v > 0))
     .reduce((a, b) => a + (typeof b === 'object' ? b.net : b), 0);
 
-  if (tentativeLiability > walletBalance + positiveRunnerPnL) {
+  const availableFunds = walletBalance + positiveRunnerPnL;
+
+  if (newLiability > availableFunds) {
     return sendError(res,
-      `Insufficient funds. Required: ${tentativeLiability.toFixed(2)}, Available: ${(walletBalance + positiveRunnerPnL).toFixed(2)}`,
+      `Insufficient funds. Required: ${newLiability.toFixed(2)}, Available: ${availableFunds.toFixed(2)}`,
       400);
   }
 
