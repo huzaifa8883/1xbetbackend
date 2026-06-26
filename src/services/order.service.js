@@ -268,41 +268,76 @@ async function settleEventBets(marketId, winningSelectionId, { commissionPct = 0
         continue;
       }
 
-      let totalWinCredit  = 0;
-      let totalLoss       = 0;
-      let totalLiableHeld = 0;
+      let totalWinCredit       = 0;
+      let totalLoss            = 0;
+      let totalLiableHeld      = 0;
+      let totalLiabilityRelease = 0;  // ✅ poori liability jo wallet mein wapis aani chahiye
+      let totalNetPnL           = 0;  // ✅ sirf extra profit/loss, liability ke upar
 
       // ── Calculate each bet result ──────────────────────────
+      // BUG FIX (v6): Pehle "totalWinCredit"/"totalLoss" ko mix kar ke seedha
+      // wallet credit banaya ja raha tha — lekin "LAY on loser" (jab tumhari
+      // LAY jeet jati hai) ke case mein, hold ki gayi liability sirf 'liable'
+      // field se minus ho rahi thi, wallet mein wapis credit nahi ho rahi thi.
+      //
+      // Ab har bet ke liye DO alag cheezen explicitly track karte hain:
+      //   1) liabilityRelease — jo amount match hone par wallet se nikal kar
+      //      'liable' mein hold ki gayi thi, woh HAMESHA wallet mein wapis
+      //      aati hai jab bet settle hoti hai (chahe bet jeeti ho ya haari).
+      //   2) netPnL — sirf EXTRA profit (agar koi mila) ya EXTRA loss
+      //      (jo liability se upar ka loss ho, BACK ke case mein nahi hota
+      //      kyunki BACK ka max loss = liability = stake hi hota hai).
+      //
+      // Final wallet credit (per bet) = liabilityRelease + netPnL
+      //
+      // ┌──────────────┬────────┬──────────────────┬───────────────────────┐
+      // │ Bet Type     │ Result │ liabilityRelease │ netPnL                │
+      // ├──────────────┼────────┼──────────────────┼───────────────────────┤
+      // │ BACK winner  │ Win    │ +stake           │ +(price-1)*stake      │
+      // │ BACK loser   │ Loss   │ +stake           │ -stake  (poora khona) │
+      // │ LAY winner   │ Loss   │ +(price-1)*stake │ -(price-1)*stake      │
+      // │ LAY loser    │ Win    │ +(price-1)*stake │ +stake                │
+      // └──────────────┴────────┴──────────────────┴───────────────────────┘
+      // BACK loser: liabilityRelease (+stake) aur netPnL (-stake) cancel ho
+      // kar net = 0 hote hain (jo sahi hai — poora stake gaya, wallet credit 0).
+      // LAY winner: liabilityRelease (+(price-1)*stake) aur netPnL
+      // (-(price-1)*stake) cancel ho kar net = 0 hote hain (poori liability gayi).
       for (const bet of bets) {
         const price         = Number(bet.price);
         const effectiveSize = Number(bet.matched) > 0 ? Number(bet.matched) : Number(bet.size);
         const isWinner      = String(bet.selection_id) === String(winningSelectionId);
+        const isBack        = bet.side === BET_SIDE.BACK;
 
-        // Liability held for this bet (already locked in wallet earlier)
-        const liableHeld = bet.side === BET_SIDE.BACK
-          ? effectiveSize
-          : (price - 1) * effectiveSize;
+        // Liability held for this bet (already locked out of wallet earlier)
+        const liableHeld = isBack ? effectiveSize : (price - 1) * effectiveSize;
+        totalLiableHeld  += liableHeld;
 
-        totalLiableHeld += liableHeld;
-
+        let netPnL; // sirf extra profit (+) ya extra loss (-), liability ke upar
         if (isWinner) {
-          if (bet.side === BET_SIDE.BACK) {
-            // Back on winner: get back stake + profit
-            totalWinCredit += effectiveSize + (price - 1) * effectiveSize;
+          if (isBack) {
+            // Back on winner: stake wapis + profit
+            netPnL = (price - 1) * effectiveSize;
+            totalWinCredit += liableHeld + netPnL; // record-keeping ke liye (gross display)
           } else {
-            // Lay on winner: pay liability (already held, so just track loss)
-            totalLoss += (price - 1) * effectiveSize;
+            // Lay on winner: poori liability ka loss
+            netPnL = -liableHeld;
+            totalLoss += liableHeld;
           }
         } else {
-          // Runner lost
-          if (bet.side === BET_SIDE.BACK) {
-            // Back on loser: stake lost
-            totalLoss += effectiveSize;
+          if (isBack) {
+            // Back on loser: poora stake gaya
+            netPnL = -liableHeld;
+            totalLoss += liableHeld;
           } else {
-            // Lay on loser: collect the stake as profit
-            totalWinCredit += effectiveSize;
+            // Lay on loser: stake jitna profit
+            netPnL = effectiveSize;
+            totalWinCredit += liableHeld + netPnL; // record-keeping ke liye (gross display)
           }
         }
+
+        // ✅ Asal wallet credit: liability hamesha release hoti hai + net P&L
+        totalLiabilityRelease += liableHeld;
+        totalNetPnL           += netPnL;
       }
 
       // ── Commission on net profit only ──────────────────────
@@ -316,8 +351,13 @@ async function settleEventBets(marketId, winningSelectionId, { commissionPct = 0
       const walletBefore = parseFloat(user.wallet_balance) || 0;
       const liableBefore = parseFloat(user.liable) || 0;
 
-      // Release liable, credit winnings
-      const newWallet = Math.max(0, walletBefore + netCredit);
+      // ✅ BUG FIX: ab liability hamesha poori release hoti hai wallet mein,
+      // aur uske upar sirf net P&L (commission minus) add/subtract hota hai.
+      // Pehle sirf "netCredit" (jo LAY-loser case mein liability include
+      // nahi karta tha) add ho raha tha, jiski wajah se LAY jeetne par bhi
+      // hold ki gayi liability wallet mein wapis nahi aati thi.
+      const netCreditAfterCommission = totalNetPnL - commission;
+      const newWallet = Math.max(0, walletBefore + totalLiabilityRelease + netCreditAfterCommission);
       const newLiable = Math.max(0, liableBefore - totalLiableHeld);
 
       await user.update(
@@ -343,7 +383,12 @@ async function settleEventBets(marketId, winningSelectionId, { commissionPct = 0
       );
 
       // ── Transaction record — Statement mein dikhega ─────────
-      const txnAmount = netCredit - totalLiableHeld;
+      // ✅ BUG FIX: txnAmount ab sirf NET P&L hai (jo asal mein wallet mein
+      // change aaya, liability ki temporary hold ko chhod kar) — pehle yahan
+      // "netCredit - totalLiableHeld" tha jo LAY-jeetne ke case mein galat
+      // negative number deta tha (statement mein loss jaisa dikhता, jabke
+      // asal mein profit hua tha).
+      const txnAmount = parseFloat(netCreditAfterCommission.toFixed(2));
       const matchName = bets[0]?.event_name || `Market ${marketId}`;
       const betSummary = bets.map(b => {
         const isW    = String(b.selection_id) === String(winningSelectionId);
@@ -358,11 +403,17 @@ async function settleEventBets(marketId, winningSelectionId, { commissionPct = 0
       await Transaction.create({
         user_id:      userId,
         type:         TRANSACTION_TYPE.BET_SETTLEMENT,
-        amount:       parseFloat(txnAmount.toFixed(2)),
+        amount:       txnAmount,
         description:  `SETTLED | Match: ${matchName} | WinnerId: ${winningSelectionId} | ${betSummary} | GrossP&L: ${grossProfit >= 0 ? '+' : ''}${grossProfit.toFixed(2)} | Commission: -${commission.toFixed(2)} | NetCredit: ${netCredit.toFixed(2)}`,
         status:       'completed',
         reference_id: String(marketId),
       }, { transaction: t });
+
+      // ── Note: Order.settlement_pnl column abhi confirm nahi hai (migration
+      // risk se bachne ke liye yahan nahi likh rahe) — statement.html apna
+      // fallback calcPnL() formula use karega, jo ab sahi currentWallet ke
+      // sath khud-ba-khud sahi result dega (asal bug wallet calculation mein
+      // tha, woh upar fix ho gaya hai).
 
       // ── Collect details for response + socket ───────────────
       const runnerPnLMap = calculateRunnerPnL(bets.map(b => b.toJSON ? b.toJSON() : b));
