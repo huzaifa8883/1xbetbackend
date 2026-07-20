@@ -425,8 +425,23 @@ async function manualSettle(marketId, winningSelectionId = null) {
 
 /* ═══════════════════════════════════════════════════════════════
    startAutoSettlement
+   IDEMPOTENT: safe to call multiple times (e.g. once from server.js
+   AND once as a safety-net from ordercontroller.js) — agar poller
+   already chal raha hai to dobara interval nahi banayega. Isi wajah
+   se pehle bug tha: agar server.js mein ye call miss/comment ho jaye
+   (deploy ke baad, refactor ke baad, waghera), to poora auto-settle
+   background loop kabhi start hi nahi hota tha — koi error bhi nahi
+   aati thi, bas silently kuch settle nahi hota tha.
 ═══════════════════════════════════════════════════════════════ */
+let _pollingStarted = false;
+
 function startAutoSettlement() {
+  if (_pollingStarted) {
+    logger.debug('[AutoSettle v5] startAutoSettlement() called again — already running, skipping duplicate start');
+    return;
+  }
+  _pollingStarted = true;
+
   logger.info(
     `[AutoSettle v5] Starting — interval=${POLL_INTERVAL/1000}s ` +
     `commission=${COMMISSION_PCT}% catalog2_base=${CATALOG2_BASE}`
