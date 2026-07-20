@@ -207,24 +207,47 @@ async function placeBets(req, res) {
 
 /* ─────────────────────────────────────────────────────────────
    getPendingOrders
+   BUG FIX: pehle sirf EK marketId/matchId accept hota tha, is liye
+   submarkets (Draw No Bet, Half Time, etc.) ke bets kabhi return
+   hi nahi hote the — sirf Match Odds (jiska id frontend "matchId"
+   ke naam se bhejta hai) ke bets aate the. Ab "marketIds" (comma-
+   separated list, saare submarkets included) bhi accept karte hain.
 ────────────────────────────────────────────────────────────── */
 async function getPendingOrders(req, res) {
+  const { Op } = require('sequelize');
   const where = { user_id: req.user.id, status: ORDER_STATUS.PENDING };
-  // Support both ?marketId= and ?matchId=
-  const filterById = req.query.marketId || req.query.matchId;
-  if (filterById) where.market_id = filterById;
+
+  // NEW: multiple market ids — event ke saare markets (main + submarkets)
+  if (req.query.marketIds) {
+    const ids = String(req.query.marketIds).split(',').map(s => s.trim()).filter(Boolean);
+    if (ids.length) where.market_id = { [Op.in]: ids };
+  } else {
+    // Backward-compatible: single ?marketId= or ?matchId=
+    const filterById = req.query.marketId || req.query.matchId;
+    if (filterById) where.market_id = filterById;
+  }
+
   const orders = await Order.findAll({ where, order: [['created_at', 'DESC']] });
   return sendSuccess(res, { orders: orders.map(o => enrichOrderWithPnL(o.toJSON())) });
 }
 
 /* ─────────────────────────────────────────────────────────────
    getMatchedOrders — MATCHED status wali bets (SETTLED nahi)
+   BUG FIX: same "marketIds" support jaisa getPendingOrders mein.
 ────────────────────────────────────────────────────────────── */
 async function getMatchedOrders(req, res) {
+  const { Op } = require('sequelize');
   const where = { user_id: req.user.id, status: ORDER_STATUS.MATCHED };
-  // Support both ?marketId= and ?matchId= for sub-market compatibility
-  const filterById = req.query.marketId || req.query.matchId;
-  if (filterById) where.market_id = filterById;
+
+  if (req.query.marketIds) {
+    const ids = String(req.query.marketIds).split(',').map(s => s.trim()).filter(Boolean);
+    if (ids.length) where.market_id = { [Op.in]: ids };
+  } else {
+    // Backward-compatible: single ?marketId= or ?matchId=
+    const filterById = req.query.marketId || req.query.matchId;
+    if (filterById) where.market_id = filterById;
+  }
+
   const orders = await Order.findAll({ where, order: [['created_at', 'DESC']] });
   const enriched = orders.map(o => enrichOrderWithPnL(o.toJSON()));
   return sendSuccess(res, { orders: enriched });
