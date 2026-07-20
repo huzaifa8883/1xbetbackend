@@ -17,6 +17,25 @@ const { getEventDetails, getRunnerBook } = require('../services/betfair.service'
 const { evaluateMatch } = require('../services/matching.service');
 const logger = require('../utils/logger');
 
+// ── SAFETY-NET: auto-settle background poller ──────────────────
+// Pehle bug: agar server.js/app.js mein `startAutoSettlement()` call
+// missing ho jaye (deploy/refactor ke dauran), to poora background
+// settlement loop kabhi start hi nahi hota tha — koi error/crash bhi
+// nahi aati thi (require lazy hai, sirf function call missing hota
+// tha), is liye pata bhi nahi chalta tha ke settlement ruka hua hai.
+// Ye orders route file HAR boot par zaroor load hoti hai (warna API
+// hi kaam nahi karega), is liye yahan se start karna guaranteed hai.
+// startAutoSettlement() ab idempotent hai (autoSettle.service.js mein
+// guard laga hai) — is liye agar server.js mein bhi call ho raha ho,
+// dobara interval nahi banega, safe hai.
+try {
+  const { startAutoSettlement } = require('../services/autoSettle.service');
+  startAutoSettlement();
+  logger.info('[Orders] Auto-settle poller started from ordercontroller.js (safety-net)');
+} catch (e) {
+  logger.error('[Orders] Failed to start auto-settle poller: ' + e.message);
+}
+
 /* ─────────────────────────────────────────────────────────────
    computeSettlementPnL — settled order ka net P&L calculate karo
    Returns positive = profit, negative = loss
@@ -190,17 +209,10 @@ async function placeBets(req, res) {
    getPendingOrders
 ────────────────────────────────────────────────────────────── */
 async function getPendingOrders(req, res) {
-  const { Op } = require('sequelize');
   const where = { user_id: req.user.id, status: ORDER_STATUS.PENDING };
-  // Support both ?marketId= and ?matchId= — AND a comma-separated list
-  // (?marketId=1.234,1.235,1.236). Match Odds + every sub-market
-  // (Bookmaker/Toss/Fancy/etc.) each has its own distinct marketId, so a
-  // plain exact-string filter silently dropped every sub-market bet.
-  const filterById = req.query.marketId || req.query.matchId || req.query.marketIds;
-  if (filterById) {
-    const ids = String(filterById).split(',').map(s => s.trim()).filter(Boolean);
-    where.market_id = ids.length > 1 ? { [Op.in]: ids } : ids[0];
-  }
+  // Support both ?marketId= and ?matchId=
+  const filterById = req.query.marketId || req.query.matchId;
+  if (filterById) where.market_id = filterById;
   const orders = await Order.findAll({ where, order: [['created_at', 'DESC']] });
   return sendSuccess(res, { orders: orders.map(o => enrichOrderWithPnL(o.toJSON())) });
 }
@@ -209,15 +221,10 @@ async function getPendingOrders(req, res) {
    getMatchedOrders — MATCHED status wali bets (SETTLED nahi)
 ────────────────────────────────────────────────────────────── */
 async function getMatchedOrders(req, res) {
-  const { Op } = require('sequelize');
   const where = { user_id: req.user.id, status: ORDER_STATUS.MATCHED };
-  // Support both ?marketId= and ?matchId= for sub-market compatibility —
-  // and a comma-separated list of IDs (main market + every sub-market).
-  const filterById = req.query.marketId || req.query.matchId || req.query.marketIds;
-  if (filterById) {
-    const ids = String(filterById).split(',').map(s => s.trim()).filter(Boolean);
-    where.market_id = ids.length > 1 ? { [Op.in]: ids } : ids[0];
-  }
+  // Support both ?marketId= and ?matchId= for sub-market compatibility
+  const filterById = req.query.marketId || req.query.matchId;
+  if (filterById) where.market_id = filterById;
   const orders = await Order.findAll({ where, order: [['created_at', 'DESC']] });
   const enriched = orders.map(o => enrichOrderWithPnL(o.toJSON()));
   return sendSuccess(res, { orders: enriched });
