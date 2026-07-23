@@ -307,12 +307,14 @@ async function getSettledOrders(req, res) {
       const raw = o.toJSON();
       return {
         ...enrichOrderWithPnL(raw),
-        marketId:             raw.market_id   || null,
-        selectionId:          raw.selection_id || null,
-        eventName:            raw.event_name  || null,
-        category:             raw.category    || null,
-        settled_at:           raw.settled_at  || null,
-        winning_selection_id: raw.winning_selection_id || null,
+        marketId:             raw.market_id              || null,
+        selectionId:          raw.selection_id           || null,
+        eventName:            raw.event_name             || null,
+        category:             raw.category               || null,
+        settled_at:           raw.settled_at             || null,
+        winning_selection_id: raw.winning_selection_id   || null,
+        winnerRunnerName:     raw.winner_runner_name     || null,
+        marketName:           raw.market_name            || raw.event_name || null,
         settlementPnL: raw.winning_selection_id
           ? computeSettlementPnL(raw)
           : null,
@@ -446,12 +448,16 @@ async function triggerAutoMatch(req, res) {
 ────────────────────────────────────────────────────────────── */
 async function settleMarket(req, res) {
   const { marketId } = req.params;
-  const { winningSelectionId, commissionPct = 0 } = req.body;
+  const { winningSelectionId, commissionPct = 0, winnerRunnerName, marketName } = req.body;
   if (!winningSelectionId)
     return sendError(res, 'winningSelectionId is required', 400);
 
   const pct = Math.max(0, Math.min(100, parseFloat(commissionPct) || 0));
-  const result = await settleEventBets(marketId, winningSelectionId, { commissionPct: pct });
+  const result = await settleEventBets(marketId, winningSelectionId, {
+    commissionPct: pct,
+    winnerRunnerName: winnerRunnerName || null,
+    marketName:       marketName       || null,
+  });
   return sendSuccess(res, result, `Market ${marketId} settled. ${result.settled} users processed.`);
 }
 
