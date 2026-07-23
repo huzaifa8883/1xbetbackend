@@ -199,7 +199,7 @@ function calculateRunnerPnL(marketOrders) {
    Duplicate protection: MATCHED orders hi process honge.
    Ek baar SETTLED ho gaye to dobara settle nahi honge.
 ═══════════════════════════════════════════════════════════════ */
-async function settleEventBets(marketId, winningSelectionId, { commissionPct = 0 } = {}) {
+async function settleEventBets(marketId, winningSelectionId, { commissionPct = 0, winnerRunnerName = null, marketName = null } = {}) {
   // ── Step 1: Check karo — koi MATCHED order hai bhi? ─────────
   const matchedOrders = await Order.findAll({
     where: { market_id: marketId, status: ORDER_STATUS.MATCHED },
@@ -366,12 +366,25 @@ async function settleEventBets(marketId, winningSelectionId, { commissionPct = 0
       );
 
       // ── Mark orders as SETTLED ──────────────────────────────
+      // Winner runner name: agar pass hua hai to save karo
+      // Agar nahi, to winning_selection_id se apne orders mein dhundho
+      let resolvedWinnerName = winnerRunnerName || null;
+      if (!resolvedWinnerName) {
+        const winnerOrder = bets.find(b => String(b.selection_id) === String(winningSelectionId));
+        resolvedWinnerName = winnerOrder?.runner_name || null;
+      }
+
+      const updateFields = {
+        status:               ORDER_STATUS.SETTLED,
+        settled_at:           nowDate,
+        winning_selection_id: String(winningSelectionId),
+      };
+      // Sirf set karo agar value hai — taake existing data overwrite na ho
+      if (resolvedWinnerName) updateFields.winner_runner_name = resolvedWinnerName;
+      if (marketName)         updateFields.market_name        = marketName;
+
       await Order.update(
-        {
-          status:               ORDER_STATUS.SETTLED,
-          settled_at:           nowDate,
-          winning_selection_id: String(winningSelectionId),
-        },
+        updateFields,
         {
           where: {
             user_id:   userId,
