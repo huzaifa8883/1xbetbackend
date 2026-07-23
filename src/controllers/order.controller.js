@@ -323,6 +323,52 @@ async function getSettledOrders(req, res) {
 }
 
 /* ─────────────────────────────────────────────────────────────
+   getProfitLossSummary — Profit/Loss page ke liye: date range ke
+   andar SETTLED orders ko category (sport) ke hisab se group karke
+   har category ka total P&L + grand total return karta hai.
+   ⚠️ NOTE: ye sirf Order table (exchange/sports bets) cover karta
+   hai. Agar "BetFairGames"/"TeenPatti Studio" jaisi casino entries
+   kisi ALAG casino service/DB mein store hoti hain (jaisa profitloss.html
+   mein defined casinoUrl se lagta hai), wo yahan shamil nahi hongi —
+   unke liye us casino service ka apna profit-loss endpoint chahiye.
+────────────────────────────────────────────────────────────── */
+async function getProfitLossSummary(req, res) {
+  const { from, to } = req.query;
+  const { Op } = require('sequelize');
+  const where = { user_id: req.user.id, status: ORDER_STATUS.SETTLED };
+
+  // ✅ Date range filter — SEEDHA database query mein (statement.html
+  // wale bug se seekha: client-side filter + fixed limit milake purani
+  // date range wale orders chhoot jaate the — yahan aisa nahi hoga
+  // kyunki hum filter DB level pe laga rahe hain, koi row-limit nahi).
+  if (from && to) {
+    where.settled_at = { [Op.between]: [new Date(from), new Date(to)] };
+  }
+
+  const rows = await Order.findAll({ where });
+
+  const totals = {};
+  let grandTotal = 0;
+
+  rows.forEach(o => {
+    const raw = o.toJSON();
+    const pnl = raw.winning_selection_id ? computeSettlementPnL(raw) : 0;
+    const cat = raw.category || 'Other';
+    totals[cat] = (totals[cat] || 0) + pnl;
+    grandTotal  += pnl;
+  });
+
+  const categories = Object.keys(totals)
+    .map(name => ({ name, amount: parseFloat(totals[name].toFixed(2)) }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  return sendSuccess(res, {
+    categories,
+    total: parseFloat(grandTotal.toFixed(2)),
+  });
+}
+
+/* ─────────────────────────────────────────────────────────────
    cancelOrder
 ────────────────────────────────────────────────────────────── */
 async function cancelOrder(req, res) {
@@ -510,6 +556,7 @@ module.exports = {
   getMatchedOrders,
   getAllOrders,
   getSettledOrders,
+  getProfitLossSummary,
   cancelOrder,
   cancelAllPendingOrders,
   triggerAutoMatch,
