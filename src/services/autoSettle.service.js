@@ -118,10 +118,12 @@ async function detectWinnerFromCatalog2(marketId) {
       r.won === true
     );
     if (byStatus) {
-      const winSel = String(byStatus.selectionId || byStatus.selection_id || byStatus.id || '');
+      const winSel      = String(byStatus.selectionId || byStatus.selection_id || byStatus.id || '');
+      const runnerName  = byStatus.runnerName || byStatus.name || null;
+      const marketName  = catalog.marketName || catalog.market_name || catalog.name || null;
       if (winSel) {
-        logger.info(`[AutoSettle v5] ✅ Catalog2 winner (status): market=${marketId} sel=${winSel} runner="${byStatus.runnerName || byStatus.name}"`);
-        return winSel;
+        logger.info(`[AutoSettle v5] ✅ Catalog2 winner (status): market=${marketId} sel=${winSel} runner="${runnerName}"`);
+        return { selectionId: winSel, runnerName, marketName };
       }
     }
 
@@ -148,12 +150,15 @@ async function detectWinnerFromCatalog2(marketId) {
         const bookStatus = (book.marketStatus || book.status || '').toUpperCase();
         if (bookStatus === 'CLOSED') {
           // id field (prices9) ya selectionId (standard)
+          const marketNameFromBook = book.marketName || book.market_name || catalog.marketName || catalog.market_name || catalog.name || null;
+
           const winner = (book.runners || []).find(r => (r.status || '').toUpperCase() === 'WINNER');
           if (winner) {
             const winSel = String(winner.id || winner.selectionId || '');
             if (winSel) {
-              logger.info(`[AutoSettle v5] ✅ prices9 Data API winner: market=${marketId} sel=${winSel}`);
-              return winSel;
+              const runnerName = winner.runnerName || winner.name || null;
+              logger.info(`[AutoSettle v5] ✅ prices9 Data API winner: market=${marketId} sel=${winSel} runner="${runnerName}"`);
+              return { selectionId: winSel, runnerName, marketName: marketNameFromBook };
             }
           }
 
@@ -165,8 +170,9 @@ async function detectWinnerFromCatalog2(marketId) {
           if (byLPT) {
             const winSel = String(byLPT.id || byLPT.selectionId || '');
             if (winSel) {
-              logger.info(`[AutoSettle v5] ✅ prices9 Data API winner (LPT): market=${marketId} sel=${winSel}`);
-              return winSel;
+              const runnerName = byLPT.runnerName || byLPT.name || null;
+              logger.info(`[AutoSettle v5] ✅ prices9 Data API winner (LPT): market=${marketId} sel=${winSel} runner="${runnerName}"`);
+              return { selectionId: winSel, runnerName, marketName: marketNameFromBook };
             }
           }
         }
@@ -181,10 +187,12 @@ async function detectWinnerFromCatalog2(marketId) {
         r.sortPriority === 1 || r.position === 1 || r.finishingPosition === 1
       );
       if (bySort) {
-        const winSel = String(bySort.selectionId || bySort.selection_id || bySort.id || '');
+        const winSel     = String(bySort.selectionId || bySort.selection_id || bySort.id || '');
+        const runnerName = bySort.runnerName || bySort.name || null;
+        const marketName = catalog.marketName || catalog.market_name || catalog.name || null;
         if (winSel) {
-          logger.info(`[AutoSettle v5] ✅ Catalog2 winner (sortPriority): market=${marketId} sel=${winSel}`);
-          return winSel;
+          logger.info(`[AutoSettle v5] ✅ Catalog2 winner (sortPriority): market=${marketId} sel=${winSel} runner="${runnerName}"`);
+          return { selectionId: winSel, runnerName, marketName };
         }
       }
     }
@@ -205,18 +213,36 @@ function detectWinnerFromBook(book) {
   if (!book) return null;
   if ((book.status || '').toUpperCase() !== 'CLOSED') return null;
 
-  const runners = book.runners || [];
+  const runners    = book.runners || [];
+  const marketName = book.marketName || book.market_name || null;
 
   // status === 'WINNER'
   const byStatus = runners.find(r => (r.status || '').toUpperCase() === 'WINNER');
-  if (byStatus) return String(byStatus.selectionId);
+  if (byStatus) {
+    return {
+      selectionId: String(byStatus.selectionId),
+      // NOTE: Betfair listMarketBook usually does NOT include runner names
+      // (only listMarketCatalogue does) — so this will often be null.
+      // marketName/winnerRunnerName fall back to Catalog2/prices9 data
+      // already captured earlier in processOneMarket, or stay null and
+      // settleEventBets() will fall back to an Order's own runner_name.
+      runnerName: byStatus.runnerName || byStatus.name || null,
+      marketName,
+    };
+  }
 
   // lastPriceTraded ≤ 1.01
   const byPrice = runners.find(r => {
     const lpt = parseFloat(r.lastPriceTraded || 0);
     return lpt > 0 && lpt <= 1.01;
   });
-  if (byPrice) return String(byPrice.selectionId);
+  if (byPrice) {
+    return {
+      selectionId: String(byPrice.selectionId),
+      runnerName:  byPrice.runnerName || byPrice.name || null,
+      marketName,
+    };
+  }
 
   return null;
 }
@@ -232,7 +258,9 @@ async function detectWinnerFromPnL(marketId) {
     const winner = (market.profitAndLosses || []).find(p => Number(p.ifWin) > 0);
     if (!winner) return null;
     logger.info(`[AutoSettle v5] Winner via PnL: market=${marketId} sel=${winner.selectionId}`);
-    return String(winner.selectionId);
+    // Betfair PnL endpoint has no runner/market names — settleEventBets()
+    // will fall back to an Order's own runner_name if one exists.
+    return { selectionId: String(winner.selectionId), runnerName: null, marketName: null };
   } catch (e) {
     if (TMR_RE.test(e.message)) logger.warn(`[AutoSettle v5] PnL rate-limited [${marketId}]`);
     else logger.warn(`[AutoSettle v5] PnL failed [${marketId}]: ${e.message}`);
@@ -243,8 +271,13 @@ async function detectWinnerFromPnL(marketId) {
 /* ═══════════════════════════════════════════════════════════════
    doSettle — duplicate-safe settlement trigger
 ═══════════════════════════════════════════════════════════════ */
-async function doSettle(marketId, winSel) {
+async function doSettle(marketId, winInfo) {
   if (_settled.has(marketId)) return; // in-memory cache hit
+
+  // Backward-compat: allow a plain selectionId string too
+  const winSel      = typeof winInfo === 'string' ? winInfo : winInfo?.selectionId;
+  const runnerName  = typeof winInfo === 'string' ? null    : winInfo?.runnerName || null;
+  const marketName  = typeof winInfo === 'string' ? null    : winInfo?.marketName || null;
 
   // DB-level check: koi order already SETTLED hai to skip
   const alreadySettled = await Order.count({
@@ -258,8 +291,16 @@ async function doSettle(marketId, winSel) {
 
   _settled.add(marketId); // optimistic lock
   try {
-    const result = await settleEventBets(marketId, winSel, { commissionPct: COMMISSION_PCT });
-    logger.info(`[AutoSettle v5] ✅ Settled market=${marketId} winner=${winSel} users=${result.settled}`);
+    // ✅ BUG FIX: pehle winnerRunnerName/marketName pass hi nahi hote the —
+    // Catalog2/prices9 se mile huye naam yahan tak aate aate discard ho jaate
+    // the, is liye Order.winner_runner_name / market_name hamesha null rehte
+    // the (Result page pe winner blank + Market Name == Match Name bug).
+    const result = await settleEventBets(marketId, winSel, {
+      commissionPct: COMMISSION_PCT,
+      winnerRunnerName: runnerName,
+      marketName,
+    });
+    logger.info(`[AutoSettle v5] ✅ Settled market=${marketId} winner=${winSel} runner="${runnerName}" users=${result.settled}`);
     return result;
   } catch (err) {
     _settled.delete(marketId); // rollback on error so retry happens next poll
