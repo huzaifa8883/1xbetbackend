@@ -513,6 +513,55 @@ async function getOrdersByEvent(req, res) {
 }
 
 /* ─────────────────────────────────────────────────────────────
+   getMarketWinnerInfo — Result page ke liye.
+   ✅ BUG FIX: Result page pe "kon jeeta" column zyada tar blank aa raha
+   tha kyunke winner ka naam sirf CURRENT USER ke apne orders se dhoonda
+   ja raha tha — agar is user ne khud winning selection par bet hi nahi
+   lagayi (jo ke aksar hota hai, kyunke koi bhi ek market ke sirf ek hi
+   side par bet lagata hai), to winner ka naam kabhi milta hi nahi tha.
+   Ab ye endpoint POORI market (kisi bhi user) ke settled orders check
+   karta hai — agar system mein KISI BHI user ne winning selection par
+   bet lagayi ho, uska runner_name mil jayega. Runner/event name public
+   info hai (kisi individual ka private data nahi), is liye cross-user
+   query safe hai.
+────────────────────────────────────────────────────────────── */
+async function getMarketWinnerInfo(req, res) {
+  const { marketId } = req.params;
+  if (!marketId) return sendError(res, 'marketId is required', 400);
+
+  // Market ka koi bhi settled order — event_name / winning_selection_id lene ke liye
+  const anyOrder = await Order.findOne({
+    where: { market_id: marketId, status: ORDER_STATUS.SETTLED },
+    order: [['settled_at', 'DESC']],
+  });
+
+  if (!anyOrder) {
+    return sendSuccess(res, {
+      marketId, eventName: null, winnerSelectionId: null, winnerName: null,
+    });
+  }
+
+  const winningSelectionId = anyOrder.winning_selection_id;
+  let winnerName = null;
+
+  if (winningSelectionId) {
+    // Kisi bhi user ka order jo winning selection par tha — usi se runner_name lo
+    const winnerOrder = await Order.findOne({
+      where: { market_id: marketId, selection_id: winningSelectionId },
+      order: [['created_at', 'DESC']],
+    });
+    if (winnerOrder) winnerName = winnerOrder.runner_name || null;
+  }
+
+  return sendSuccess(res, {
+    marketId,
+    eventName:         anyOrder.event_name || null,
+    winnerSelectionId: winningSelectionId || null,
+    winnerName,
+  });
+}
+
+/* ─────────────────────────────────────────────────────────────
    HELPERS
 ────────────────────────────────────────────────────────────── */
 function enrichOrderWithPnL(order) {
@@ -564,5 +613,6 @@ module.exports = {
   voidMarket,
   getMarketRunnerPnL,
   getOrdersByEvent,
+  getMarketWinnerInfo,
   autoSettleMarket,
 };
