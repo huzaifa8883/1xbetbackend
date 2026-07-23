@@ -9,6 +9,7 @@ const {
   getMatchedOrders,
   getAllOrders,
   getSettledOrders,
+  getProfitLossSummary,
   cancelOrder,
   cancelAllPendingOrders,
   triggerAutoMatch,
@@ -26,6 +27,8 @@ router.get('/matched',                        authenticate(), getMatchedOrders);
 router.get('/all',                            authenticate(), getAllOrders);
 // ✅ NEW: Settled bets — statement/ledger page ke liye
 router.get('/settled',                        authenticate(), getSettledOrders);
+// ✅ NEW: Profit/Loss page ke liye — date range + sport-category ke hisab se grouped totals
+router.get('/profitloss-summary',             authenticate(), getProfitLossSummary);
 router.get('/event',                          authenticate(), getOrdersByEvent);
 router.post('/cancel-all',                    authenticate(), cancelAllPendingOrders);
 router.post('/:requestId/cancel',             authenticate(), cancelOrder);
