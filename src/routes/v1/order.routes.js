@@ -17,6 +17,7 @@ const {
   voidMarket,
   getMarketRunnerPnL,
   getOrdersByEvent,
+  getMarketWinnerInfo,
   autoSettleMarket,
 } = require('../../controllers/order.controller');
 
@@ -30,6 +31,9 @@ router.get('/settled',                        authenticate(), getSettledOrders);
 // ✅ NEW: Profit/Loss page ke liye — date range + sport-category ke hisab se grouped totals
 router.get('/profitloss-summary',             authenticate(), getProfitLossSummary);
 router.get('/event',                          authenticate(), getOrdersByEvent);
+// ✅ NEW: Result page ke liye — kisi bhi user ke orders se market ka
+// winner runner_name + event_name nikalta hai (current user tak simit nahi)
+router.get('/market-winner/:marketId',        authenticate(), getMarketWinnerInfo);
 router.post('/cancel-all',                    authenticate(), cancelAllPendingOrders);
 router.post('/:requestId/cancel',             authenticate(), cancelOrder);
 
