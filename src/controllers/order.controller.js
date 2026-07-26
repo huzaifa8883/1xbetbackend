@@ -263,7 +263,11 @@ async function getAllOrders(req, res) {
   const where = { user_id: req.user.id };
 
   if (status) {
-    where.status = status;
+    // ✅ Comma-separated multiple statuses bhi support karo (e.g. "VOID,VOIDED")
+    // — bethistory.html ke "Voided"/"Cancelled" filter ke liye, jahan exact
+    // enum value ki certainty nahi thi.
+    const statusList = String(status).split(',').map(s => s.trim()).filter(Boolean);
+    where.status = statusList.length > 1 ? { [Op.in]: statusList } : statusList[0];
   } else {
     // Default: sirf active bets (PENDING + MATCHED), SETTLED excluded
     where.status = { [Op.in]: [ORDER_STATUS.PENDING, ORDER_STATUS.MATCHED] };
