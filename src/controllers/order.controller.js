@@ -618,8 +618,8 @@ async function autoSettleMarket(req, res) {
 ────────────────────────────────────────────────────────────── */
 async function getStuckMarketsList(req, res) {
   try {
-    const { getStuckMarkets } = require('../services/autoSettle.service');
-    const stuck = getStuckMarkets();
+    const { getStuckMarketsDetailed } = require('../services/autoSettle.service');
+    const stuck = await getStuckMarketsDetailed();
     return sendSuccess(res, { stuck, count: stuck.length });
   } catch (err) {
     logger.error(`getStuckMarketsList error: ${err.message}`);
