@@ -19,6 +19,7 @@ const {
   getOrdersByEvent,
   getMarketWinnerInfo,
   autoSettleMarket,
+  getStuckMarketsList,
 } = require('../../controllers/order.controller');
 
 // ── User routes ────────────────────────────────────────────
@@ -46,5 +47,8 @@ router.post('/settle/:marketId',              authenticate(), settleMarket);
 router.post('/void/:marketId',                authenticate(), voidMarket);
 // ── Auto-settle: betfair se winner detect kar ke settle karo ──
 router.post('/auto-settle/:marketId',         authenticate(), autoSettleMarket);
+// ✅ NEW: admin ke liye — jo markets kaafi der se auto-settle nahi ho paa
+// rahe unki list (taake manually check/settle kiya ja sake)
+router.get('/stuck-markets',                  authenticate(), getStuckMarketsList);
 
 module.exports = router;
