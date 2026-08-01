@@ -609,6 +609,24 @@ async function autoSettleMarket(req, res) {
   }
 }
 
+/* ─────────────────────────────────────────────────────────────
+   getStuckMarketsList — admin ke liye: jo markets kaafi der se
+   auto-settle nahi ho paa rahe (koi bhi layer winner nahi dhoondh
+   saki) unki list, taake manually check/settle kiya ja sake.
+   Ye pehle poori tarah invisible tha — sirf debug logs mein chhupa
+   rehta tha jo koi dekhta hi nahi tha.
+────────────────────────────────────────────────────────────── */
+async function getStuckMarketsList(req, res) {
+  try {
+    const { getStuckMarkets } = require('../services/autoSettle.service');
+    const stuck = getStuckMarkets();
+    return sendSuccess(res, { stuck, count: stuck.length });
+  } catch (err) {
+    logger.error(`getStuckMarketsList error: ${err.message}`);
+    return sendError(res, `Failed to get stuck markets: ${err.message}`, 500);
+  }
+}
+
 module.exports = {
   placeBets,
   getPendingOrders,
@@ -625,4 +643,5 @@ module.exports = {
   getOrdersByEvent,
   getMarketWinnerInfo,
   autoSettleMarket,
+  getStuckMarketsList,
 };
