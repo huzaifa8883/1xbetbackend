@@ -78,7 +78,14 @@ const _betfairGone = new Set();   // DSC-0018 markets — skip Betfair book
 // warning dete hain + admin endpoint se list dekhi ja sakti hai.
 const _failCount        = new Map();  // marketId → consecutive fail count
 const _firstSeenFailing = new Map();  // marketId → jab pehli baar fail hua
-const STUCK_THRESHOLD    = parseInt(process.env.AUTO_SETTLE_STUCK_THRESHOLD || '20', 10); // ~5 min @ 15s interval
+// ⚠️ FIX: pehle 20 poll cycles (~5 min) baad alert aati thi — lekin
+// Greyhound/Horse Race ka data Betfair se "minutes" mein gayab ho jaata
+// hai (isi file ke header mein documented). 5 min tak wait karna matlab
+// alert aane tak data zyadatar cases mein already gone ho chuka hota
+// tha. Ab sirf 8 cycles (~2 min) mein alert aayegi — jitni jaldi pata
+// chalega, utna zyada chance hai ke result kahin aur se (racing result
+// site) manually daal ke market settle karne ka waqt mil jaye.
+const STUCK_THRESHOLD    = parseInt(process.env.AUTO_SETTLE_STUCK_THRESHOLD || '8', 10); // ~2 min @ 15s interval
 
 /* ═══════════════════════════════════════════════════════════════
    rebuildSettledCache — startup mein already-settled markets load
@@ -391,12 +398,20 @@ async function processOneMarket(marketId) {
 
       if (fails === STUCK_THRESHOLD) {
         const stuckMins = Math.round((Date.now() - _firstSeenFailing.get(marketId)) / 60000);
+        // Event ka naam bhi nikal lo (koi bhi order se) — taake admin ko
+        // seedha pata chale kaunsa match/race hai, alag se dhoondhna na pare
+        let eventName = marketId;
+        try {
+          const sample = await Order.findOne({ where: { market_id: marketId }, attributes: ['event_name', 'category'] });
+          if (sample) eventName = `${sample.event_name || marketId} [${sample.category || '?'}]`;
+        } catch (e) { /* ignore — sirf display ke liye hai */ }
+
         logger.warn(
-          `[AutoSettle v5] ⚠️ STUCK MARKET: ${marketId} — ${fails} consecutive poll(s) ` +
+          `[AutoSettle v5] ⚠️ STUCK MARKET: ${marketId} (${eventName}) — ${fails} consecutive poll(s) ` +
           `(~${stuckMins} min) mein koi bhi layer (Catalog2/Betfair-book/Betfair-PnL) winner nahi ` +
-          `dhoondh saki. Manually check karo — ho sakta hai ye ek custom/non-Betfair submarket ` +
-          `(Fancy/Bookmaker/Toss) ho jiska Catalog2 status kabhi CLOSED nahi hota, ya market ` +
-          `abhi bhi sahi mein open hai. Manual settle ke liye: manualSettle('${marketId}', <winningSelectionId>)`
+          `dhoondh saki. ACTION CHAHIYE: is match/race ka result kahin aur se (racing/scoring site) ` +
+          `pata karo aur manually settle karo, warna Betfair se data permanently gayab ho sakta hai: ` +
+          `POST /orders/settle/${marketId} { "winningSelectionId": "<selectionId>" }`
         );
       } else {
         logger.debug(`[AutoSettle v5] market=${marketId}: winner not determinable yet (fail #${fails}) — will retry next poll`);
@@ -546,4 +561,24 @@ function getStuckMarkets() {
   return result;
 }
 
-module.exports = { startAutoSettlement, pollAndSettle, manualSettle, getStuckMarkets };
+// ✅ NEW: async version — event_name/category bhi saath deti hai
+// (admin ke liye zyada useful, seedha pata chal jata hai kaunsa match hai)
+async function getStuckMarketsDetailed() {
+  const list = getStuckMarkets();
+  for (const item of list) {
+    try {
+      const sample = await Order.findOne({
+        where: { market_id: item.marketId },
+        attributes: ['event_name', 'category'],
+      });
+      item.eventName = sample?.event_name || null;
+      item.category  = sample?.category  || null;
+    } catch (e) {
+      item.eventName = null;
+      item.category  = null;
+    }
+  }
+  return list;
+}
+
+module.exports = { startAutoSettlement, pollAndSettle, manualSettle, getStuckMarkets, getStuckMarketsDetailed };
