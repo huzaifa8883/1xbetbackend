@@ -70,6 +70,16 @@ const _settled     = new Set();   // fully settled markets
 const _inProgress  = new Set();   // currently settling (race guard)
 const _betfairGone = new Set();   // DSC-0018 markets — skip Betfair book
 
+// ✅ NEW: stuck-market visibility — pehle agar teeno layers har poll pe
+// fail hoti thi to sirf logger.debug hota tha (jo practically kabhi nahi
+// dikhta), koi warning ya alert nahi — is liye "kuch bets settle nahi
+// hotay" wale cases silently forever chhupe rehte the. Ab har market ke
+// consecutive-fail count track karte hain aur ek threshold ke baad LOUD
+// warning dete hain + admin endpoint se list dekhi ja sakti hai.
+const _failCount        = new Map();  // marketId → consecutive fail count
+const _firstSeenFailing = new Map();  // marketId → jab pehli baar fail hua
+const STUCK_THRESHOLD    = parseInt(process.env.AUTO_SETTLE_STUCK_THRESHOLD || '20', 10); // ~5 min @ 15s interval
+
 /* ═══════════════════════════════════════════════════════════════
    rebuildSettledCache — startup mein already-settled markets load
 ═══════════════════════════════════════════════════════════════ */
@@ -290,6 +300,8 @@ async function doSettle(marketId, winInfo) {
   }
 
   _settled.add(marketId); // optimistic lock
+  _failCount.delete(marketId);          // ✅ settle ho gaya — fail-tracking clear
+  _firstSeenFailing.delete(marketId);
   try {
     // ✅ BUG FIX: pehle winnerRunnerName/marketName pass hi nahi hote the —
     // Catalog2/prices9 se mile huye naam yahan tak aate aate discard ho jaate
@@ -370,7 +382,25 @@ async function processOneMarket(marketId) {
       await doSettle(marketId, winSel);
       if (_betfairGone.has(marketId)) _betfairGone.delete(marketId);
     } else {
-      logger.debug(`[AutoSettle v5] market=${marketId}: winner not determinable yet — will retry next poll`);
+      // ✅ NEW: teeno layers fail ho gayi is poll cycle mein — count badhao
+      // aur agar bohot der se stuck hai to LOUD warning do (pehle ye sirf
+      // debug log tha jo kabhi kisi ko nazar nahi aata tha).
+      const fails = (_failCount.get(marketId) || 0) + 1;
+      _failCount.set(marketId, fails);
+      if (!_firstSeenFailing.has(marketId)) _firstSeenFailing.set(marketId, Date.now());
+
+      if (fails === STUCK_THRESHOLD) {
+        const stuckMins = Math.round((Date.now() - _firstSeenFailing.get(marketId)) / 60000);
+        logger.warn(
+          `[AutoSettle v5] ⚠️ STUCK MARKET: ${marketId} — ${fails} consecutive poll(s) ` +
+          `(~${stuckMins} min) mein koi bhi layer (Catalog2/Betfair-book/Betfair-PnL) winner nahi ` +
+          `dhoondh saki. Manually check karo — ho sakta hai ye ek custom/non-Betfair submarket ` +
+          `(Fancy/Bookmaker/Toss) ho jiska Catalog2 status kabhi CLOSED nahi hota, ya market ` +
+          `abhi bhi sahi mein open hai. Manual settle ke liye: manualSettle('${marketId}', <winningSelectionId>)`
+        );
+      } else {
+        logger.debug(`[AutoSettle v5] market=${marketId}: winner not determinable yet (fail #${fails}) — will retry next poll`);
+      }
     }
 
   } finally {
@@ -494,4 +524,26 @@ function startAutoSettlement() {
   });
 }
 
-module.exports = { startAutoSettlement, pollAndSettle, manualSettle };
+/* ═══════════════════════════════════════════════════════════════
+   getStuckMarkets — admin endpoint ke liye: jo markets STUCK_THRESHOLD
+   se zyada dafa fail ho chuke hain unki list (marketId + kitni der se
+   + kitni baar fail hua), taake admin manually check/settle kar sake.
+═══════════════════════════════════════════════════════════════ */
+function getStuckMarkets() {
+  const result = [];
+  for (const [marketId, fails] of _failCount.entries()) {
+    if (fails >= STUCK_THRESHOLD) {
+      result.push({
+        marketId,
+        failCount:      fails,
+        stuckSinceMs:   _firstSeenFailing.get(marketId) || null,
+        stuckSinceMins: _firstSeenFailing.has(marketId)
+          ? Math.round((Date.now() - _firstSeenFailing.get(marketId)) / 60000)
+          : null,
+      });
+    }
+  }
+  return result;
+}
+
+module.exports = { startAutoSettlement, pollAndSettle, manualSettle, getStuckMarkets };
