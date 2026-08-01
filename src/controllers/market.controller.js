@@ -116,7 +116,26 @@ async function fetchSportMarkets(sportKey, eventTypeId, overrides = {}) {
   const hoursAhead    = cfg?.hours_ahead  ?? overrides.hoursAhead  ?? 24;
 
   const now = new Date();
-  const from = new Date(now.getTime() - 30 * 60_000).toISOString();  // 30 min pehle (inplay races cover karne ke liye)
+
+  // ✅ BUG FIX: pehle SAARE sports ke liye "sirf pichle 30 minute mein
+  // shuru hui matches" wala hardcoded filter tha. Horse/Greyhound races
+  // ke liye theek hai (2 minute mein khatam ho jaate hain), lekin
+  // Football (90+ min), Cricket (ghanton/dinon), Tennis (5-set matches
+  // ghanton chal sakte hain) — in sab ke liye match 30 minute ke baad
+  // bhi abhi LIVE/in-play hota hai, lekin marketStartTime filter ki
+  // wajah se Betfair listEvents() ki response se hi bahar reh jaata tha
+  // — is liye match dashboard se "gayab" ho jaata tha jabke wo abhi
+  // band (closed) bhi nahi hua hota tha. Ab sport ke hisab se alag
+  // lookback window use ho raha hai.
+  const LOOKBACK_MINUTES = {
+    horse:     30,   // races ~2 min mein khatam — tight window sahi hai
+    greyhound: 30,
+    football: 180,   // 90 min game + extra-time + stoppage ka buffer
+    cricket:  720,   // T20/ODI cover karne ke liye generous buffer
+    tennis:   360,   // lambe 5-set matches cover karne ke liye
+  };
+  const lookbackMin = LOOKBACK_MINUTES[sportKey] ?? 30;
+  const from = new Date(now.getTime() - lookbackMin * 60_000).toISOString();
   const to   = new Date(now.getTime() + hoursAhead * 3600_000).toISOString();
 
   // Build event filter
