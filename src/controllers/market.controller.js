@@ -288,10 +288,28 @@ async function getLiveHorse(req, res) {
       eventTypeIds: ['7'],
       marketStartTime: { from, to },
     };
-    if (cfg?.allowed_countries)       eventFilter.marketCountries = cfg.allowed_countries.split(',').map(s => s.trim());
-    if (cfg?.allowed_competition_ids) eventFilter.competitionIds  = cfg.allowed_competition_ids.split(',').map(s => s.trim());
+    if (cfg?.allowed_countries) eventFilter.marketCountries = cfg.allowed_countries.split(',').map(s => s.trim());
+    // ⚠️ allowed_competition_ids field mein TRACK NAAM hote hain (jaise
+    // "Ballarat"), Betfair competition ID nahi — races ki koi "competition"
+    // hoti hi nahi. Isliye ye seedha Betfair filter mein NAHI jaata; niche
+    // events fetch hone ke baad naam se match karke filter hota hai.
 
-    const events = await listEvents(eventFilter);
+    let events = await listEvents(eventFilter);
+    if (!events.length) return sendSuccess(res, []);
+
+    // ✅ FIX: track-naam se filter karo (getBetfairTracks jaisi hi derivation)
+    if (cfg?.allowed_competition_ids) {
+      const allowedTracks = new Set(
+        cfg.allowed_competition_ids.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+      );
+      if (allowedTracks.size > 0) {
+        events = events.filter(e => {
+          const rawName   = e.event?.name || '';
+          const trackName = (rawName.split('(')[0] || rawName).trim().toLowerCase();
+          return allowedTracks.has(trackName);
+        });
+      }
+    }
     if (!events.length) return sendSuccess(res, []);
 
     const catalogues = await listMarketCatalogue(
@@ -376,10 +394,28 @@ async function getLiveGreyhound(req, res) {
       eventTypeIds: ['4339'],
       marketStartTime: { from, to },
     };
-    if (cfg?.allowed_countries)       eventFilter.marketCountries = cfg.allowed_countries.split(',').map(s => s.trim());
-    if (cfg?.allowed_competition_ids) eventFilter.competitionIds  = cfg.allowed_competition_ids.split(',').map(s => s.trim());
+    if (cfg?.allowed_countries) eventFilter.marketCountries = cfg.allowed_countries.split(',').map(s => s.trim());
+    // ⚠️ allowed_competition_ids field mein TRACK NAAM hote hain, Betfair
+    // competition ID nahi — races ki koi "competition" hoti hi nahi.
+    // Isliye ye seedha Betfair filter mein NAHI jaata; niche events fetch
+    // hone ke baad naam se match karke filter hota hai.
 
-    const events = await listEvents(eventFilter);
+    let events = await listEvents(eventFilter);
+    if (!events.length) return sendSuccess(res, []);
+
+    // ✅ FIX: track-naam se filter karo (getBetfairTracks jaisi hi derivation)
+    if (cfg?.allowed_competition_ids) {
+      const allowedTracks = new Set(
+        cfg.allowed_competition_ids.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+      );
+      if (allowedTracks.size > 0) {
+        events = events.filter(e => {
+          const rawName   = e.event?.name || '';
+          const trackName = (rawName.split('(')[0] || rawName).trim().toLowerCase();
+          return allowedTracks.has(trackName);
+        });
+      }
+    }
     if (!events.length) return sendSuccess(res, []);
 
     const catalogues = await listMarketCatalogue(
@@ -768,6 +804,68 @@ async function getBetfairCompetitions(req, res) {
   }
 }
 
+/**
+ * GET /api/v1/markets/betfair/active-leagues?eventTypeId=<id>&hoursAhead=48
+ * Sirf wahi leagues (competitions) return karta hai jinke andar kam se kam
+ * ek match "abhi" ya agle N ghanton (default 48 = 2 din) mein ho raha hai —
+ * saari 100+ leagues ka flat dump nahi (jinme se zyadatar off-season hoti hain).
+ * Har league ke saath uske matches (eventId, name, startTime) bhi diye jate
+ * hain taake admin panel drill-down UI bana sake (league → matches → markets).
+ */
+async function getBetfairActiveLeagues(req, res) {
+  const { eventTypeId, hoursAhead } = req.query;
+  if (!eventTypeId) return sendError(res, 'eventTypeId query parameter is required', 400);
+
+  try {
+    const hrs  = parseInt(hoursAhead, 10) || 48;
+    const now  = new Date();
+    const from = new Date(now.getTime() - 30 * 60_000).toISOString(); // 30 min grace (abhi live matches)
+    const to   = new Date(now.getTime() + hrs * 3600_000).toISOString();
+
+    const events = await listEvents({
+      eventTypeIds: [String(eventTypeId)],
+      marketStartTime: { from, to },
+    });
+
+    if (!events.length) return sendSuccess(res, { leagues: [] });
+
+    // Competition info sirf listMarketCatalogue se milti hai (listEvents
+    // mein nahi hoti), is liye MATCH_ODDS market catalogue nikalte hain
+    const eventIds = events.map(e => e.event.id);
+    const catalogues = await listMarketCatalogue(
+      { eventIds, marketTypeCodes: ['MATCH_ODDS'] },
+      '400',
+      ['EVENT', 'COMPETITION']
+    );
+
+    const leagueMap = {}; // competitionId -> { id, name, matches: [...] }
+    catalogues.forEach(m => {
+      const comp = m.competition;
+      const ev   = m.event;
+      if (!comp || !ev) return;
+      if (!leagueMap[comp.id]) leagueMap[comp.id] = { id: String(comp.id), name: comp.name, matches: [] };
+      if (!leagueMap[comp.id].matches.some(x => x.eventId === ev.id)) {
+        leagueMap[comp.id].matches.push({
+          eventId:   ev.id,
+          marketId:  m.marketId,
+          name:      ev.name,
+          startTime: ev.openDate,
+        });
+      }
+    });
+
+    const leagues = Object.values(leagueMap).map(l => {
+      l.matches.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+      return l;
+    }).sort((a, b) => a.name.localeCompare(b.name));
+
+    return sendSuccess(res, { leagues });
+  } catch (err) {
+    logger.error(`getBetfairActiveLeagues error: ${err.message}`);
+    return sendError(res, 'Failed to fetch active leagues from Betfair', 500);
+  }
+}
+
 async function getBetfairMarketTypes(req, res) {
   const { eventTypeId } = req.query;
   if (!eventTypeId) return sendError(res, 'eventTypeId query parameter is required', 400);
@@ -1043,6 +1141,7 @@ module.exports = {
   getMarketCatalog2,
   getNavigation,
   getBetfairCompetitions,
+  getBetfairActiveLeagues,   // ← NEW
   getBetfairMarketTypes,
   getBetfairTracks,          // ← NEW
   getEventMarkets,           // ← NEW
