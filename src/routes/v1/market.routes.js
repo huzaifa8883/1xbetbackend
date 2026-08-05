@@ -105,6 +105,14 @@ router.get('/event-markets', ctrl.getEventMarkets);
 router.get('/betfair/competitions', ctrl.getBetfairCompetitions);
 
 /**
+ * @route   GET /api/v1/markets/betfair/active-leagues?eventTypeId=<id>&hoursAhead=48
+ * @desc    Sirf wahi leagues jinke matches abhi ya agle N ghanton (default
+ *          48 = 2 din) mein hain — har league ke saath uske matches
+ *          (eventId, name, startTime) bhi. Admin panel drill-down UI ke liye.
+ */
+router.get('/betfair/active-leagues', ctrl.getBetfairActiveLeagues);
+
+/**
  * @route   GET /api/v1/markets/betfair/market-types?eventTypeId=<id>
  * @desc    Betfair se available market types fetch karo
  */
