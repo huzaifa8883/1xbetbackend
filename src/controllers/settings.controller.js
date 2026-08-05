@@ -172,4 +172,45 @@ async function getMarketSettingsBySport(req, res) {
   return sendSuccess(res, { sport, enabledMarketIds: ids, filterActive: true });
 }
 
-module.exports = { getLeagues, saveLeagues, getEnabledLeagues, getMarketSettings, saveMarketSettings, getMarketSettingsBySport };
+/* ─────────────────────────────────────────────────────────────
+   MATCH-SPECIFIC MARKET SETTINGS
+   Har match (eventId) ke liye enabled marketTypes
+   File: data/match-market-settings.json
+───────────────────────────────────────────────────────────── */
+
+const MATCH_MKT_PATH = path.join(__dirname, '../../data/match-market-settings.json');
+
+function readMatchMktStore() {
+  try {
+    if (fs.existsSync(MATCH_MKT_PATH)) return JSON.parse(fs.readFileSync(MATCH_MKT_PATH, 'utf8'));
+  } catch (e) {}
+  return {};
+}
+function writeMatchMktStore(data) {
+  try {
+    fs.mkdirSync(path.dirname(MATCH_MKT_PATH), { recursive: true });
+    fs.writeFileSync(MATCH_MKT_PATH, JSON.stringify(data, null, 2));
+  } catch (e) { logger.error('writeMatchMktStore: ' + e.message); }
+}
+
+// POST /api/v1/settings/match-markets
+// Body: { eventId, enabledMarketTypes: ['MATCH_ODDS','BOOKMAKER'] }
+async function saveMatchMarketSettings(req, res) {
+  const { eventId, enabledMarketTypes } = req.body;
+  if (!eventId || !Array.isArray(enabledMarketTypes))
+    return sendError(res, 'eventId and enabledMarketTypes required', 400);
+  const store = readMatchMktStore();
+  store[eventId] = enabledMarketTypes;
+  writeMatchMktStore(store);
+  return sendSuccess(res, { message: 'Match market settings saved', eventId });
+}
+
+// GET /api/v1/settings/match-markets/:eventId
+async function getMatchMarketSettings(req, res) {
+  const { eventId } = req.params;
+  const store = readMatchMktStore();
+  const types  = store[eventId] || null;
+  return sendSuccess(res, { eventId, enabledMarketTypes: types, filterActive: !!types });
+}
+
+module.exports = { getLeagues, saveLeagues, getEnabledLeagues, getMarketSettings, saveMarketSettings, getMarketSettingsBySport, saveMatchMarketSettings, getMatchMarketSettings };
