@@ -172,45 +172,74 @@ async function getMarketSettingsBySport(req, res) {
   return sendSuccess(res, { sport, enabledMarketIds: ids, filterActive: true });
 }
 
+module.exports = { getLeagues, saveLeagues, getEnabledLeagues, getMarketSettings, saveMarketSettings, getMarketSettingsBySport };
+
 /* ─────────────────────────────────────────────────────────────
-   MATCH-SPECIFIC MARKET SETTINGS
-   Har match (eventId) ke liye enabled marketTypes
-   File: data/match-market-settings.json
+   MATCH MARKETS  —  per-MATCH market selection (NEW)
+   ─────────────────────────────────────────────────────────────
+   Pehle sirf sport-wide market TYPE toggles the ("Cricket Markets"
+   jaisa generic card) — jo actual bet-able markets se disconnected
+   tha. Ab admin har individual match ke andar uske actual markets
+   (marketId ke sath) dekh ke select/unselect kar sakta hai — aur
+   wahi selection market.html (cricket) / Event.html (football,
+   tennis, horse race, greyhound) par respect hoti hai.
+   File: data/match-markets.json
+   Format: { "<eventId>": ["1.234567","1.234568", ...] }  // enabled marketIds
 ───────────────────────────────────────────────────────────── */
 
-const MATCH_MKT_PATH = path.join(__dirname, '../../data/match-market-settings.json');
+const MATCH_MARKETS_STORE_PATH = path.join(__dirname, '../../data/match-markets.json');
 
-function readMatchMktStore() {
+function readMatchMarketsStore() {
   try {
-    if (fs.existsSync(MATCH_MKT_PATH)) return JSON.parse(fs.readFileSync(MATCH_MKT_PATH, 'utf8'));
+    if (fs.existsSync(MATCH_MARKETS_STORE_PATH)) {
+      return JSON.parse(fs.readFileSync(MATCH_MARKETS_STORE_PATH, 'utf8'));
+    }
   } catch (e) {}
   return {};
 }
-function writeMatchMktStore(data) {
-  try {
-    fs.mkdirSync(path.dirname(MATCH_MKT_PATH), { recursive: true });
-    fs.writeFileSync(MATCH_MKT_PATH, JSON.stringify(data, null, 2));
-  } catch (e) { logger.error('writeMatchMktStore: ' + e.message); }
-}
 
-// POST /api/v1/settings/match-markets
-// Body: { eventId, enabledMarketTypes: ['MATCH_ODDS','BOOKMAKER'] }
-async function saveMatchMarketSettings(req, res) {
-  const { eventId, enabledMarketTypes } = req.body;
-  if (!eventId || !Array.isArray(enabledMarketTypes))
-    return sendError(res, 'eventId and enabledMarketTypes required', 400);
-  const store = readMatchMktStore();
-  store[eventId] = enabledMarketTypes;
-  writeMatchMktStore(store);
-  return sendSuccess(res, { message: 'Match market settings saved', eventId });
+function writeMatchMarketsStore(data) {
+  try {
+    fs.mkdirSync(path.dirname(MATCH_MARKETS_STORE_PATH), { recursive: true });
+    fs.writeFileSync(MATCH_MARKETS_STORE_PATH, JSON.stringify(data, null, 2));
+  } catch (e) {
+    logger.error('writeMatchMarketsStore error: ' + e.message);
+  }
 }
 
 // GET /api/v1/settings/match-markets/:eventId
-async function getMatchMarketSettings(req, res) {
-  const { eventId } = req.params;
-  const store = readMatchMktStore();
-  const types  = store[eventId] || null;
-  return sendSuccess(res, { eventId, enabledMarketTypes: types, filterActive: !!types });
+// Returns { eventId, enabledMarketIds: [...] | null, filterActive: bool }
+// filterActive=false → admin ne is match ke liye kabhi save nahi kiya,
+// is liye SAB markets show hone chahiye (koi filter mat lagao).
+async function getMatchMarkets(req, res) {
+  const eventId = req.params.eventId;
+  if (!eventId) return sendError(res, 'eventId param required', 400);
+
+  const store = readMatchMarketsStore();
+  const ids = store[eventId];
+
+  if (!ids || !Array.isArray(ids)) {
+    return sendSuccess(res, { eventId, enabledMarketIds: null, filterActive: false });
+  }
+  return sendSuccess(res, { eventId, enabledMarketIds: ids, filterActive: true });
 }
 
-module.exports = { getLeagues, saveLeagues, getEnabledLeagues, getMarketSettings, saveMarketSettings, getMarketSettingsBySport, saveMatchMarketSettings, getMatchMarketSettings };
+// POST /api/v1/settings/match-markets
+// Body: { eventId, enabledMarketIds: ['1.234567', ...] }
+async function saveMatchMarkets(req, res) {
+  const { eventId, enabledMarketIds } = req.body || {};
+  if (!eventId || !Array.isArray(enabledMarketIds)) {
+    return sendError(res, 'eventId + enabledMarketIds[] required', 400);
+  }
+  const store = readMatchMarketsStore();
+  store[eventId] = enabledMarketIds;
+  writeMatchMarketsStore(store);
+  logger.info(`Match markets saved for event ${eventId}: ${enabledMarketIds.length} enabled`);
+  return sendSuccess(res, { message: 'Match markets saved', eventId, count: enabledMarketIds.length });
+}
+
+module.exports = {
+  getLeagues, saveLeagues, getEnabledLeagues,
+  getMarketSettings, saveMarketSettings, getMarketSettingsBySport,
+  getMatchMarkets, saveMatchMarkets,
+};
