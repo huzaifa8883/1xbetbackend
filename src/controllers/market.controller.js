@@ -939,7 +939,7 @@ async function getBetfairTracks(req, res) {
 
     if (!events.length) return sendSuccess(res, { countries: [] });
 
-    // country → { trackName → count }
+    // country → { trackName → { eventCount, races:[{eventId,name,startTime}] } }
     const countryMap = {};
     events.forEach(e => {
       const ev = e.event;
@@ -950,7 +950,18 @@ async function getBetfairTracks(req, res) {
       const trackName = (rawName.split('(')[0] || rawName).trim() || 'Unknown';
 
       if (!countryMap[countryCode]) countryMap[countryCode] = {};
-      countryMap[countryCode][trackName] = (countryMap[countryCode][trackName] || 0) + 1;
+      if (!countryMap[countryCode][trackName]) {
+        countryMap[countryCode][trackName] = { eventCount: 0, races: [] };
+      }
+      countryMap[countryCode][trackName].eventCount++;
+      // ✅ NEW: har race ka eventId bhi save karo — is se admin panel
+      // individual race click karke uske markets select kar sakta hai
+      // (pehle sirf track-level count tha, race-level detail nahi thi)
+      countryMap[countryCode][trackName].races.push({
+        eventId:   ev.id,
+        name:      rawName,
+        startTime: ev.openDate,
+      });
     });
 
     const countries = Object.keys(countryMap)
@@ -958,7 +969,14 @@ async function getBetfairTracks(req, res) {
         code,
         name: COUNTRY_NAMES[code] || code,
         tracks: Object.keys(countryMap[code])
-          .map(name => ({ name, eventCount: countryMap[code][name] }))
+          .map(name => {
+            const t = countryMap[code][name];
+            return {
+              name,
+              eventCount: t.eventCount,
+              races: t.races.sort((a, b) => new Date(a.startTime) - new Date(b.startTime)),
+            };
+          })
           .sort((a, b) => a.name.localeCompare(b.name)),
       }))
       .sort((a, b) => a.name.localeCompare(b.name));
