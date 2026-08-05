@@ -110,4 +110,12 @@ router.get('/betfair/competitions', ctrl.getBetfairCompetitions);
  */
 router.get('/betfair/market-types', ctrl.getBetfairMarketTypes);
 
+/**
+ * @route   GET /api/v1/markets/betfair/tracks?eventTypeId=<7|4339>
+ * @desc    Horse Racing (7) / Greyhound (4339) ke liye Country → Track
+ *          hierarchy — competitions ki jagah, kyunki racing sports
+ *          Betfair pe competition-based nahi hote.
+ */
+router.get('/betfair/tracks', ctrl.getBetfairTracks);
+
 module.exports = router;
