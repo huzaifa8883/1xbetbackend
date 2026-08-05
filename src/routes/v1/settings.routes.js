@@ -13,4 +13,8 @@ router.get('/markets/:sport',         ctrl.getMarketSettingsBySport);
 router.get('/markets',                ctrl.getMarketSettings);
 router.post('/markets',               ctrl.saveMarketSettings);
 
+// Match-specific market settings
+router.get('/match-markets/:eventId',  ctrl.getMatchMarketSettings);
+router.post('/match-markets',          ctrl.saveMatchMarketSettings);
+
 module.exports = router;
