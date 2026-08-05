@@ -806,6 +806,72 @@ async function getBetfairMarketTypes(req, res) {
   }
 }
 
+/* ── NEW: Country → Track hierarchy (Horse Racing / Greyhound) ──────
+   Racing sports (eventTypeId 7 = Horse, 4339 = Greyhound) Betfair pe
+   "competitions" ki tarah nahi hote — har event ek race hoti hai, jiska
+   naam aam taur pe "TrackName (COUNTRY) Race-time" format mein hota hai
+   (e.g. "Ballarat (AUS) 23rd Jul"). Isi se hum country + track nikaal
+   ke admin ko country > track wala UI dete hain, jaisa asal racing
+   sites (Bet365, Betfair khud) dikhate hain — sirf "leagues" nahi.
+──────────────────────────────────────────────────────────────── */
+
+// Common Betfair country codes → readable names (jo na mile wahi code dikhega)
+const COUNTRY_NAMES = {
+  GB: 'United Kingdom', IE: 'Ireland', US: 'United States', AU: 'Australia',
+  FR: 'France', ZA: 'South Africa', AE: 'UAE', HK: 'Hong Kong', SG: 'Singapore',
+  NZ: 'New Zealand', IN: 'India', JP: 'Japan', CA: 'Canada', DE: 'Germany',
+  IT: 'Italy', ES: 'Spain', SE: 'Sweden', NO: 'Norway', ZW: 'Zimbabwe',
+  MU: 'Mauritius', AR: 'Argentina', BR: 'Brazil', CL: 'Chile', PE: 'Peru',
+  PH: 'Philippines', MY: 'Malaysia', KR: 'South Korea', QA: 'Qatar',
+};
+
+async function getBetfairTracks(req, res) {
+  const { eventTypeId } = req.query;
+  if (!eventTypeId) return sendError(res, 'eventTypeId query parameter is required', 400);
+
+  try {
+    const now  = new Date();
+    const from = new Date(now.getTime() - 30 * 60_000).toISOString();
+    const to   = new Date(now.getTime() + 48 * 3600_000).toISOString(); // 48h ahead — sabhi upcoming races cover karo
+
+    const events = await listEvents({
+      eventTypeIds: [String(eventTypeId)],
+      marketStartTime: { from, to },
+    });
+
+    if (!events.length) return sendSuccess(res, { countries: [] });
+
+    // country → { trackName → count }
+    const countryMap = {};
+    events.forEach(e => {
+      const ev = e.event;
+      if (!ev) return;
+      const countryCode = ev.countryCode || 'OTHER';
+      const rawName = ev.name || '';
+      // "Ballarat (AUS) 23rd Jul" → track = "Ballarat"
+      const trackName = (rawName.split('(')[0] || rawName).trim() || 'Unknown';
+
+      if (!countryMap[countryCode]) countryMap[countryCode] = {};
+      countryMap[countryCode][trackName] = (countryMap[countryCode][trackName] || 0) + 1;
+    });
+
+    const countries = Object.keys(countryMap)
+      .map(code => ({
+        code,
+        name: COUNTRY_NAMES[code] || code,
+        tracks: Object.keys(countryMap[code])
+          .map(name => ({ name, eventCount: countryMap[code][name] }))
+          .sort((a, b) => a.name.localeCompare(b.name)),
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    return sendSuccess(res, { countries });
+  } catch (err) {
+    logger.error(`getBetfairTracks error: ${err.message}`);
+    return sendError(res, 'Failed to fetch tracks from Betfair', 500);
+  }
+}
+
 /* ── NEW: All markets for a specific event ───────────────── */
 
 /**
@@ -978,5 +1044,6 @@ module.exports = {
   getNavigation,
   getBetfairCompetitions,
   getBetfairMarketTypes,
+  getBetfairTracks,          // ← NEW
   getEventMarkets,           // ← NEW
 };
