@@ -8,42 +8,106 @@ const USERNAME = process.env.BETFAIR_USERNAME;
 const PASSWORD = process.env.BETFAIR_PASSWORD;
 const LOGIN_URL  = process.env.BETFAIR_LOGIN_URL  || 'https://identitysso.betfair.com/api/login';
 const API_URL    = process.env.BETFAIR_API_URL     || 'https://api.betfair.com/exchange/betting/json-rpc/v1';
-const TTL_MS     = parseInt(process.env.BETFAIR_SESSION_TTL_MINUTES || '29', 10) * 60 * 1000;
+const TTL_MS     = parseInt(process.env.BETFAIR_SESSION_TTL_MINUTES || '25', 10) * 60 * 1000; // Reduced to 25 mins for safety
 
 const { SPORT_MAP } = require('../config/constants');
 
-/* ── Session cache ──────────────────────────────────────── */
+/* ── Session cache & Lock ────────────────────────────────── */
 let cachedToken = null;
 let tokenExpiry = null;
+let loginPromise = null; // Lock for concurrent requests
 
 async function getSessionToken() {
-  if (cachedToken && tokenExpiry && Date.now() < tokenExpiry) return cachedToken;
+  // 1. Return cached token if valid
+  if (cachedToken && tokenExpiry && Date.now() < tokenExpiry) {
+    return cachedToken;
+  }
 
-  const res = await axios.post(
-    LOGIN_URL,
-    new URLSearchParams({ username: USERNAME, password: PASSWORD }),
-    { headers: { 'X-Application': APP_KEY, 'Content-Type': 'application/x-www-form-urlencoded' } }
-  );
+  // 2. Return active login request if already in progress (Deduplication)
+  if (loginPromise) {
+    return loginPromise;
+  }
 
-  if (res.data.status !== 'SUCCESS') throw new Error(`Betfair login failed: ${res.data.error}`);
+  // 3. Initiate single login request
+  loginPromise = (async () => {
+    try {
+      logger.info('Betfair: Requesting new session token...');
+      const res = await axios.post(
+        LOGIN_URL,
+        new URLSearchParams({ username: USERNAME, password: PASSWORD }),
+        { 
+          headers: { 
+            'X-Application': APP_KEY, 
+            'Content-Type': 'application/x-www-form-urlencoded' 
+          },
+          timeout: 10000 
+        }
+      );
 
-  cachedToken  = res.data.token;
-  tokenExpiry  = Date.now() + TTL_MS;
-  logger.info('Betfair: new session token generated');
-  return cachedToken;
+      if (res.data.status !== 'SUCCESS') {
+        const errorMsg = res.data.error || 'UNKNOWN_ERROR';
+        // If banned, invalidate cache and throw
+        cachedToken = null;
+        tokenExpiry = null;
+        throw new Error(`Betfair login failed: ${errorMsg}`);
+      }
+
+      cachedToken = res.data.token;
+      tokenExpiry = Date.now() + TTL_MS;
+      logger.info('Betfair: New session token successfully generated');
+      return cachedToken;
+    } catch (err) {
+      cachedToken = null;
+      tokenExpiry = null;
+      throw err;
+    } finally {
+      loginPromise = null; // Release lock
+    }
+  })();
+
+  return loginPromise;
 }
 
-/* ── Generic JSON-RPC call ──────────────────────────────── */
-async function jsonRpc(method, params) {
-  const token = await getSessionToken();
-  const body  = [{ jsonrpc: '2.0', method, params, id: 1 }];
-  const resp  = await axios.post(API_URL, body, {
-    headers: { 'X-Application': APP_KEY, 'X-Authentication': token, 'Content-Type': 'application/json' }
-  });
-  const result = resp.data[0]?.result;
-  const error  = resp.data[0]?.error;
-  if (!result) throw new Error(`No result from Betfair: ${method} - error: ${JSON.stringify(error)}`);
-  return result;
+/* ── Generic JSON-RPC call with Auto Session Retry ──────── */
+async function jsonRpc(method, params, isRetry = false) {
+  try {
+    const token = await getSessionToken();
+    const body  = [{ jsonrpc: '2.0', method, params, id: 1 }];
+    const resp  = await axios.post(API_URL, body, {
+      headers: { 
+        'X-Application': APP_KEY, 
+        'X-Authentication': token, 
+        'Content-Type': 'application/json' 
+      },
+      timeout: 15000
+    });
+
+    const result = resp.data[0]?.result;
+    const error  = resp.data[0]?.error;
+
+    // Handle Session Expired error inside RPC
+    if (error && (error.code === -32099 || error.data?.APINGException?.errorCode === 'INVALID_SESSION_INFORMATION')) {
+      logger.warn('Betfair: Session invalidated on RPC call, clearing cached token');
+      cachedToken = null;
+      tokenExpiry = null;
+      if (!isRetry) {
+        return jsonRpc(method, params, true); // Retry once with fresh token
+      }
+    }
+
+    if (!result) {
+      throw new Error(`No result from Betfair: ${method} - error: ${JSON.stringify(error)}`);
+    }
+
+    return result;
+  } catch (err) {
+    // Clear token if token issue detected in network response
+    if (err.message.includes('INVALID_SESSION') || err.message.includes('login failed')) {
+      cachedToken = null;
+      tokenExpiry = null;
+    }
+    throw err;
+  }
 }
 
 /* ── Public helpers ──────────────────────────────────────── */
