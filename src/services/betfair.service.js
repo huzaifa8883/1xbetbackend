@@ -356,16 +356,33 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
   const eventTypeId = filter?.eventTypeIds?.[0];
   let markets = [];
 
+  // ✅ BUG FIX: pehle sirf "eventTypeIds" ya "marketIds" diye jaane par
+  // hi Shubdx se data fetch hota tha. Lekin getLiveHorse/getLiveGreyhound
+  // (aur kai aur callers) sirf { eventIds, marketTypeCodes } bhejte hain
+  // — na eventTypeIds na marketIds — is liye ye function hamesha `[]`
+  // return karta tha, chahe events pehle se mil chuke hon. Isi wajah se
+  // frontend par data kabhi nahi aata tha (dashboard.html har request
+  // ke liye pehle listEvents() se events leta hai, phir listMarketCatalogue
+  // se unki details — ye doosra step hamesha khali aata tha).
+  // Ab agar sirf eventIds diye gaye hon, saare sports mein dhoondo
+  // (jaisa marketIds ke liye pehle se hota hai).
   if (eventTypeId) {
     const sportSlug = sportSlugFromEventTypeId(eventTypeId);
     markets = await fetchAllMatches(sportSlug);
-  } else if (filter?.marketIds?.length) {
-    // Sport pata nahi — saare sports try karo jab tak market ID na mile
-    // (getEventDetails/getRunnerBook jaise callers sirf marketId dete hain)
+  } else if (filter?.marketIds?.length || filter?.eventIds?.length) {
+    // Sport pata nahi — saare sports try karo jab tak match na mile
+    // (getEventDetails/getRunnerBook/getLiveHorse jaise callers sirf
+    // marketId ya eventId dete hain, sport slug nahi)
     for (const slug of Object.values(EVENT_TYPE_TO_SPORT_SLUG)) {
       const list = await fetchAllMatches(slug).catch(() => []);
-      const hit = list.filter(m => filter.marketIds.includes(m.id));
-      if (hit.length) { markets = hit; break; }
+      if (filter?.marketIds?.length) {
+        const hit = list.filter(m => filter.marketIds.includes(m.id));
+        if (hit.length) { markets = hit; break; } // marketId unique hai ek sport mein, mil gaya to ruk jao
+      } else if (filter?.eventIds?.length) {
+        // eventIds multiple sports mein spread ho sakte hain (theoretically) —
+        // is liye har slug se accumulate karo, break mat karo
+        markets = markets.concat(list.filter(m => filter.eventIds.includes(m.event?.id)));
+      }
     }
   }
 
