@@ -219,8 +219,16 @@ async function listEvents(filter = {}) {
     const ev = m.event;
     if (!ev?.id) return;
     if (competitionIds && !competitionIds.includes(String(m.competition?.id))) return;
-    if (fromMs !== null && m.start < fromMs) return;
-    if (toMs   !== null && m.start > toMs)   return;
+
+    // ✅ FIX: m.start Shubdx response mein number (epoch ms) ya string
+    // (ISO date) — dono ho sakta hai. Pehle seedha numeric comparison
+    // (m.start < fromMs) hoti thi jo agar m.start string ho to hamesha
+    // fail hoti (NaN comparison) — is se date-range filter silently
+    // kaam nahi karta tha, ya to sab match gayab ho jaate ya sab reh jaate.
+    // Ab hamesha Date object se normalize karke compare karte hain.
+    const startMs = m.start != null ? new Date(m.start).getTime() : NaN;
+    if (fromMs !== null && !isNaN(startMs) && startMs < fromMs) return;
+    if (toMs   !== null && !isNaN(startMs) && startMs > toMs)   return;
 
     if (!seen.has(ev.id)) {
       seen.set(ev.id, {
@@ -230,7 +238,7 @@ async function listEvents(filter = {}) {
           countryCode: ev.countryCode || null,
           timezone: null,
           venue: ev.venue || null,
-          openDate: ev.openDate || new Date(m.start).toISOString(),
+          openDate: ev.openDate || (!isNaN(startMs) ? new Date(startMs).toISOString() : new Date().toISOString()),
         },
         marketCount: 0,
       });
@@ -266,25 +274,47 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
     markets = markets.filter(m => filter.marketIds.includes(m.id));
   }
 
-  return markets.slice(0, parseInt(maxResults, 10) || 20).map(m => ({
-    marketId: m.id,
-    marketName: m.name,
-    marketStartTime: new Date(m.start).toISOString(),
-    totalMatched: m.matched || 0,
-    competition: m.competition ? { id: m.competition.id, name: m.competition.name } : null,
-    event: m.event ? {
-      id: m.event.id, name: m.event.name,
-      countryCode: m.event.countryCode || null,
-      openDate: m.event.openDate,
-    } : null,
-    eventType: { id: String(m.eventTypeId), name: SPORT_MAP[String(m.eventTypeId)] || 'Other' },
-    runners: (m.runners || []).map(r => ({
-      selectionId: r.id,
-      runnerName: r.name,
-      sortPriority: r.sort || 0,
-      handicap: r.hdp || 0,
-    })),
-  }));
+  return markets.slice(0, parseInt(maxResults, 10) || 20).map(m => {
+    const startMs = m.start != null ? new Date(m.start).getTime() : NaN;
+    return {
+      marketId: m.id,
+      marketName: m.name,
+      marketStartTime: !isNaN(startMs) ? new Date(startMs).toISOString() : (m.event?.openDate || new Date().toISOString()),
+      totalMatched: m.matched || 0,
+      competition: m.competition ? { id: m.competition.id, name: m.competition.name } : null,
+      event: m.event ? {
+        id: m.event.id, name: m.event.name,
+        countryCode: m.event.countryCode || null,
+        openDate: m.event.openDate || (!isNaN(startMs) ? new Date(startMs).toISOString() : null),
+      } : null,
+      eventType: { id: String(m.eventTypeId), name: SPORT_MAP[String(m.eventTypeId)] || 'Other' },
+      runners: (m.runners || []).map(r => ({
+        selectionId: r.id,
+        runnerName: r.name,
+        sortPriority: r.sort || 0,
+        handicap: r.hdp || 0,
+        // ✅ Raw runner object pass-through as metadata — Shubdx horse/
+        // greyhound runners mein jockey/trainer/silk/cloth-number jaisi
+        // details ho sakti hain kisi bhi naming convention mein. Purana
+        // Betfair-based buildOddsPayload() pehle se hi kai naming variants
+        // check karta hai (CLOTH_NUMBER/cloth_number/ClothNumber, etc.) —
+        // poora raw object bhej dene se agar Shubdx ka field naam match
+        // kare to wo turant dikhna shuru ho jayega, warna gracefully null
+        // rahega (koi crash nahi). metadataDict se raw fields dikh bhi
+        // jayenge debugging ke liye.
+        metadata: {
+          ...r,
+          CLOTH_NUMBER: r.clothNumber ?? r.cloth ?? r.CLOTH_NUMBER ?? null,
+          JOCKEY_NAME:  r.jockey      ?? r.jockeyName ?? r.JOCKEY_NAME ?? null,
+          TRAINER_NAME: r.trainer     ?? r.trainerName ?? r.TRAINER_NAME ?? null,
+          STALL_DRAW:   r.stallDraw   ?? r.stall ?? r.STALL_DRAW ?? null,
+          COLOURS_FILENAME_URL: r.silk ?? r.silkUrl ?? r.COLOURS_FILENAME_URL ?? null,
+          FORM:         r.form  ?? r.FORM ?? null,
+          AGE:          r.age   ?? r.AGE  ?? null,
+        },
+      })),
+    };
+  });
 }
 
 // Betfair jaisa shape: [{ marketId, status, inplay, betDelay,
