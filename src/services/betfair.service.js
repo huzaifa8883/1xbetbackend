@@ -114,25 +114,55 @@ async function bfJsonRpc(method, params, isRetry = false) {
 // Betfair eventTypeId → Shubdx/Rollwin URL sport-segment mapping.
 // SPORT_MAP (config/constants) se hi eventTypeId → naam milta hai,
 // yahan sirf naam ko API ke URL-friendly slug mein convert kar rahe hain.
+//
+// ⚠️ Horse/Greyhound slugs env var se override ho sakti hain — agar
+// Rollwin/Shubdx pe inka asal URL-segment "horse"/"greyhound" se
+// different nikle (404 error dekh kar), .env mein
+// SHUBDX_SLUG_HORSE / SHUBDX_SLUG_GREYHOUND set karke bina code
+// badle turant test kiya ja sakta hai.
 const EVENT_TYPE_TO_SPORT_SLUG = {
   '1':    'football',
   '2':    'tennis',
   '4':    'cricket',
-  '7':    'horse',
-  '4339': 'greyhound',
+  '7':    process.env.SHUBDX_SLUG_HORSE     || 'horse',
+  '4339': process.env.SHUBDX_SLUG_GREYHOUND || 'greyhound',
 };
 
 /* ── Short-TTL cache: ek hi sport ke liye baar baar "allmatches" na
    maara jaaye jab multiple functions (events/competitions/catalogue)
    thodi thodi der mein call ho rahe hon. ────────────────────────── */
-const _cache = new Map(); // sportSlug → { data, expiresAt }
+const _cache = new Map(); // sportSlug → { data, expiresAt, isError }
 const CACHE_TTL_MS = parseInt(process.env.SHUBDX_CACHE_TTL_MS || '4000', 10);
+// ✅ Failure bhi cache karo — warna ek hamesha-404-dene-wala slug (jaise
+// abhi horse/greyhound) HAR single request pe dobara hit hota hai, khaas
+// taur pe listMarketCatalogue/listMarketBook jab sirf marketId diya ho
+// (getRunnerBook/catalog2/AutoSettle) to woh SAARE 5 sports try karte hain
+// — matlab ek hi settlement cycle mein horse+greyhound dono baar baar fail
+// ho rahe the, chahe market unse related bhi na ho. Negative-cache is
+// noise/load ko bohot kam kar deta hai jab tak asal slug fix na ho.
+const ERROR_CACHE_TTL_MS = parseInt(process.env.SHUBDX_ERROR_CACHE_TTL_MS || '30000', 10);
+
+// Horse Race / Greyhound Betfair "races" hote hain, "matches" nahi —
+// Rollwin/Shubdx pe inka list-endpoint bhi alag naam se hai: "allraces"
+// (allmatches nahi). Env var se override bhi ho sakta hai agar naam
+// aage kabhi badle.
+const RACING_SLUGS = new Set([
+  process.env.SHUBDX_SLUG_HORSE     || 'horse',
+  process.env.SHUBDX_SLUG_GREYHOUND || 'greyhound',
+]);
+function isRacingSlug(sportSlug) { return RACING_SLUGS.has(sportSlug); }
+const ALL_LIST_ENDPOINT = process.env.SHUBDX_RACES_ENDPOINT || 'allraces'; // horse/greyhound
+const ONE_MATCH_ENDPOINT_RACING = process.env.SHUBDX_FETCHRACE_ENDPOINT || 'fetchrace'; // horse/greyhound
 
 async function fetchAllMatches(sportSlug) {
   const cached = _cache.get(sportSlug);
-  if (cached && Date.now() < cached.expiresAt) return cached.data;
+  if (cached && Date.now() < cached.expiresAt) {
+    if (cached.isError) throw cached.error;
+    return cached.data;
+  }
 
-  const url = `${BASE_URL}/${sportSlug}/allmatches`;
+  const endpoint = isRacingSlug(sportSlug) ? ALL_LIST_ENDPOINT : 'allmatches';
+  const url = `${BASE_URL}/${sportSlug}/${endpoint}`;
   try {
     const res = await axios.get(url, { timeout: TIMEOUT_MS });
     const raw = res.data;
@@ -146,24 +176,33 @@ async function fetchAllMatches(sportSlug) {
                   : [];
 
     if (!markets.length) {
-      logger.warn(`[Shubdx] allmatches(${sportSlug}) — 0 markets mile. Response shape: ${JSON.stringify(Object.keys(raw || {}))}`);
+      logger.warn(`[Shubdx] ${endpoint}(${sportSlug}) — 0 markets mile. Response shape: ${JSON.stringify(Object.keys(raw || {}))}`);
     }
 
-    _cache.set(sportSlug, { data: markets, expiresAt: Date.now() + CACHE_TTL_MS });
+    _cache.set(sportSlug, { data: markets, expiresAt: Date.now() + CACHE_TTL_MS, isError: false });
     return markets;
   } catch (err) {
-    logger.error(`[Shubdx] fetchAllMatches(${sportSlug}) failed: ${err.message}`);
+    const status = err.response?.status;
+    if (status === 404) {
+      logger.error(`[Shubdx] ${endpoint}(${sportSlug}) failed: 404 — URL check karo (${url}). Sport slug ya endpoint naam galat ho sakta hai — SHUBDX_SLUG_HORSE / SHUBDX_SLUG_GREYHOUND / SHUBDX_RACES_ENDPOINT env var se adjust karo.`);
+    } else {
+      logger.error(`[Shubdx] ${endpoint}(${sportSlug}) failed: ${err.message}`);
+    }
+    // Negative-cache — is se agla ${ERROR_CACHE_TTL_MS}ms tak yahi error
+    // turant (bina naya HTTP call kiye) return hoga, server par load kam.
+    _cache.set(sportSlug, { error: err, expiresAt: Date.now() + ERROR_CACHE_TTL_MS, isError: true });
     throw err;
   }
 }
 
 async function fetchOneMatch(sportSlug, matchOrEventId) {
-  const url = `${BASE_URL}/${sportSlug}/fetchmatch`;
+  const endpoint = isRacingSlug(sportSlug) ? ONE_MATCH_ENDPOINT_RACING : 'fetchmatch';
+  const url = `${BASE_URL}/${sportSlug}/${endpoint}`;
   try {
     const res = await axios.get(url, { params: { match: matchOrEventId }, timeout: TIMEOUT_MS });
     return res.data;
   } catch (err) {
-    logger.error(`[Shubdx] fetchOneMatch(${sportSlug}, ${matchOrEventId}) failed: ${err.message}`);
+    logger.error(`[Shubdx] fetchOneMatch(${sportSlug}, ${matchOrEventId}) via ${endpoint} failed: ${err.message}`);
     throw err;
   }
 }
