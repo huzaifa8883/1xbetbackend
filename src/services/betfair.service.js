@@ -154,6 +154,61 @@ function isRacingSlug(sportSlug) { return RACING_SLUGS.has(sportSlug); }
 const ALL_LIST_ENDPOINT = process.env.SHUBDX_RACES_ENDPOINT || 'allraces'; // horse/greyhound
 const ONE_MATCH_ENDPOINT_RACING = process.env.SHUBDX_FETCHRACE_ENDPOINT || 'fetchrace'; // horse/greyhound
 
+// Reverse lookup: sportSlug → eventTypeId (racing normalizer ke liye chahiye)
+const SPORT_SLUG_TO_EVENT_TYPE = Object.fromEntries(
+  Object.entries(EVENT_TYPE_TO_SPORT_SLUG).map(([id, slug]) => [slug, id])
+);
+
+/* ═══════════════════════════════════════════════════════════════
+   ✅ BUG FIX: Horse Race / Greyhound "allraces" endpoint ka response
+   shape team-sports "allmatches" se BILKUL ALAG (flat) hai:
+
+     allmatches (football/cricket/tennis) → { id, event:{id,name,...}, competition:{...}, start, runners:[...] }
+     allraces   (horse/greyhound)         → { id, countryCode, venue, startTime, marketId, isBettable, inPlay }
+                                              ⚠️ koi nested "event" object NAHI hai!
+
+   Baaki poora file (listEvents, listMarketCatalogue, listMarketBook)
+   hamesha `m.event.id`, `m.event.name`, `m.start` waghera padhta hai —
+   racing ke flat items mein `m.event` hi undefined hota hai, is liye
+   `if (!ev?.id) return;` HAR race ko silently skip kar deta tha →
+   horse/greyhound mein hamesha khali data aata tha (admin panel ho ya
+   dashboard, dono jagah).
+
+   Fix: racing items ko yahin (source par) generic "event"-shaped object
+   mein normalize kar do — is se baaki file mein KUCH badalne ki
+   zaroorat nahi, sab already-existing code automatically kaam karega.
+──────────────────────────────────────────────────────────────── */
+function normalizeRacingItem(r, sportSlug) {
+  const startIso   = r.startTime || null;
+  const timeLabel  = startIso ? new Date(startIso).toISOString().slice(11, 16) : '';
+  const venueName  = r.venue || 'Race';
+  const displayName = timeLabel ? `${venueName} ${timeLabel}` : venueName;
+
+  return {
+    // ⚠️ marketId abhi tak Betfair/Shubdx se assign nahi hua ho sakta
+    // (raw "marketId" often null jab tak race bettable-window ke qareeb
+    // na aaye) — tab tak race ki apni unique id (e.g. "35911818.1734")
+    // hi placeholder ki tarah use karo, taake downstream code crash na
+    // ho. Jaise hi real marketId aata hai wo automatically use hoga.
+    id:     r.marketId || r.id,
+    name:   displayName,
+    start:  startIso,
+    status: r.isBettable === false ? 'CLOSED' : 'OPEN',
+    inPlay: !!r.inPlay,
+    matched: 0,
+    competition: null, // racing mein "competition" jaisi cheez nahi hoti — track/venue hi grouping hai
+    event: {
+      id: r.id,          // ✅ race ki apni unique id — ye hi per-race "eventId" hai
+      name: displayName,
+      countryCode: r.countryCode || null,
+      venue: venueName,
+      openDate: startIso,
+    },
+    eventTypeId: SPORT_SLUG_TO_EVENT_TYPE[sportSlug] || null,
+    runners: r.runners || [], // "allraces" list mein runners nahi hote — "fetchrace" (single) mein aate hain
+  };
+}
+
 async function fetchAllMatches(sportSlug) {
   const cached = _cache.get(sportSlug);
   if (cached && Date.now() < cached.expiresAt) {
@@ -169,7 +224,7 @@ async function fetchAllMatches(sportSlug) {
     // ✅ Confirmed shapes (asal server response se):
     //   allmatches:  { status:"success", data: { status:{...}, success:true, result:[...] } }
     //   fetchmatch:  { status:{...}, success:true, result:[...] }
-    const markets = Array.isArray(raw?.data?.result) ? raw.data.result   // allmatches shape
+    let markets = Array.isArray(raw?.data?.result) ? raw.data.result   // allmatches shape
                   : Array.isArray(raw?.result)       ? raw.result        // fetchmatch shape
                   : Array.isArray(raw)                ? raw
                   : Array.isArray(raw?.data)          ? raw.data
@@ -177,6 +232,14 @@ async function fetchAllMatches(sportSlug) {
 
     if (!markets.length) {
       logger.warn(`[Shubdx] ${endpoint}(${sportSlug}) — 0 markets mile. Response shape: ${JSON.stringify(Object.keys(raw || {}))}`);
+    }
+
+    // ✅ BUG FIX: racing (horse/greyhound) ka flat shape ko generic
+    // event-shaped object mein normalize karo (dekho normalizeRacingItem
+    // ka comment upar) — warna listEvents() etc. mein har race silently
+    // skip ho jata tha kyunke m.event kabhi milta hi nahi tha.
+    if (isRacingSlug(sportSlug)) {
+      markets = markets.map(r => normalizeRacingItem(r, sportSlug));
     }
 
     _cache.set(sportSlug, { data: markets, expiresAt: Date.now() + CACHE_TTL_MS, isError: false });
