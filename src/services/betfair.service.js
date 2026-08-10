@@ -259,10 +259,13 @@ async function fetchAllMatches(sportSlug) {
 }
 
 async function fetchOneMatch(sportSlug, matchOrEventId) {
-  const endpoint = isRacingSlug(sportSlug) ? ONE_MATCH_ENDPOINT_RACING : 'fetchmatch';
-  const url = `${BASE_URL}/${sportSlug}/${endpoint}`;
+  const isRacing = isRacingSlug(sportSlug);
+  const endpoint = isRacing ? ONE_MATCH_ENDPOINT_RACING : 'fetchmatch';
+  const url      = `${BASE_URL}/${sportSlug}/${endpoint}`;
+  // Racing: param name = "raceNumber", others: "match"
+  const params   = isRacing ? { raceNumber: matchOrEventId } : { match: matchOrEventId };
   try {
-    const res = await axios.get(url, { params: { match: matchOrEventId }, timeout: TIMEOUT_MS });
+    const res = await axios.get(url, { params, timeout: TIMEOUT_MS });
     return res.data;
   } catch (err) {
     logger.error(`[Shubdx] fetchOneMatch(${sportSlug}, ${matchOrEventId}) via ${endpoint} failed: ${err.message}`);
