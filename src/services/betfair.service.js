@@ -270,57 +270,6 @@ async function fetchOneMatch(sportSlug, matchOrEventId) {
   }
 }
 
-// ✅ Horse/Greyhound ("allraces" list) mein runners kabhi nahi hote — sirf
-// per-race "fetchrace" detail call se milte hain. Ye helper un markets ko
-// enrich karta hai jinke runners abhi khali hain (racing sports ke liye).
-//
-// listMarketCatalogue() aur listMarketBook() dono isse independently call
-// karte hain (kyunki getMarketCatalog2 unhe Promise.all se PARALLEL chalata
-// hai — agar sirf ek jagah enrich hota to dusri jagah race-condition ki
-// wajah se abhi bhi khali runners mil sakte the). In-flight de-dup (isi
-// race ke liye do parallel fetchrace calls na ho) ke liye ek shared
-// promise-cache use hoti hai.
-const _enrichInFlight = new Map(); // "sportSlug::matchId" → Promise
-
-async function ensureRacingRunners(marketsList) {
-  await Promise.all(marketsList.map(async (m) => {
-    if (Array.isArray(m.runners) && m.runners.length > 0) return; // already hain
-    const sportSlug = m.eventTypeId ? EVENT_TYPE_TO_SPORT_SLUG[String(m.eventTypeId)] : null;
-    if (!sportSlug || !isRacingSlug(sportSlug)) return; // sirf racing ke liye
-
-    const matchId = m.event?.id || m.id;
-    const key = `${sportSlug}::${matchId}`;
-
-    if (!_enrichInFlight.has(key)) {
-      _enrichInFlight.set(key, (async () => {
-        try {
-          const detail = await fetchOneMatch(sportSlug, matchId);
-          // ⚠️ "fetchrace" ka exact response-shape confirm nahi kiya gaya —
-          // multiple plausible variants try karte hain taake jo bhi shape ho
-          // usse pakad sake, bina crash kiye.
-          const d = detail?.data?.result ?? detail?.result ?? detail?.data ?? detail;
-          const raceObj = Array.isArray(d) ? d[0] : d;
-          const rawRunners = raceObj?.runners || raceObj?.selections || raceObj?.horses || raceObj?.dogs || [];
-          if (!Array.isArray(rawRunners) || rawRunners.length === 0) {
-            logger.warn(`[Shubdx] fetchrace(${sportSlug}, ${matchId}) — runners nahi mile. Response keys: ${JSON.stringify(Object.keys(raceObj || {}))}`);
-          }
-          return { runners: rawRunners, marketId: raceObj?.marketId || raceObj?.market_id || null };
-        } catch (e) {
-          return { runners: [], marketId: null };
-        } finally {
-          setTimeout(() => _enrichInFlight.delete(key), 0); // ek tick baad clear, sirf isi burst ke liye dedup
-        }
-      })());
-    }
-
-    const result = await _enrichInFlight.get(key);
-    if (result.runners.length > 0) {
-      m.runners = result.runners;
-      if (result.marketId) m.id = result.marketId;
-    }
-  }));
-}
-
 function sportSlugFromEventTypeId(eventTypeId) {
   const slug = EVENT_TYPE_TO_SPORT_SLUG[String(eventTypeId)];
   if (!slug) throw new Error(`Unknown eventTypeId for Shubdx mapping: ${eventTypeId}`);
@@ -446,15 +395,47 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
 
   const sliced = markets.slice(0, parseInt(maxResults, 10) || 20);
 
-  // ✅ FIX: Event.html per horse/greyhound ke odds/runners bilkul nahi
-  // dikh rahe the (baaki sports jinke runners "allmatches" list mein hi
-  // embedded hote hain, wo theek chal rahe the) — racing sports ke liye
-  // runners sirf fetchrace se milte hain, list se nahi.
-  await ensureRacingRunners(sliced);
+  // Racing markets ke liye fetchrace se runners fetch karo (allraces mein runners nahi hote)
+  // Pehle determine karo kaunse markets racing hain
+  const racingFetches = new Map(); // groupById → Promise<raceItem>
+  for (const m of sliced) {
+    const eid  = String(m.eventTypeId || '');
+    const slug = EVENT_TYPE_TO_SPORT_SLUG[eid];
+    if (slug && isRacingSlug(slug) && !(m.runners && m.runners.length)) {
+      const groupById = m.event?.id || m.groupById;
+      if (groupById && !racingFetches.has(groupById)) {
+        racingFetches.set(groupById, fetchOneMatch(slug, groupById)
+          .then(res => {
+            const raw  = res?.data || res;
+            return Array.isArray(raw?.result) ? raw.result[0] : null;
+          })
+          .catch(() => null)
+        );
+      }
+    }
+  }
+  // Sab racing fetches parallel mein resolve karo
+  if (racingFetches.size > 0) {
+    await Promise.all([...racingFetches.values()]);
+  }
 
-  return sliced.map(m => {
+  const resultArr = [];
+  for (const m of sliced) {
     const startMs = m.start != null ? new Date(m.start).getTime() : NaN;
-    return {
+    const eid     = String(m.eventTypeId || '');
+    const slug    = EVENT_TYPE_TO_SPORT_SLUG[eid];
+    let runners   = m.runners || [];
+
+    // Racing runners: fetchrace se lo agar allraces mein nahi the
+    if (slug && isRacingSlug(slug) && runners.length === 0) {
+      const groupById = m.event?.id || m.groupById;
+      if (groupById && racingFetches.has(groupById)) {
+        const raceItem = await racingFetches.get(groupById);
+        runners = raceItem?.runners || [];
+      }
+    }
+
+    resultArr.push({
       marketId: m.id,
       marketName: m.name,
       marketStartTime: !isNaN(startMs) ? new Date(startMs).toISOString() : (m.event?.openDate || new Date().toISOString()),
@@ -465,81 +446,107 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
         countryCode: m.event.countryCode || null,
         openDate: m.event.openDate || (!isNaN(startMs) ? new Date(startMs).toISOString() : null),
       } : null,
-      eventType: { id: String(m.eventTypeId), name: SPORT_MAP[String(m.eventTypeId)] || 'Other' },
-      runners: (m.runners || []).map(r => ({
-        selectionId: r.id ?? r.selectionId ?? r.selection_id,
-        runnerName: r.name ?? r.runnerName ?? r.runner_name,
-        sortPriority: r.sort ?? r.sortPriority ?? r.trapNumber ?? r.clothNumber ?? 0,
-        handicap: r.hdp ?? r.handicap ?? 0,
-        // ✅ Raw runner object pass-through as metadata — Shubdx horse/
-        // greyhound runners mein jockey/trainer/silk/cloth-number jaisi
-        // details ho sakti hain kisi bhi naming convention mein. Purana
-        // Betfair-based buildOddsPayload() pehle se hi kai naming variants
-        // check karta hai (CLOTH_NUMBER/cloth_number/ClothNumber, etc.) —
-        // poora raw object bhej dene se agar Shubdx ka field naam match
-        // kare to wo turant dikhna shuru ho jayega, warna gracefully null
-        // rahega (koi crash nahi). metadataDict se raw fields dikh bhi
-        // jayenge debugging ke liye.
+      eventType: { id: eid, name: SPORT_MAP[eid] || 'Other' },
+      runners: runners.map(r => ({
+        selectionId: r.id || r.selectionId,
+        runnerName:  r.name || r.runnerName,
+        sortPriority: r.sort || r.sortPriority || 0,
+        handicap: r.hdp || 0,
         metadata: {
-          ...r,
-          CLOTH_NUMBER: r.clothNumber ?? r.cloth ?? r.CLOTH_NUMBER ?? null,
-          JOCKEY_NAME:  r.jockey      ?? r.jockeyName ?? r.JOCKEY_NAME ?? null,
-          TRAINER_NAME: r.trainer     ?? r.trainerName ?? r.TRAINER_NAME ?? null,
-          STALL_DRAW:   r.stallDraw   ?? r.stall ?? r.STALL_DRAW ?? null,
-          COLOURS_FILENAME_URL: r.silk ?? r.silkUrl ?? r.COLOURS_FILENAME_URL ?? null,
-          FORM:         r.form  ?? r.FORM ?? null,
-          AGE:          r.age   ?? r.AGE  ?? null,
+          ...r.metadata,
+          CLOTH_NUMBER: r.metadata?.CLOTH_NUMBER ?? r.clothNumber ?? r.cloth ?? null,
+          JOCKEY_NAME:  r.metadata?.JOCKEY_NAME  ?? r.jockey ?? r.jockeyName ?? null,
+          TRAINER_NAME: r.metadata?.TRAINER_NAME ?? r.trainer ?? r.trainerName ?? null,
+          STALL_DRAW:   r.metadata?.STALL_DRAW   ?? r.stallDraw ?? r.stall ?? null,
+          COLOURS_FILENAME_URL: r.metadata?.COLOURS_FILENAME_URL ?? r.silk ?? r.silkUrl ?? null,
+          COLOURS_FILENAME_BASE64: r.metadata?.COLOURS_FILENAME_BASE64 ?? null,
+          FORM: r.metadata?.FORM ?? r.form ?? null,
+          AGE:  r.metadata?.AGE  ?? r.age  ?? null,
         },
       })),
-    };
-  });
+    });
+  }
+  return resultArr;
 }
 
 // Betfair jaisa shape: [{ marketId, status, inplay, betDelay,
 //                          runners: [{selectionId, status, lastPriceTraded,
 //                                     ex: { availableToBack, availableToLay } }] }]
-//
-// ℹ️ NOTE: racing markets (horse/greyhound) ke runners listMarketCatalogue()
-// ke andar fetchOneMatch() se enrich hoke, USI cached array-object mein
-// (reference se) save ho jaate hain jo yahan fetchAllMatches() se milta
-// hai — is liye agar listMarketCatalogue() pehle call ho chuki ho (jaisa
-// getMarketCatalog2/fetchSportMarkets mein hota hai), to yahan bhi
-// runners already mil jaate hain, warna khali rahenge.
 async function listMarketBook(marketIds = [], priceProjection) {
   if (!marketIds.length) return [];
 
-  // marketIds mein se sport pata nahi hota (koi eventTypeId prefix nahi) —
-  // saare sports mein dhoondo (cache ki wajah se ye sasta hai, 4s tak reuse hoti hai)
-  const results = [];
-  for (const slug of Object.values(EVENT_TYPE_TO_SPORT_SLUG)) {
+  // marketIds mein se sport pata nahi hota — saare sports mein dhoondo
+  // Racing sports (horse/greyhound) ke liye allraces mein runners nahi hote —
+  // fetchrace (single market) se alag se fetch karna padta hai
+
+  // Step 1: allmatches/allraces se basic market info lo
+  const basicMap = new Map(); // marketId → { m, slug }
+  for (const [eid, slug] of Object.entries(EVENT_TYPE_TO_SPORT_SLUG)) {
     const list = await fetchAllMatches(slug).catch(() => []);
-    const matched = list.filter(m => marketIds.includes(m.id));
-    if (matched.length === 0) continue;
-
-    // ✅ Racing sports ke liye runners enrich karo (listMarketCatalogue()
-    // ke saath parallel chal rahi ho to bhi dono independently sahi kaam
-    // karein — dekho ensureRacingRunners() ka comment).
-    await ensureRacingRunners(matched);
-
-    matched.forEach(m => {
-      results.push({
-        marketId: m.id,
-        status: m.status || 'OPEN',
-        inplay: !!m.inPlay,
-        betDelay: m.betDelay || 0,
-        totalMatched: m.matched || 0,
-        runners: (m.runners || []).map(r => ({
-          selectionId: r.id ?? r.selectionId ?? r.selection_id,
-          status: r.status || 'ACTIVE',
-          lastPriceTraded: r.lastPriceTraded ?? r.last_price_traded ?? null,
-          ex: {
-            availableToBack: (r.back || r.backs || r.availableToBack || []).map(b => ({ price: b.price, size: b.size })),
-            availableToLay:  (r.lay  || r.lays  || r.availableToLay  || []).map(l => ({ price: l.price, size: l.size })),
-          },
-        })),
-      });
+    list.forEach(m => {
+      if (marketIds.includes(m.id) && !basicMap.has(m.id)) {
+        basicMap.set(m.id, { m, slug });
+      }
     });
-    if (results.length >= marketIds.length) break; // sab mil gaye, aage dhoondhne ki zaroorat nahi
+    if (basicMap.size >= marketIds.length) break;
+  }
+
+  // Step 2: Racing markets ke liye fetchrace se runners + odds fetch karo
+  // groupById = m.event.id (e.g. "35916518.1827")
+  const fetchraceCache = new Map(); // groupById → fetchrace result
+
+  async function getRacingMarketData(m, slug) {
+    const groupById = m.event?.id || m.groupById;
+    if (!groupById) return null;
+    if (fetchraceCache.has(groupById)) return fetchraceCache.get(groupById);
+
+    try {
+      const res = await fetchOneMatch(slug, groupById);
+      // Response: res.data.result[0] ya res.result[0]
+      const raw  = res?.data || res;
+      const item = Array.isArray(raw?.result) ? raw.result[0] : null;
+      fetchraceCache.set(groupById, item);
+      return item;
+    } catch(e) {
+      logger.warn(`[listMarketBook] fetchrace failed for ${groupById}: ${e.message}`);
+      fetchraceCache.set(groupById, null);
+      return null;
+    }
+  }
+
+  // Step 3: Build results
+  const results = [];
+  for (const [marketId, { m, slug }] of basicMap.entries()) {
+    let runners = m.runners || [];
+
+    if (isRacingSlug(slug) && runners.length === 0) {
+      // Racing: fetchrace se runners + live odds lo
+      const raceData = await getRacingMarketData(m, slug);
+      if (raceData) {
+        // Agar marketId match kare (fetchrace ka m.id)
+        runners = raceData.runners || [];
+        // Status bhi update karo
+        m.status = raceData.status || m.status;
+        m.inPlay = raceData.inPlay ?? m.inPlay;
+      }
+    }
+
+    results.push({
+      marketId: m.id,
+      status:   m.status || 'OPEN',
+      inplay:   !!m.inPlay,
+      betDelay: m.betDelay || 0,
+      totalMatched: m.matched || 0,
+      runners: runners.map(r => ({
+        selectionId:     r.id || r.selectionId,
+        status:          r.status || 'ACTIVE',
+        lastPriceTraded: r.lastPriceTraded || null,
+        ex: {
+          availableToBack: (r.back || []).map(b => ({ price: b.price, size: b.size })),
+          availableToLay:  (r.lay  || []).map(l => ({ price: l.price, size: l.size })),
+        },
+      })),
+    });
   }
   return results;
 }
