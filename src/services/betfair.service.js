@@ -4,9 +4,15 @@
    ⚠️ MIGRATION NOTICE (please read before relying on this file)
    ═══════════════════════════════════════════════════════════════════
    Ye file pehle SEEDHA Betfair API call karti thi. Ab market/odds LIST
-   Shubdx/Rollwin (rollwinpk.org) se aata hai — file ka NAAM same rakha
-   hai (betfair.service.js) taake market.controller.js aur baaki
+   Shubdx (shubdxinternational.com) se aata hai — file ka NAAM same
+   rakha hai (betfair.service.js) taake market.controller.js aur baaki
    consumers mein import paths na badalne padein.
+
+   ✅ NEW: Cricket/Football/Tennis ke liye score-card endpoint bhi add
+   kiya hai (fetchScoreCard) — https://shubdxinternational.com/score/max<Sport>
+   — future mein settlement/live-score ke liye use ho sakta hai (abhi
+   sirf function ready hai, kahin call nahi ho raha — jab result-data
+   confirm ho jaye tab autoSettle_service.js mein wire karna).
 
    FUNCTION NAMES aur RETURN SHAPES Betfair jaisi hi rakhi hain (event,
    competition, runners[].back/lay waghera) — taake existing controller
@@ -36,7 +42,7 @@ const axios  = require('axios');
 const logger = require('../utils/logger');
 const { SPORT_MAP } = require('../config/constants');
 
-const BASE_URL = process.env.SHUBDX_BASE_URL || 'https://rollwinpk.org/sports';
+const BASE_URL = process.env.SHUBDX_BASE_URL || 'https://shubdxinternational.com/sports';
 const TIMEOUT_MS = 15000;
 
 /* ── ✅ Real Betfair session/login — SETTLEMENT ke liye zinda rakha hai
@@ -269,6 +275,33 @@ async function fetchOneMatch(sportSlug, matchOrEventId) {
     return res.data;
   } catch (err) {
     logger.error(`[Shubdx] fetchOneMatch(${sportSlug}, ${matchOrEventId}) via ${endpoint} failed: ${err.message}`);
+    throw err;
+  }
+}
+
+// ✅ NEW: Score-card endpoint — Cricket/Football/Tennis ke liye.
+// URL pattern shubdxinternational.com/score/max<Sport>?event_id=<groupById>
+// Sport-naam yahan capitalized/specific hai (maxCricket/maxFootball/
+// maxTennis) — /sports/<slug>/... wale lowercase slugs se ALAG hai,
+// is liye apna khud ka mapping rakha hai.
+const SCORE_BASE_URL = process.env.SHUBDX_SCORE_BASE_URL || 'https://shubdxinternational.com/score';
+const SPORT_SLUG_TO_SCORE_PATH = {
+  cricket:  'maxCricket',
+  football: 'maxFootball',
+  tennis:   'maxTennis',
+};
+
+async function fetchScoreCard(sportSlug, eventId) {
+  const scorePath = SPORT_SLUG_TO_SCORE_PATH[sportSlug];
+  if (!scorePath) {
+    throw new Error(`fetchScoreCard: '${sportSlug}' ke liye koi score-card endpoint maloom nahi (sirf cricket/football/tennis available hain)`);
+  }
+  const url = `${SCORE_BASE_URL}/${scorePath}`;
+  try {
+    const res = await axios.get(url, { params: { event_id: eventId }, timeout: TIMEOUT_MS });
+    return res.data;
+  } catch (err) {
+    logger.error(`[Shubdx] fetchScoreCard(${sportSlug}, ${eventId}) failed: ${err.message}`);
     throw err;
   }
 }
@@ -611,4 +644,5 @@ module.exports = {
   listMarketProfitAndLoss,
   getEventDetails,
   getRunnerBook,
+  fetchScoreCard,   // ✅ NEW — abhi kahin call nahi ho raha, future settlement/live-score ke liye ready
 };
