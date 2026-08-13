@@ -10,6 +10,17 @@ const LOGIN_URL  = process.env.BETFAIR_LOGIN_URL  || 'https://identitysso.betfai
 const API_URL    = process.env.BETFAIR_API_URL     || 'https://api.betfair.com/exchange/betting/json-rpc/v1';
 const TTL_MS     = parseInt(process.env.BETFAIR_SESSION_TTL_MINUTES || '25', 10) * 60 * 1000; // Reduced to 25 mins for safety
 
+// ✅ NEW: TEMPORARY_BAN cooldown — jab Betfair "TOO_MANY_REQUESTS" bole,
+// itni der tak koi bhi naya login attempt bilkul nahi hoga (fail-fast).
+// Pehle har request fail hote hi turant agli request phir login try karti
+// thi — is continuous retry se ban baar baar RENEW ho raha tha aur kabhi
+// khatam hi nahi ho pa raha tha (2 din band rakhne ke baad bhi nahi gaya
+// — matlab har baar restart pe naya attempt ban ko phir se renew kar
+// deta tha). Ab ek dafa ban detect hone ke baad system khud 30 minute
+// (badhta hua — dekhein neeche) tak koi request hi nahi bhejega.
+const BASE_BAN_COOLDOWN_MS = parseInt(process.env.BETFAIR_BAN_COOLDOWN_MINUTES || '30', 10) * 60 * 1000;
+const MAX_BAN_COOLDOWN_MS  = parseInt(process.env.BETFAIR_MAX_BAN_COOLDOWN_MINUTES || '360', 10) * 60 * 1000; // 6 ghante cap
+
 const { SPORT_MAP } = require('../config/constants');
 
 /* ── Session cache & Lock ────────────────────────────────── */
@@ -17,7 +28,30 @@ let cachedToken = null;
 let tokenExpiry = null;
 let loginPromise = null; // Lock for concurrent requests
 
+// ✅ NEW: ban state — consecutive ban count ke saath exponential backoff
+// (1st ban -> 30 min, 2nd baar phir ban mila -> 60 min, phir 120 min...
+// 6 ghante tak cap). Agar account ko lamba/severe ban mila ho to system
+// khud zyada der ruk jayega, chhota fixed wait baar baar retry karke
+// ban ko renew nahi karega.
+let bannedUntil = null;
+let consecutiveBans = 0;
+
+function currentCooldownMs() {
+  const scaled = BASE_BAN_COOLDOWN_MS * Math.pow(2, consecutiveBans);
+  return Math.min(scaled, MAX_BAN_COOLDOWN_MS);
+}
+
 async function getSessionToken() {
+  // 0. ✅ NEW: Cooldown active ho to bilkul login try mat karo — fail-fast,
+  // Betfair ko koi request hi nahi jaati is dauran.
+  if (bannedUntil && Date.now() < bannedUntil) {
+    const waitMin = Math.ceil((bannedUntil - Date.now()) / 60000);
+    throw new Error(`Betfair temporarily banned — cooldown active, ~${waitMin} min baaki (login try nahi kiya jaa raha, is se ban renew hone se bach raha hai)`);
+  }
+  if (bannedUntil && Date.now() >= bannedUntil) {
+    bannedUntil = null; // cooldown khatam — dobara try karne do
+  }
+
   // 1. Return cached token if valid
   if (cachedToken && tokenExpiry && Date.now() < tokenExpiry) {
     return cachedToken;
@@ -46,11 +80,28 @@ async function getSessionToken() {
 
       if (res.data.status !== 'SUCCESS') {
         const errorMsg = res.data.error || 'UNKNOWN_ERROR';
-        // If banned, invalidate cache and throw
         cachedToken = null;
         tokenExpiry = null;
+
+        // ✅ NEW: ban-specific error ho to cooldown lagao (exponential
+        // backoff ke saath) — normal login-fail (galat password waghera)
+        // ke liye cooldown NAHI lagana, sirf rate-limit/ban ke liye.
+        if (String(errorMsg).includes('TEMPORARY_BAN') || String(errorMsg).includes('TOO_MANY_REQUESTS')) {
+          consecutiveBans += 1;
+          const cooldown = currentCooldownMs();
+          bannedUntil = Date.now() + cooldown;
+          logger.error(
+            `Betfair: TEMPORARY_BAN detected (${consecutiveBans}${consecutiveBans === 1 ? 'st' : consecutiveBans === 2 ? 'nd' : 'th'} baar) — ` +
+            `${Math.round(cooldown / 60000)} min ke liye login attempts ROK diye gaye. ` +
+            `Is dauran koi bhi Betfair request nahi jayegi.`
+          );
+        }
         throw new Error(`Betfair login failed: ${errorMsg}`);
       }
+
+      // ✅ Successful login — ban-tracking reset karo
+      consecutiveBans = 0;
+      bannedUntil = null;
 
       cachedToken = res.data.token;
       tokenExpiry = Date.now() + TTL_MS;
@@ -171,6 +222,18 @@ async function getRunnerBook(marketId, selectionId) {
   }
 }
 
+// ✅ NEW: kisi ko bhi check karna ho ke abhi cooldown chal raha hai ya
+// nahi (e.g. admin panel mein "Betfair rate-limited, X min baaki" dikhane ke liye)
+function getBanStatus() {
+  if (!bannedUntil || Date.now() >= bannedUntil) return { banned: false, consecutiveBans };
+  return {
+    banned: true,
+    consecutiveBans,
+    retryAfterMs: bannedUntil - Date.now(),
+    retryAt: new Date(bannedUntil).toISOString(),
+  };
+}
+
 module.exports = {
   getSessionToken,
   getEventDetails,
@@ -181,4 +244,5 @@ module.exports = {
   listMarketCatalogue,
   listMarketBook,
   listMarketProfitAndLoss,
+  getBanStatus,
 };
