@@ -268,8 +268,14 @@ async function fetchOneMatch(sportSlug, matchOrEventId) {
   const isRacing = isRacingSlug(sportSlug);
   const endpoint = isRacing ? ONE_MATCH_ENDPOINT_RACING : 'fetchmatch';
   const url      = `${BASE_URL}/${sportSlug}/${endpoint}`;
-  // Racing: param name = "raceNumber", others: "match"
-  const params   = isRacing ? { raceNumber: matchOrEventId } : { match: matchOrEventId };
+  // ✅ FIX: racing ("fetchrace") ka query param bhi "match" hai —
+  // pehle galti se "raceNumber" bhej rahe the, is liye Shubdx ka
+  // fetchrace endpoint kabhi sahi data hi nahi deta tha (chahe URL/slug
+  // sahi ho). Ab dono (team-sport "fetchmatch" aur racing "fetchrace")
+  // ke liye SAME param naam "match" use hota hai:
+  //   https://shubdxinternational.com/sports/horse/fetchrace?match=${groupById}
+  //   https://shubdxinternational.com/sports/greyhound/fetchrace?match=${groupById}
+  const params = { match: matchOrEventId };
   try {
     const res = await axios.get(url, { params, timeout: TIMEOUT_MS });
     return res.data;
