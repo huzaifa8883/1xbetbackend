@@ -20,24 +20,26 @@
    Client instruction (verbatim): "/api/ ki jagah /api1/ use karo" —
    is liye menu endpoint /api1/menu hai (docs mein /api/menu likha tha).
 
-   ⚠️ UNCONFIRMED HISSE (real sample se verify nahi hue abhi tak):
+   ⚠️ UNCONFIRMED HISSA (abhi tak real sample se verify nahi hua):
    1) /api1/menu ka EXACT response shape — sirf itna pata hai ke isse
       "eventName → matchId" milta hai (docs se). eventTypeId/competition/
       startTime jaise fields kis naam se aate hain, confirm nahi —
       is liye normalizeMenuItem() mein kai plausible field-name variants
       try kiye hain (defensive parsing), taake jo bhi shape ho crash na ho.
-   2) /data/Data ka marketBooks[].runners[] structure — docs sirf itna
-      batate hain ke "price1/size1/lay1" jaisi fields hoti hain, lekin
-      humara test empty market (Tournament Winner, not actively traded)
-      pe khaali aaya tha ("marketBooks": []) — isliye price1/price2/
-      price3 (3-level back) aur lay1/lay2/lay3 (3-level lay) ka structure
-      BEST-GUESS hai, ek active/in-play match ke real response se abhi
-      tak verify nahi hua.
 
-   ➡️ AGLA STEP: ek in-play match dhoond kar
-      curl "https://betwayinfo.com/data/Data?id=<marketId>" ka poora
-      (untruncated) response bhejna — us se ye dono cheezein pin-point
-      confirm/fix ho jayengi.
+   ✅ CONFIRMED (real in-play match, marketId=1.259466913 se):
+   2) /data/Data ka marketBooks[].runners[] structure ab confirm ho chuka
+      hai: { id, price1/2/3, size1/2/3, lay1/2/3, ls1/2/3 (← lay SIZE,
+      "laySize" nahi), status, handicap }. listMarketBook() ab isi ke
+      hisab se sahi parse karta hai. Pehle "ls1/2/3" ki jagah "laySize"/
+      "lsize" try ho raha tha (kabhi match nahi hota tha → LAY size hamesha
+      0 aata tha), aur marketBooks[0].marketStatus field ko "status"
+      samjha ja raha tha (galat naam, hamesha default 'OPEN' fallback
+      chalta tha) — dono fix ho chuke hain.
+
+   ➡️ AGLA STEP (agar kuch bacha ho): /api1/menu ka real sample bhejna
+      taake normalizeMenuItem() ki defensive-parsing guesses confirm ho
+      sakein.
    ═══════════════════════════════════════════════════════════════════ */
 
 const axios  = require('axios');
@@ -435,7 +437,11 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
       } : null,
       eventType: { id: eid, name: SPORT_MAP[eid] || 'Other' },
       runners: (runners || []).map(r => ({
-        selectionId: r.selectionId ?? r.id,
+        // ✅ Number() se normalize — Data endpoint (/data/Data) ka runner.id
+        // bhi selectionId hi hota hai, aur dono jagah consistent type
+        // (number) rakhna zaroori hai warna frontend price ko sahi runner
+        // se match hi nahi kar pata (string "47998" !== number 47998)
+        selectionId: Number(r.selectionId ?? r.id),
         runnerName:  r.runnerName ?? r.name,
         sortPriority: r.sortPriority ?? r.sort ?? 0,
         handicap: r.handicap ?? r.hdp ?? 0,
@@ -459,10 +465,16 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
 //                                     ex: { availableToBack, availableToLay } }],
 //                          scoreboard? }]  ← scoreboard sirf cricket ke liye
 //
-// ⚠️ /data/Data ka price1/size1/lay1... structure abhi tak REAL in-play
-// sample se confirm nahi hua (dekho file ke top wala notice) — best-guess
-// hai. 3 levels try karte hain (price1..3 / lay1..3), jitne bhi mile
-// utne le lete hain, extra ko chup-chaap ignore karte hain.
+// ✅ CONFIRMED (real in-play match se, marketId=1.259466913):
+//   marketBooks[0] = { id, winners, betDelay, totalMatched, marketStatus,
+//                       maxBetSize, bettingAllowed, isMarketDataDelayed,
+//                       runners:[{ id, price1..3, size1..3, lay1..3, ls1..3,
+//                                  status, handicap }], isRoot, timestamp, winnerIDs }
+//   → status field ka asal naam "marketStatus" hai (generic "status" nahi)
+//   → lay SIZE field "ls1/ls2/ls3" hai (pehle "laySize"/"lsize" try ho raha
+//     tha, jo kabhi match nahi hota tha — isi wajah se LAY size hamesha 0
+//     aata tha, aur frontend size=0 wale cells ko non-clickable/blank
+//     dikhata hai)
 async function listMarketBook(marketIds = [], priceProjection) {
   if (!marketIds.length) return [];
 
@@ -485,7 +497,8 @@ async function listMarketBook(marketIds = [], priceProjection) {
 
       return {
         marketId: id,
-        status: mb.status || 'OPEN',
+        // ✅ FIX: real field "marketStatus" hai, "status" nahi
+        status: mb.marketStatus || mb.status || 'OPEN',
         inplay: !!(mb.inplay ?? mb.inPlay),
         betDelay: mb.betDelay ?? 0,
         totalMatched: mb.totalMatched ?? mb.matched ?? 0,
@@ -494,7 +507,8 @@ async function listMarketBook(marketIds = [], priceProjection) {
           const lay  = [];
           for (let i = 1; i <= 3; i++) {
             if (r[`price${i}`] != null) back.push({ price: r[`price${i}`], size: r[`size${i}`] ?? 0 });
-            if (r[`lay${i}`]   != null) lay.push({ price: r[`lay${i}`], size: r[`laySize${i}`] ?? r[`lsize${i}`] ?? 0 });
+            // ✅ FIX: lay size ka real field "ls1/ls2/ls3" hai
+            if (r[`lay${i}`]   != null) lay.push({ price: r[`lay${i}`], size: r[`ls${i}`] ?? r[`laySize${i}`] ?? r[`lsize${i}`] ?? 0 });
           }
           // Fallback: agar price1/lay1 style fields bilkul na milen, shayad
           // Betfair-native "back"/"lay" array format bhi ho sakta hai
@@ -502,7 +516,11 @@ async function listMarketBook(marketIds = [], priceProjection) {
           const layFallback  = Array.isArray(r.lay)  ? r.lay.map(l  => ({ price: l.price, size: l.size }))  : [];
 
           return {
-            selectionId: r.selectionId ?? r.id,
+            // ✅ FIX: catalog2 ke selectionId se type-consistent rakhne ke
+            // liye Number() — warna frontend price ko runner se match hi
+            // nahi kar pata (string vs number mismatch se dono BACK aur
+            // LAY khaali/blank dikhte hain)
+            selectionId: Number(r.selectionId ?? r.id),
             status: r.status || 'ACTIVE',
             lastPriceTraded: r.lastPriceTraded ?? r.ltp ?? null,
             ex: {
