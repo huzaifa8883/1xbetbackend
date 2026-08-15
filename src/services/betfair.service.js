@@ -215,17 +215,30 @@ const SPORT_NAME_TO_EVENT_TYPE = Object.fromEntries(
 );
 
 /* ── /api1/menu — cache (baar baar poori list na maangi jaaye) ────── */
-const _menuCache = { data: null, expiresAt: 0 };
+// ✅ TEST: pehle sirf ek unfiltered call hoti thi (jisme horse/greyhound
+// kabhi nahi aate the). Ab agar eventTypeId diya jaye to usay query param
+// ke taur par bhi bhejte hain — ho sakta hai server sirf tab racing
+// include kare jab explicitly maanga jaye. Har eventTypeId (aur "sab")
+// ka apna cache-slot hai taake football/cricket/tennis ka existing
+// (working) unfiltered-call flow bilkul na chhide.
+const _menuCache = new Map(); // key: eventTypeId || '__all__'  →  { data, expiresAt }
 const MENU_CACHE_TTL_MS = parseInt(process.env.BETWAY_MENU_CACHE_TTL_MS || '5000', 10);
 
-async function fetchMenu() {
-  if (_menuCache.data && Date.now() < _menuCache.expiresAt) return _menuCache.data;
+async function fetchMenu(eventTypeId = null) {
+  const cacheKey = eventTypeId ? String(eventTypeId) : '__all__';
+  const cached = _menuCache.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt) return cached.data;
 
   // ✅ Client instruction: docs mein "/api/menu" likha tha, lekin
   // client ne kaha "/api/ ki jagah /api1/ use karo" — is liye:
   const url = `${BASE_URL}/api1/menu`;
+  // 🧪 TEST: eventTypeId diya ho to query param mein bhi bhejo (kai
+  // possible naam try karte hain — jo bhi server samjhe)
+  const params = eventTypeId
+    ? { eventTypeId, sportId: eventTypeId, sport: eventTypeId }
+    : undefined;
   try {
-    const res = await axios.get(url, { timeout: TIMEOUT_MS });
+    const res = await axios.get(url, { params, timeout: TIMEOUT_MS });
     const raw = res.data;
     // ⚠️ Exact shape unconfirmed — kai plausible variants try karte hain
     // (Rollwin migration mein bhi isi tarah defensive parsing kaam aayi thi)
@@ -237,15 +250,30 @@ async function fetchMenu() {
                 : Array.isArray(raw?.menu)          ? raw.menu
                 : [];
 
-    if (!items.length) {
-      logger.warn(`[BetwayInfo] menu — 0 items mile. Response top-level keys: ${JSON.stringify(Object.keys(raw || {}))}`);
+    // 🧪 TEST LOG: eventTypeId 7/4339 ke liye kya mila — dono cases
+    // clearly dikhao (kitne items aaye, aur unme se kitne genuinely
+    // horse/greyhound the vs sirf same purana unfiltered response wapas
+    // aa gaya)
+    if (eventTypeId === '7' || eventTypeId === '4339' || String(eventTypeId) === '7' || String(eventTypeId) === '4339') {
+      const matchingCount = items.filter(it => {
+        const etid = String(it.eventTypeId ?? it.eventtypeid ?? it.sportId ?? it.sport_id ?? '');
+        return etid === String(eventTypeId);
+      }).length;
+      logger.warn(
+        `[BetwayInfo][TEST] menu?eventTypeId=${eventTypeId} → ${items.length} total items, ` +
+        `${matchingCount} match this eventTypeId. ` +
+        `Sample eventTypeIds seen: ${JSON.stringify([...new Set(items.slice(0, 50).map(it => it.eventTypeId ?? it.eventtypeid ?? it.sportId ?? '?'))])}`
+      );
     }
 
-    _menuCache.data = items;
-    _menuCache.expiresAt = Date.now() + MENU_CACHE_TTL_MS;
+    if (!items.length) {
+      logger.warn(`[BetwayInfo] menu(eventTypeId=${eventTypeId || 'none'}) — 0 items mile. Response top-level keys: ${JSON.stringify(Object.keys(raw || {}))}`);
+    }
+
+    _menuCache.set(cacheKey, { data: items, expiresAt: Date.now() + MENU_CACHE_TTL_MS });
     return items;
   } catch (err) {
-    logger.error(`[BetwayInfo] menu (${url}) fetch failed: ${err.message}`);
+    logger.error(`[BetwayInfo] menu (${url}, eventTypeId=${eventTypeId || 'none'}) fetch failed: ${err.message}`);
     throw err;
   }
 }
@@ -288,9 +316,25 @@ function normalizeMenuItem(raw) {
 }
 
 async function sportItems(eventTypeId) {
-  const menu = await fetchMenu();
-  const items = menu.map(normalizeMenuItem).filter(m => m.id);
-  return eventTypeId ? items.filter(m => m.eventTypeId === String(eventTypeId)) : items;
+  if (!eventTypeId) {
+    const menu = await fetchMenu();
+    return menu.map(normalizeMenuItem).filter(m => m.id);
+  }
+
+  // 🧪 TEST (horse=7 / greyhound=4339 ke liye): pehle eventTypeId-scoped
+  // call try karo (ho sakta hai server sirf tab racing include kare).
+  // Agar wo khaali aaye, unfiltered list se client-side filter karke
+  // bhi dekh lo — dono results server logs mein already log ho chuke
+  // honge (fetchMenu() ke andar).
+  let menu = await fetchMenu(eventTypeId).catch(() => []);
+  let items = menu.map(normalizeMenuItem).filter(m => m.id && m.eventTypeId === String(eventTypeId));
+
+  if (!items.length) {
+    const allMenu = await fetchMenu(null).catch(() => []);
+    items = allMenu.map(normalizeMenuItem).filter(m => m.id && m.eventTypeId === String(eventTypeId));
+  }
+
+  return items;
 }
 
 /* ── Public helpers (Betfair-shaped — market.controller.js ke liye) ── */
