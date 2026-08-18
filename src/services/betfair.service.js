@@ -20,36 +20,23 @@
    Client instruction (verbatim): "/api/ ki jagah /api1/ use karo" —
    is liye menu endpoint /api1/menu hai (docs mein /api/menu likha tha).
 
-   ⚠️ UNCONFIRMED HISSA (abhi tak real sample se verify nahi hua):
-   1) /api1/menu ka EXACT response shape — sirf itna pata hai ke isse
-      "eventName → matchId" milta hai (docs se). eventTypeId/competition/
-      startTime jaise fields kis naam se aate hain, confirm nahi —
-      is liye normalizeMenuItem() mein kai plausible field-name variants
-      try kiye hain (defensive parsing), taake jo bhi shape ho crash na ho.
+   ✅ CONFIRMED /api1/menu shape:
+      { eventTypeId, eventTypeName, competitionId, competitionName,
+        eventid, eventname, openDate, marketId, status, inPlay }
+      → Menu SIRF primary market (Match Odds) deta hai per event.
 
    ✅ CONFIRMED (real in-play match, marketId=1.259466913 se):
-   2) /data/Data ka marketBooks[].runners[] structure ab confirm ho chuka
-      hai: { id, price1/2/3, size1/2/3, lay1/2/3, ls1/2/3 (← lay SIZE,
-      "laySize" nahi), status, handicap }. listMarketBook() ab isi ke
-      hisab se sahi parse karta hai. Pehle "ls1/2/3" ki jagah "laySize"/
-      "lsize" try ho raha tha (kabhi match nahi hota tha → LAY size hamesha
-      0 aata tha), aur marketBooks[0].marketStatus field ko "status"
-      samjha ja raha tha (galat naam, hamesha default 'OPEN' fallback
-      chalta tha) — dono fix ho chuke hain.
+      /data/Data ka marketBooks[].runners[] structure:
+      { id, price1/2/3, size1/2/3, lay1/2/3, ls1/2/3 (← lay SIZE),
+        status, handicap }. marketStatus field (generic "status" nahi).
 
-   ➡️ AGLA STEP (agar kuch bacha ho): /api1/menu ka real sample bhejna
-      taake normalizeMenuItem() ki defensive-parsing guesses confirm ho
-      sakein.
-
-   ⚠️ UPDATE (3rd migration): PRIMARY listing source ab /api1/menu nahi,
-      /api1/markethighlights hai (featured/in-play + upcoming active
-      matches — homepage instantly load hoti hai, empty catalog nahi
-      dikhta). /api1/menu ab sirf FALLBACK hai jab highlights khaali ho
-      ya fail ho jaaye. Dono cached hain (BETWAY_HIGHLIGHTS_CACHE_TTL_MS
-      / BETWAY_MENU_CACHE_TTL_MS, default 5s). listCompetitions(),
-      listEvents(), listMarketCatalogue() sab sportItems() se hi data
-      lete hain, jo highlights→menu fallback chain khud handle karta
-      hai — un functions mein koi change nahi karna pada.
+   ✅ RELATED MARKETS (Match Odds ke alawa):
+      Menu ek hi marketId deta hai. Sibling markets sequential IDs par
+      hain (seed, seed+1, …). expandRelatedMarkets() /data/catalogs batch
+      (+ /data/catalog2 fallback) se same-eventId markets nikaalta hai:
+      Over/Under, Correct Score, Half Time, Double Chance, Tied Match,
+      Goal Lines, Fancy, Bookmaker, etc. listMarketCatalogue ab ye saari
+      markets return karta hai (sirf Match Odds nahi).
    ═══════════════════════════════════════════════════════════════════ */
 
 const axios  = require('axios');
@@ -288,15 +275,19 @@ async function fetchMenu(eventTypeId = null) {
   }
 }
 
-// ⚠️ UNCONFIRMED field-names — real /api1/menu sample milte hi verify/fix karo.
+// ✅ CONFIRMED /api1/menu shape (real sample):
+//   { eventTypeId, eventTypeName, competitionId, competitionName,
+//     eventid, eventname, openDate, marketId, status, inPlay }
 function normalizeMenuItem(raw) {
   const eventTypeId = String(
     raw.eventTypeId ?? raw.eventtypeid ?? raw.sportId ?? raw.sport_id ??
-    raw.eventType?.id ?? (raw.sport ? SPORT_NAME_TO_EVENT_TYPE[String(raw.sport).toLowerCase()] : '') ?? ''
+    raw.eventType?.id ?? (raw.sport ? SPORT_NAME_TO_EVENT_TYPE[String(raw.sport).toLowerCase()] : '') ??
+    (raw.eventTypeName ? SPORT_NAME_TO_EVENT_TYPE[String(raw.eventTypeName).toLowerCase()] : '') ?? ''
   );
 
   const marketId  = raw.marketId ?? raw.market_id ?? raw.matchId ?? raw.match_id ?? raw.id;
-  const eventIdRaw = raw.eventId ?? raw.event_id ?? raw.event?.id ?? raw.groupById ?? marketId;
+  // menu uses lowercase "eventid" / "eventname"
+  const eventIdRaw = raw.eventid ?? raw.eventId ?? raw.event_id ?? raw.event?.id ?? raw.groupById ?? marketId;
   const eventId    = String(eventIdRaw);
   const eventName  = raw.eventname ?? raw.eventName ?? raw.event?.name ?? raw.name ?? raw.matchName ?? 'Unknown';
 
@@ -309,6 +300,7 @@ function normalizeMenuItem(raw) {
   return {
     id: marketId != null ? String(marketId) : null,
     name: raw.marketName ?? raw.market_name ?? 'Match Odds',
+    marketType: raw.marketType ?? 'MATCH_ODDS',
     start: startRaw,
     eventTypeId,
     inPlay: !!(raw.inPlay ?? raw.inplay ?? raw.in_play),
@@ -321,11 +313,11 @@ function normalizeMenuItem(raw) {
       venue: raw.venue ?? null,
       openDate: startRaw,
     },
-    runners: Array.isArray(raw.runners) ? raw.runners : [], // menu shayad runners na de — /data/catalogs se milenge
+    runners: Array.isArray(raw.runners) ? raw.runners : [], // menu runners nahi deta — /data/catalogs se milenge
   };
 }
 
-async function menuItems(eventTypeId) {
+async function sportItems(eventTypeId) {
   if (!eventTypeId) {
     const menu = await fetchMenu();
     return menu.map(normalizeMenuItem).filter(m => m.id);
@@ -345,189 +337,6 @@ async function menuItems(eventTypeId) {
   }
 
   return items;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   ✅ NEW PRIMARY SOURCE — /api1/markethighlights
-   ═══════════════════════════════════════════════════════════════════
-   Highlights endpoint featured/in-play + upcoming active matches deta
-   hai — /api1/menu se zyada "curated" hai, is liye ab primary source
-   yahi hai. /api1/menu ab sirf FALLBACK hai (agar highlights khaali
-   ho ya fail ho jaaye).
-
-   ⚠️ Exact response shape bhi unconfirmed hai (jaisa menu ke saath tha),
-   is liye normalizeHighlightItem() bhi defensive parsing karta hai —
-   dono flat shape ("[{marketId,...}]") aur nested shape
-   ("[{eventId, event:{...}, markets:[{marketId,...}, ...]}]") dono
-   handle karta hai (flattenHighlightEntries() se).
-   ═══════════════════════════════════════════════════════════════════ */
-const _highlightsCache = new Map(); // key: eventTypeId || '__all__' → { data, expiresAt }
-const HIGHLIGHTS_CACHE_TTL_MS = parseInt(process.env.BETWAY_HIGHLIGHTS_CACHE_TTL_MS || '5000', 10);
-
-async function fetchHighlights(eventTypeId = null) {
-  const cacheKey = eventTypeId ? String(eventTypeId) : '__all__';
-  const cached = _highlightsCache.get(cacheKey);
-  if (cached && Date.now() < cached.expiresAt) return cached.data;
-
-  const url = `${BASE_URL}/api1/markethighlights`;
-  const params = eventTypeId
-    ? { eventTypeId, sportId: eventTypeId, sport: eventTypeId }
-    : undefined;
-
-  try {
-    const res = await axios.get(url, { params, timeout: TIMEOUT_MS });
-    const raw = res.data;
-    // ⚠️ Unconfirmed shape — same defensive-parsing pattern as fetchMenu()
-    const items = Array.isArray(raw)                ? raw
-                : Array.isArray(raw?.data)           ? raw.data
-                : Array.isArray(raw?.result)         ? raw.result
-                : Array.isArray(raw?.data?.result)   ? raw.data.result
-                : Array.isArray(raw?.markets)        ? raw.markets
-                : Array.isArray(raw?.highlights)     ? raw.highlights
-                : Array.isArray(raw?.events)         ? raw.events
-                : Array.isArray(raw?.data?.markets)  ? raw.data.markets
-                : [];
-
-    if (!items.length) {
-      logger.warn(
-        `[BetwayInfo] markethighlights(eventTypeId=${eventTypeId || 'none'}) — 0 items mile. ` +
-        `Response top-level keys: ${JSON.stringify(Object.keys(raw || {}))}`
-      );
-    }
-
-    // Sirf successful (even if empty) responses cache karo — taake ek
-    // real "abhi koi highlight nahi hai" result 5s ke liye repeat na ho,
-    // lekin ek transient error cache na ho jaaye (neeche catch cache
-    // set nahi karta, is liye agli call turant retry karegi).
-    _highlightsCache.set(cacheKey, { data: items, expiresAt: Date.now() + HIGHLIGHTS_CACHE_TTL_MS });
-    return items;
-  } catch (err) {
-    logger.error(`[BetwayInfo] markethighlights (${url}, eventTypeId=${eventTypeId || 'none'}) fetch failed: ${err.message}`);
-    return [];
-  }
-}
-
-// Highlights feed possibly event-grouped ho ("event" + nested "markets"
-// array) instead of flat per-market entries jaisa /api1/menu deta hai.
-// Isko normalize se pehle flatten karte hain taake normalizeHighlightItem()
-// har market ke liye ek consistent flat object dekhe.
-function flattenHighlightEntries(rawItems) {
-  const flat = [];
-  (rawItems || []).forEach(entry => {
-    if (!entry || typeof entry !== 'object') return;
-    const marketsArr = Array.isArray(entry.markets) ? entry.markets
-                      : Array.isArray(entry.market)  ? entry.market
-                      : null;
-
-    if (marketsArr && marketsArr.length) {
-      marketsArr.forEach(mkt => flat.push({ ...entry, ...mkt, _highlightParent: entry }));
-    } else {
-      flat.push(entry);
-    }
-  });
-  return flat;
-}
-
-// ⚠️ UNCONFIRMED field-names — real /api1/markethighlights sample milte hi
-// verify/fix karo (same caveat jo normalizeMenuItem() ke liye hai).
-function normalizeHighlightItem(raw) {
-  const parent = raw._highlightParent || raw;
-
-  const eventTypeId = String(
-    raw.eventTypeId ?? raw.eventtypeid ?? raw.sportId ?? raw.sport_id ??
-    raw.eventType?.id ?? parent.eventTypeId ?? parent.eventType?.id ??
-    (raw.sport ? SPORT_NAME_TO_EVENT_TYPE[String(raw.sport).toLowerCase()] : '') ?? ''
-  );
-
-  const marketId   = raw.marketId ?? raw.market_id ?? raw.matchId ?? raw.match_id ?? raw.id;
-  const eventIdRaw = raw.eventId ?? raw.event_id ?? raw.event?.id ?? parent.eventId ?? parent.id ?? marketId;
-  const eventId    = String(eventIdRaw);
-  const eventName  = raw.eventname ?? raw.eventName ?? raw.event?.name ?? parent.eventName ?? parent.name ?? raw.name ?? raw.matchName ?? 'Unknown';
-
-  const compId   = raw.competitionId ?? raw.competition_id ?? raw.competition?.id ?? parent.competitionId ?? parent.competition?.id ?? null;
-  const compName = raw.competitionName ?? raw.competition_name ?? raw.competition?.name ?? parent.competition?.name ?? raw.league ?? null;
-  const competition = compId ? { id: String(compId), name: compName || 'Unknown League' } : null;
-
-  const startRaw = raw.marketStartTime ?? raw.startTime ?? raw.start_time ?? raw.start ?? raw.openDate
-                 ?? parent.startTime ?? parent.openDate ?? null;
-
-  // Highlights endpoint ka poora point hi in-play/featured matches upar
-  // laana hai — is liye inPlay flag ko defensively kai naamon se parse
-  // karte hain (parent-level bhi check karte hain, kyunki kabhi kabhi
-  // "live" flag event-level pe hota hai, market-level pe nahi).
-  const inPlay = !!(
-    raw.inPlay ?? raw.inplay ?? raw.in_play ?? raw.isInPlay ??
-    raw.live ?? raw.isLive ??
-    parent.inPlay ?? parent.inplay ?? parent.live ?? parent.isLive ?? false
-  );
-
-  return {
-    id: marketId != null ? String(marketId) : null,
-    name: raw.marketName ?? raw.market_name ?? 'Match Odds',
-    start: startRaw,
-    eventTypeId,
-    inPlay,
-    matched: raw.totalMatched ?? raw.matched ?? 0,
-    competition,
-    event: {
-      id: eventId,
-      name: eventName,
-      countryCode: raw.countryCode ?? parent.countryCode ?? null,
-      venue: raw.venue ?? parent.venue ?? null,
-      openDate: startRaw,
-    },
-    runners: Array.isArray(raw.runners) ? raw.runners
-           : Array.isArray(parent.runners) ? parent.runners
-           : [],
-  };
-}
-
-// In-play matches pehle, phir jo jald shuru honge — homepage/featured
-// listing ke liye sabse useful order (highlights endpoint ka poora
-// maqsad hi ye hai ke "abhi kya chal raha hai" upar dikhe).
-function sortHighlighted(items) {
-  return items.slice().sort((a, b) => {
-    if (a.inPlay !== b.inPlay) return a.inPlay ? -1 : 1;
-    const aMs = a.start != null ? new Date(a.start).getTime() : Infinity;
-    const bMs = b.start != null ? new Date(b.start).getTime() : Infinity;
-    return (isNaN(aMs) ? Infinity : aMs) - (isNaN(bMs) ? Infinity : bMs);
-  });
-}
-
-async function highlightItems(eventTypeId) {
-  const raw = await fetchHighlights(eventTypeId).catch(() => []);
-  let items = flattenHighlightEntries(raw).map(normalizeHighlightItem).filter(m => m.id);
-  if (eventTypeId) items = items.filter(m => m.eventTypeId === String(eventTypeId));
-
-  // Same "unfiltered + client-side filter" retry jo fetchMenu() mein hai —
-  // ho sakta hai eventTypeId-scoped call server-side support na ho.
-  if (eventTypeId && !items.length) {
-    const allRaw = await fetchHighlights(null).catch(() => []);
-    items = flattenHighlightEntries(allRaw).map(normalizeHighlightItem)
-      .filter(m => m.id && m.eventTypeId === String(eventTypeId));
-  }
-
-  return sortHighlighted(items);
-}
-
-/* ── sportItems(): unified entry point — markethighlights PRIMARY,
-   /api1/menu FALLBACK (sirf tab jab highlights khaali/fail ho) ────── */
-async function sportItems(eventTypeId) {
-  try {
-    const highlighted = await highlightItems(eventTypeId);
-    if (highlighted.length) return highlighted;
-    logger.warn(
-      `[BetwayInfo] markethighlights khaali (eventTypeId=${eventTypeId || 'none'}) — ` +
-      `/api1/menu par fallback ho raha hai.`
-    );
-  } catch (err) {
-    logger.error(
-      `[BetwayInfo] markethighlights fetch mein exception (eventTypeId=${eventTypeId || 'none'}): ` +
-      `${err.message} — /api1/menu par fallback ho raha hai.`
-    );
-  }
-
-  return menuItems(eventTypeId);
 }
 
 /* ── Public helpers (Betfair-shaped — market.controller.js ke liye) ── */
@@ -617,82 +426,320 @@ async function fetchCatalogsBatch(marketIds) {
   }
 }
 
+/* ── Related markets expansion ───────────────────────────────────────
+   Menu sirf primary market (Match Odds) deta hai. Baaki markets
+   (Over/Under, Correct Score, Half Time, Tied Match, Bookmaker, Fancy…)
+   same event ke sequential marketIds par hote hain.
+
+   Strategy: seed Match Odds id se ± range ke candidates banao →
+   /data/catalogs batch se fetch → sirf wahi rakho jinka eventId seed
+   se match kare aur marketName valid ho ("Unable to load" drop).
+
+   /data/catalog2 single-market deep metadata ke liye fallback hai.
+   ─────────────────────────────────────────────────────────────────── */
+const RELATED_MARKET_RANGE = parseInt(process.env.BETWAY_RELATED_MARKET_RANGE || '40', 10);
+const RELATED_BATCH_SIZE   = parseInt(process.env.BETWAY_RELATED_BATCH_SIZE || '40', 10);
+const _relatedCache = new Map(); // seedMarketId → { items: NormalizedItem[], expiresAt }
+const RELATED_CACHE_TTL_MS = parseInt(process.env.BETWAY_RELATED_CACHE_TTL_MS || '15000', 10);
+
+function parseMarketIdNumeric(marketId) {
+  // Betfair style "1.259658661" → { prefix: "1.", num: 259658661 }
+  const s = String(marketId || '');
+  const m = s.match(/^(\d+\.)(\d+)$/);
+  if (!m) return null;
+  return { prefix: m[1], num: parseInt(m[2], 10) };
+}
+
+function catalogToMenuItem(cat, fallbackEventTypeId = '') {
+  if (!cat) return null;
+  const marketId = cat.marketId ?? cat.market_id ?? cat.id;
+  if (marketId == null) return null;
+  const name = cat.marketName ?? cat.market_name ?? '';
+  if (!name || /unable to load/i.test(name)) return null;
+
+  const eventId = String(cat.eventId ?? cat.event_id ?? cat.event?.id ?? '');
+  const eventName = cat.eventName ?? cat.event_name ?? cat.event?.name ?? 'Unknown';
+  const eventTypeId = String(
+    cat.eventTypeId ?? cat.eventtypeid ?? cat.sport?.id ?? fallbackEventTypeId ?? ''
+  );
+  const compId = cat.competitionId ?? cat.competition_id ?? cat.competition?.id ?? null;
+  const compName = cat.competitionName ?? cat.competition_name ?? cat.competition?.name ?? null;
+  const startRaw = cat.marketStartTime ?? cat.marketStartTimeUtc ?? cat.startTime ?? null;
+
+  return {
+    id: String(marketId),
+    name,
+    marketType: cat.marketType ?? cat.market_type ?? null,
+    start: startRaw,
+    eventTypeId,
+    inPlay: !!(cat.inPlay ?? cat.inplay),
+    matched: cat.totalMatched ?? cat.matched ?? 0,
+    competition: compId ? { id: String(compId), name: compName || 'Unknown League' } : null,
+    event: {
+      id: eventId,
+      name: eventName,
+      countryCode: cat.countryCode ?? null,
+      venue: cat.venue ?? null,
+      openDate: startRaw,
+    },
+    runners: Array.isArray(cat.runners) ? cat.runners : [],
+    // raw catalog keep for listMarketCatalogue enrichment
+    _catalog: cat,
+  };
+}
+
+/**
+ * Seed Match Odds marketId se related markets expand karo.
+ * Returns array of normalize-style items (including the seed itself).
+ */
+async function expandRelatedMarkets(seedMarketId, seedEventId = null, seedEventTypeId = '') {
+  if (!seedMarketId) return [];
+
+  const cacheKey = String(seedMarketId);
+  const cached = _relatedCache.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt) return cached.items;
+
+  const parsed = parseMarketIdNumeric(seedMarketId);
+  if (!parsed) {
+    // Non-standard id — sirf seed hi try karo via catalog2
+    try {
+      const url = `${BASE_URL}/data/catalog2`;
+      const res = await axios.get(url, { params: { id: seedMarketId }, timeout: TIMEOUT_MS });
+      const item = catalogToMenuItem(res.data, seedEventTypeId);
+      const items = item ? [item] : [];
+      _relatedCache.set(cacheKey, { items, expiresAt: Date.now() + RELATED_CACHE_TTL_MS });
+      return items;
+    } catch (err) {
+      logger.warn(`[BetwayInfo] catalog2 seed=${seedMarketId} failed: ${err.message}`);
+      return [];
+    }
+  }
+
+  // Candidates: seed, seed+1 ... seed+(RANGE-1)
+  const candidateIds = [];
+  for (let i = 0; i < RELATED_MARKET_RANGE; i++) {
+    candidateIds.push(`${parsed.prefix}${parsed.num + i}`);
+  }
+
+  const allCats = {};
+  // Batch in chunks
+  for (let i = 0; i < candidateIds.length; i += RELATED_BATCH_SIZE) {
+    const chunk = candidateIds.slice(i, i + RELATED_BATCH_SIZE);
+    const map = await fetchCatalogsBatch(chunk);
+    Object.assign(allCats, map);
+  }
+
+  // Agar batch se kuch nahi mila, single catalog2 fallback on seed
+  if (!Object.keys(allCats).length) {
+    try {
+      const res = await axios.get(`${BASE_URL}/data/catalog2`, {
+        params: { id: seedMarketId },
+        timeout: TIMEOUT_MS,
+      });
+      if (res.data) allCats[String(seedMarketId)] = res.data;
+    } catch (err) {
+      logger.warn(`[BetwayInfo] catalog2 fallback seed=${seedMarketId}: ${err.message}`);
+    }
+  }
+
+  const targetEventId = seedEventId != null ? String(seedEventId) : null;
+  const items = [];
+  const seen = new Set();
+
+  // Prefer order by marketId numeric
+  const orderedIds = Object.keys(allCats).sort((a, b) => {
+    const pa = parseMarketIdNumeric(a);
+    const pb = parseMarketIdNumeric(b);
+    if (pa && pb) return pa.num - pb.num;
+    return a.localeCompare(b);
+  });
+
+  for (const mid of orderedIds) {
+    const cat = allCats[mid];
+    const item = catalogToMenuItem(cat, seedEventTypeId);
+    if (!item || seen.has(item.id)) continue;
+    // Same event filter (jab seed eventId pata ho)
+    if (targetEventId && item.event?.id && item.event.id !== targetEventId) continue;
+    // Agar eventId missing on seed, seed ke eventId se lock kar lo pehle valid item se
+    seen.add(item.id);
+    items.push(item);
+  }
+
+  // Ensure seed itself is present even if catalogs skipped it
+  if (!seen.has(String(seedMarketId)) && allCats[String(seedMarketId)]) {
+    const item = catalogToMenuItem(allCats[String(seedMarketId)], seedEventTypeId);
+    if (item) items.unshift(item);
+  }
+
+  _relatedCache.set(cacheKey, { items, expiresAt: Date.now() + RELATED_CACHE_TTL_MS });
+  logger.info(
+    `[BetwayInfo] expandRelated seed=${seedMarketId} → ${items.length} markets` +
+    (items.length ? ` (${items.map(i => i.name).slice(0, 8).join(', ')}${items.length > 8 ? '…' : ''})` : '')
+  );
+  return items;
+}
+
+/**
+ * Kai seed (Match Odds) markets ke liye related expand + dedupe.
+ */
+async function expandAllRelated(seedItems) {
+  if (!seedItems.length) return [];
+  const results = await Promise.all(
+    seedItems.map(s =>
+      expandRelatedMarkets(s.id, s.event?.id, s.eventTypeId).catch(err => {
+        logger.warn(`[BetwayInfo] expand failed for ${s.id}: ${err.message}`);
+        return [s]; // fallback: kam az kam seed hi
+      })
+    )
+  );
+  const byId = new Map();
+  results.flat().forEach(m => {
+    if (m?.id && !byId.has(m.id)) byId.set(m.id, m);
+  });
+  return Array.from(byId.values());
+}
+
 // Betfair jaisa shape: [{ marketId, marketName, marketStartTime, totalMatched,
 //                          competition, event, eventType, runners:[{selectionId, runnerName, sortPriority}] }]
+//
+// ✅ Match Odds ke alawa related markets bhi: menu sirf primary (Match Odds)
+// deta hai. expandRelatedMarkets() seed id se sequential /data/catalogs
+// (aur zarurat par /data/catalog2) se Over/Under, Correct Score, Half Time,
+// Tied Match, Fancy, Bookmaker wagaira nikaalta hai.
 async function listMarketCatalogue(filter = {}, maxResults = '20', marketProjection) {
   const eventTypeId = filter?.eventTypeIds?.[0];
-  let items = [];
+  let seedItems = [];
 
   if (eventTypeId) {
-    items = await sportItems(eventTypeId);
+    seedItems = await sportItems(eventTypeId);
   } else if (filter?.marketIds?.length || filter?.eventIds?.length) {
     // Sport pata nahi — poori menu list mein se dhoondo
     const all = await sportItems(null);
     if (filter?.marketIds?.length) {
       const ids = filter.marketIds.map(String);
-      items = all.filter(m => ids.includes(m.id));
+      seedItems = all.filter(m => ids.includes(m.id));
     } else if (filter?.eventIds?.length) {
       const ids = filter.eventIds.map(String);
-      items = all.filter(m => ids.includes(m.event?.id));
+      seedItems = all.filter(m => ids.includes(m.event?.id));
     }
   }
 
   if (filter?.eventIds?.length) {
     const ids = filter.eventIds.map(String);
-    items = items.filter(m => ids.includes(m.event?.id));
+    seedItems = seedItems.filter(m => ids.includes(m.event?.id));
   }
-  if (filter?.marketIds?.length) {
-    const ids = filter.marketIds.map(String);
-    items = items.filter(m => ids.includes(m.id));
+
+  // marketIds filter: agar user specific market maang raha hai to seed
+  // ke taur par unhe use karo (expand unke event ke related bhi de sakta hai
+  // jab eventIds na hon — lekin strict marketIds hone par sirf wahi return).
+  const strictMarketIds = filter?.marketIds?.length ? filter.marketIds.map(String) : null;
+
+  if (strictMarketIds && !filter?.eventIds?.length && !eventTypeId) {
+    // Direct market id lookup — menu mein na mile to catalog2/catalogs se lao
+    const fromMenu = seedItems.filter(m => strictMarketIds.includes(m.id));
+    const missing = strictMarketIds.filter(id => !fromMenu.some(m => m.id === id));
+    if (missing.length) {
+      const map = await fetchCatalogsBatch(missing);
+      for (const id of missing) {
+        const cat = map[id];
+        if (cat) {
+          const item = catalogToMenuItem(cat);
+          if (item) fromMenu.push(item);
+        } else {
+          // single catalog2 fallback
+          try {
+            const res = await axios.get(`${BASE_URL}/data/catalog2`, {
+              params: { id },
+              timeout: TIMEOUT_MS,
+            });
+            const item = catalogToMenuItem(res.data);
+            if (item) fromMenu.push(item);
+          } catch (_) { /* ignore */ }
+        }
+      }
+    }
+    seedItems = fromMenu;
+  }
+
+  // ✅ Related markets expand (Match Odds → saari sibling markets)
+  // Agar strict marketIds + koi event/sport filter nahi, to expand mat karo
+  // (user ne exact ids maangi hain). Warna event/sport listing mein saari markets lao.
+  let items;
+  if (strictMarketIds && !filter?.eventIds?.length && !eventTypeId) {
+    items = seedItems;
+  } else {
+    // Unique seeds by event (ek event ka ek Match Odds seed kaafi)
+    const seedByEvent = new Map();
+    seedItems.forEach(s => {
+      const eid = s.event?.id || s.id;
+      if (!seedByEvent.has(eid)) seedByEvent.set(eid, s);
+    });
+    items = await expandAllRelated(Array.from(seedByEvent.values()));
+  }
+
+  if (strictMarketIds) {
+    items = items.filter(m => strictMarketIds.includes(m.id));
+  }
+  if (filter?.eventIds?.length) {
+    const ids = filter.eventIds.map(String);
+    items = items.filter(m => ids.includes(m.event?.id));
   }
 
   const sliced = items.slice(0, parseInt(maxResults, 10) || 20);
   if (!sliced.length) return [];
 
-  // ✅ /data/catalog2 (single) ki jagah /data/catalogs (batch) use karo —
-  // ek hi HTTP call mein saare markets ki details mil jaati hain (docs
-  // mein explicitly "optimized endpoint for fetching metadata for
-  // multiple related markets" likha hai).
-  const catalogMap = await fetchCatalogsBatch(sliced.map(m => m.id));
+  // Catalogs batch — jo expand se _catalog nahi aaya unke liye
+  const needFetch = sliced.filter(m => !m._catalog).map(m => m.id);
+  const catalogMap = needFetch.length ? await fetchCatalogsBatch(needFetch) : {};
 
   return sliced.map(m => {
-    const cat = catalogMap[m.id] || {};
+    const cat = m._catalog || catalogMap[m.id] || {};
     const runners = Array.isArray(cat.runners) ? cat.runners : m.runners;
     const startMs = m.start != null ? new Date(m.start).getTime() : NaN;
-    const eid = String(m.eventTypeId || eventTypeId || '');
+    const eid = String(m.eventTypeId || eventTypeId || cat.eventTypeId || '');
 
     return {
       marketId: m.id,
       marketName: cat.marketName || cat.market_name || m.name,
+      marketType: cat.marketType || m.marketType || null,
       marketStartTime: !isNaN(startMs) ? new Date(startMs).toISOString() : (m.event?.openDate || new Date().toISOString()),
-      totalMatched: m.matched || 0,
-      competition: m.competition ? { id: m.competition.id, name: m.competition.name } : null,
+      totalMatched: m.matched || cat.totalMatched || 0,
+      competition: m.competition ? { id: m.competition.id, name: m.competition.name } : (
+        cat.competitionId ? { id: String(cat.competitionId), name: cat.competitionName || 'Unknown League' } : null
+      ),
       event: m.event ? {
         id: m.event.id, name: m.event.name,
-        countryCode: m.event.countryCode || null,
+        countryCode: m.event.countryCode || cat.countryCode || null,
         openDate: m.event.openDate || (!isNaN(startMs) ? new Date(startMs).toISOString() : null),
       } : null,
-      eventType: { id: eid, name: SPORT_MAP[eid] || 'Other' },
-      runners: (runners || []).map(r => ({
-        // ✅ Number() se normalize — Data endpoint (/data/Data) ka runner.id
-        // bhi selectionId hi hota hai, aur dono jagah consistent type
-        // (number) rakhna zaroori hai warna frontend price ko sahi runner
-        // se match hi nahi kar pata (string "47998" !== number 47998)
-        selectionId: Number(r.selectionId ?? r.id),
-        runnerName:  r.runnerName ?? r.name,
-        sortPriority: r.sortPriority ?? r.sort ?? 0,
-        handicap: r.handicap ?? r.hdp ?? 0,
-        metadata: {
-          ...r.metadata,
-          CLOTH_NUMBER: r.metadata?.CLOTH_NUMBER ?? r.clothNumber ?? r.cloth ?? null,
-          JOCKEY_NAME:  r.metadata?.JOCKEY_NAME  ?? r.jockey ?? r.jockeyName ?? null,
-          TRAINER_NAME: r.metadata?.TRAINER_NAME ?? r.trainer ?? r.trainerName ?? null,
-          STALL_DRAW:   r.metadata?.STALL_DRAW   ?? r.stallDraw ?? r.stall ?? null,
-          COLOURS_FILENAME_URL: r.metadata?.COLOURS_FILENAME_URL ?? r.silk ?? r.silkUrl ?? null,
-          FORM: r.metadata?.FORM ?? r.form ?? null,
-          AGE:  r.metadata?.AGE  ?? r.age  ?? null,
-        },
-      })),
+      eventType: { id: eid, name: SPORT_MAP[eid] || cat.eventType || cat.sport?.name || 'Other' },
+      runners: (runners || []).map(r => {
+        let meta = r.metadata;
+        if (typeof meta === 'string') {
+          try { meta = JSON.parse(meta); } catch (_) { meta = {}; }
+        }
+        meta = meta && typeof meta === 'object' ? meta : {};
+        return {
+          // ✅ Number() se normalize — Data endpoint (/data/Data) ka runner.id
+          // bhi selectionId hi hota hai, aur dono jagah consistent type
+          // (number) rakhna zaroori hai warna frontend price ko sahi runner
+          // se match hi nahi kar pata (string "47998" !== number 47998)
+          selectionId: Number(r.selectionId ?? r.id),
+          runnerName:  r.runnerName ?? r.name,
+          sortPriority: r.sortPriority ?? r.sort ?? 0,
+          handicap: r.handicap ?? r.hdp ?? 0,
+          metadata: {
+            ...meta,
+            CLOTH_NUMBER: meta.CLOTH_NUMBER ?? r.clothNumber ?? r.cloth ?? null,
+            JOCKEY_NAME:  meta.JOCKEY_NAME  ?? r.jockey ?? r.jockeyName ?? r.jockeyName ?? null,
+            TRAINER_NAME: meta.TRAINER_NAME ?? r.trainer ?? r.trainerName ?? null,
+            STALL_DRAW:   meta.STALL_DRAW   ?? r.stallDraw ?? r.stall ?? null,
+            COLOURS_FILENAME_URL: meta.COLOURS_FILENAME_URL ?? r.silk ?? r.silkUrl ?? r.silkColor ?? null,
+            FORM: meta.FORM ?? r.form ?? r.lastRun ?? null,
+            AGE:  meta.AGE  ?? r.age  ?? null,
+          },
+        };
+      }),
     };
   });
 }
@@ -816,9 +863,4 @@ module.exports = {
   listMarketBook,
   listMarketProfitAndLoss,
   getBanStatus,
-  // Exposed mainly for diagnostics/tests — not needed by controllers,
-  // since listCompetitions/listEvents/listMarketCatalogue already route
-  // through sportItems() internally.
-  fetchHighlights,
-  normalizeHighlightItem,
 };
