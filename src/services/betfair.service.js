@@ -1,73 +1,117 @@
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
-   ⚠️ MIGRATION NOTICE — BetwayInfo (2nd migration, Rollwin/Shubdx se)
+   ⚠️ MIGRATION NOTICE — BetwayInfo POORI TARAH HATA DI GAYI HAI
    ═══════════════════════════════════════════════════════════════════
-   Odds/listing data ab BetwayInfo (betwayinfo.com) se aata hai — ye
-   ek Betfair-RELAY hai (khud ka data nahi banata, seedha Betfair se
-   proxy karta hai). Confirm ho chuka hai: catalog2 response mein
-   "origin": "BETFAIR" milta hai, matlab market IDs ASAL Betfair market
-   IDs hain (jaise "1.255462233").
+   Ab koi bhi odds/listing data BetwayInfo (betwayinfo.com) se nahi
+   aata — poora relay hata diya gaya hai, jaisa client ne kaha tha.
 
-   Isi wajah se:
    ✅ Odds/listing (listEvents, listMarketCatalogue, listMarketBook,
-      listCompetitions, listEventTypes) — BetwayInfo se (neeche).
+      listCompetitions, listEventTypes) — SABHI sports (Horse Racing,
+      Greyhound, Cricket, Tennis, Football/Soccer) ab bpexch.live ke
+      /Common/MarketHighlights response se aate hain (neeche).
    ✅ Settlement (listMarketProfitAndLoss) — REAL Betfair API se hi
-      (login/session code neeche zinda rakha hai) — kyunki market IDs
-      genuine Betfair IDs hain, Betfair khud unhe pehchanta hai. Ye
-      bilkul wahi pattern hai jo Rollwin migration mein bhi tha.
+      (login/session code neeche zinda hai) — UNCHANGED.
 
-   Client instruction (verbatim): "/api/ ki jagah /api1/ use karo" —
-   is liye menu endpoint /api1/menu hai (docs mein /api/menu likha tha).
+   ⚠️ ZAROORI CAVEAT (ise chhupaya nahi ja raha):
+   Horse Racing/Greyhound ke market IDs pehle se hi bpexch ke apne
+   composite IDs the (jaise "35954463.1822"), aur ab Football/Cricket/
+   Tennis ke IDs bhi bpexch ke apne row IDs hain (jaise
+   "m_1_260688187") — BetwayInfo catalog2 se jo IDs milte the wo
+   *confirmed genuine Betfair IDs* the ("origin":"BETFAIR"). bpexch ke
+   IDs Betfair format ("1.xxxxxxx") mein NAHI hain, is liye
+   listMarketProfitAndLoss (settlement) in bpexch-sourced markets ke
+   liye ab kaam NAHI karega — real Betfair API in IDs ko pehchanega
+   nahi. Ye trade-off hai jo BetwayInfo hataane se seedha aata hai;
+   agar settlement chahiye to alag se real Betfair market IDs ka
+   mapping banana padega.
 
-   ⚠️ UNCONFIRMED HISSA (abhi tak real sample se verify nahi hua):
-   1) /api1/menu ka EXACT response shape — sirf itna pata hai ke isse
-      "eventName → matchId" milta hai (docs se). eventTypeId/competition/
-      startTime jaise fields kis naam se aate hain, confirm nahi —
-      is liye normalizeMenuItem() mein kai plausible field-name variants
-      try kiye hain (defensive parsing), taake jo bhi shape ho crash na ho.
-
-   ✅ CONFIRMED (real in-play match, marketId=1.259466913 se):
-   2) /data/Data ka marketBooks[].runners[] structure ab confirm ho chuka
-      hai: { id, price1/2/3, size1/2/3, lay1/2/3, ls1/2/3 (← lay SIZE,
-      "laySize" nahi), status, handicap }. listMarketBook() ab isi ke
-      hisab se sahi parse karta hai. Pehle "ls1/2/3" ki jagah "laySize"/
-      "lsize" try ho raha tha (kabhi match nahi hota tha → LAY size hamesha
-      0 aata tha), aur marketBooks[0].marketStatus field ko "status"
-      samjha ja raha tha (galat naam, hamesha default 'OPEN' fallback
-      chalta tha) — dono fix ho chuke hain.
-
-   ➡️ AGLA STEP (agar kuch bacha ho): /api1/menu ka real sample bhejna
-      taake normalizeMenuItem() ki defensive-parsing guesses confirm ho
-      sakein.
+   ✅ CONFIRMED ROW FORMAT (real bpexch HTML sample se, Football
+   section, 20 rows) — sab sports isi <tr class="...McomCustom">
+   structure ko share karte hain (same site, same CSS classes):
+     <tr id="m_1_260688187" class="m_1_260688187 McomCustom">
+       <td class="sport-date"><span class="day">Today|Tomorrow|InPlay</span>
+         <span class="market-time">HH:MM</span>
+         <span class="utctime" data-target="time">ISO-8601</span></td>
+       <td><div class="teams"><strong class="team-1"><a href="/Common/Event/ID">
+         Team A v Team B</a></strong><strong class="team-2"><a>...</a></strong></div></td>
+       <td><span class="TMFORDESK">matched amount</span></td>
+       <td>x6 <div class="box -blue|-pink"><strong>price</strong><span>size</span></div>
+         → back1, lay1, backX, layX, back2, lay2 (X = draw, "-" = no price)
+     </tr>
+   ⚠️ Cricket aur Tennis tables isi HTML mein is waqt maujood the (nav
+   tabs Cricket/Tennis/Soccer dikhate hain) lekin jo sample bheja gaya
+   usme Cricket ka <tbody></tbody> khaali tha aur Tennis table sirf
+   bheja hi nahi gaya. Parser generic hai (label text "Cricket"/
+   "Tennis"/"Football" se detect karta hai) — jis din unka tbody bhi
+   bharega, automatically kaam karega. Abhi ke liye khaali array milega
+   (crash nahi hoga, chup-chaap 0 items).
    ═══════════════════════════════════════════════════════════════════ */
 
 const axios  = require('axios');
 const logger = require('../utils/logger');
 const { SPORT_MAP } = require('../config/constants');
 
-const BASE_URL = process.env.BETWAY_BASE_URL || 'https://betwayinfo.com';
 const TIMEOUT_MS = 15000;
 
-/* ═══════════════════════════════════════════════════════════════════
-   ✅ bpexch.live migration — HORSE RACING (7) aur GREYHOUND (4339) ONLY
-   ═══════════════════════════════════════════════════════════════════
-   Client ne https://bpexch.live/Common/MarketHighlights?_=... diya.
-   Real HTML sample check kiya:
-   - Horse Race aur Grey Hound section HTML mein hi seedha embedded hain
-     (venue name, race start time (UTC), aur "/Common/Event/<id>" link) —
-     isliye ye 2 sports ab CONFIRMED bpexch.live se parse ho rahe hain
-     (neeche getRacingHighlights()).
-   - Cricket/Soccer/Tennis ka odds table (Matched, 1/X/2 prices) is HTML
-     response mein KHAALI (<tbody></tbody>) aata hai — wo data page-load
-     ke baad kisi ALAG AJAX call se JS bharta hai, jiska exact URL abhi
-     confirm nahi hua. Isi wajah se football/cricket/tennis abhi bhi
-     PURANE BetwayInfo source se hi aa rahe hain (neeche, unchanged) —
-     jaise hi real odds-AJAX endpoint mil jaye, wahi switch ho jayega.
-   ═══════════════════════════════════════════════════════════════════ */
 const BPEXCH_BASE_URL = process.env.BPEXCH_BASE_URL || 'https://bpexch.live';
-const RACING_EVENT_TYPE_IDS = new Set(['7', '4339']); // Horse Racing, Greyhound Racing
 
+/* ── eventTypeId resolution — SPORT_MAP se naam-based match (ID
+   hardcode nahi karte, jaisi Rollwin/Greyhound fix mein pehle bhi
+   pattern tha) ─────────────────────────────────────────────────── */
+function isEventTypeMatching(eventTypeId, keywords) {
+  const name = String(SPORT_MAP?.[String(eventTypeId)] || '').toLowerCase();
+  return keywords.some(k => name.includes(k));
+}
+function resolveEventTypeIdByKeywords(keywords, fallback) {
+  const found = Object.entries(SPORT_MAP || {}).find(([, name]) =>
+    keywords.some(k => String(name || '').toLowerCase().includes(k))
+  );
+  return found ? found[0] : fallback;
+}
+
+function isHorseRacingEventType(eventTypeId) {
+  return isEventTypeMatching(eventTypeId, ['horse']) || String(eventTypeId) === '7';
+}
+function isGreyhoundEventType(eventTypeId) {
+  return isEventTypeMatching(eventTypeId, ['grey', 'dog racing']) || String(eventTypeId) === '4339';
+}
+function isCricketEventType(eventTypeId) {
+  return isEventTypeMatching(eventTypeId, ['cricket']);
+}
+function isTennisEventType(eventTypeId) {
+  return isEventTypeMatching(eventTypeId, ['tennis']);
+}
+function isFootballEventType(eventTypeId) {
+  return isEventTypeMatching(eventTypeId, ['football', 'soccer']);
+}
+
+function resolveHorseRacingId() {
+  return resolveEventTypeIdByKeywords(['horse'], '7');
+}
+function resolveGreyhoundId() {
+  return resolveEventTypeIdByKeywords(['grey', 'dog racing'], '4339');
+}
+function resolveCricketId() {
+  return resolveEventTypeIdByKeywords(['cricket'], null);
+}
+function resolveTennisId() {
+  return resolveEventTypeIdByKeywords(['tennis'], null);
+}
+function resolveFootballId() {
+  return resolveEventTypeIdByKeywords(['football', 'soccer'], null);
+}
+
+function eventTypeIdForSportLabel(label) {
+  const l = String(label || '').toLowerCase();
+  if (l.includes('cricket')) return resolveCricketId();
+  if (l.includes('tennis')) return resolveTennisId();
+  if (l.includes('football') || l.includes('soccer')) return resolveFootballId();
+  return null;
+}
+
+/* ── /Common/MarketHighlights — cached fetch (racing + match-odds
+   sports dono isi ek response se aate hain) ───────────────────────── */
 let _highlightsHtmlCache = null;
 let _highlightsHtmlExpiry = 0;
 // Chhota TTL rakha hai taake "time ke sath data update" ho — har naya
@@ -103,7 +147,10 @@ function sliceBetweenMarkers(html, startMarker, endMarker) {
   return endIdx === -1 ? html.slice(startIdx) : html.slice(startIdx, endIdx);
 }
 
-// Har race-card block ka pattern (real sample se confirmed):
+/* ═══════════════════════════════════════════════════════════════════
+   Horse Racing / Greyhound — HTML-embedded slider (CONFIRMED, unchanged)
+   ═══════════════════════════════════════════════════════════════════ */
+
 // <a href="/Common/Event/35954463.1822">...utctime...2026-08-19T18:22:00...
 // ...slidename'>Finger Lakes (US)...
 const RACE_ITEM_RE = /href="\/Common\/Event\/([^"]+)"[\s\S]*?utctime[^>]*>\s*([^<]+?)\s*<\/span>[\s\S]*?slidename'>\s*([^<]+?)\s*<\/span>/g;
@@ -114,7 +161,7 @@ function parseRaceItems(sectionHtml, eventTypeId) {
   RACE_ITEM_RE.lastIndex = 0;
   while ((m = RACE_ITEM_RE.exec(sectionHtml)) !== null) {
     const [, hrefId, startIsoRaw, venueRaw] = m;
-    const id = hrefId.trim(); // e.g. "35954463.1822" — poora string hi unique race id hai (prefix meeting/venue ka hai, poora string specific race ka)
+    const id = hrefId.trim(); // poora string hi unique race id hai
     const venue = venueRaw.trim();
     const startIso = startIsoRaw.trim();
     items.push({
@@ -143,17 +190,170 @@ async function getRacingHighlights(eventTypeId) {
   const horseSection = sliceBetweenMarkers(html, 'Horse Race', 'Grey Hound');
   const greyhoundSection = sliceBetweenMarkers(html, 'Grey Hound', 'TABS SYSTEM');
 
-  if (String(eventTypeId) === '7') return parseRaceItems(horseSection, '7');
-  if (String(eventTypeId) === '4339') return parseRaceItems(greyhoundSection, '4339');
+  if (eventTypeId != null) {
+    if (isHorseRacingEventType(eventTypeId)) return parseRaceItems(horseSection, eventTypeId);
+    if (isGreyhoundEventType(eventTypeId)) return parseRaceItems(greyhoundSection, eventTypeId);
+    return [];
+  }
 
-  return [...parseRaceItems(horseSection, '7'), ...parseRaceItems(greyhoundSection, '4339')];
+  return [
+    ...parseRaceItems(horseSection, resolveHorseRacingId()),
+    ...parseRaceItems(greyhoundSection, resolveGreyhoundId()),
+  ];
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Cricket / Tennis / Football — match-odds tables (CONFIRMED via
+   Football sample; parser generic hai, Cricket/Tennis automatically
+   kaam karega jis din unka tbody bhi bhare)
+   ═══════════════════════════════════════════════════════════════════ */
+
+const HIGHLIGHTS_TABLE_RE = /<div class="high_lights">([\s\S]*?)<\/table>\s*<\/div>/g;
+const MATCH_ROW_RE = /<tr id="([^"]+)"[^>]*class="[^"]*McomCustom[^"]*"[\s\S]*?<\/tr>/g;
+const SPORT_LABEL_RE = /<\/svg>\s*([A-Za-z]+)\s*<\/div>/;
+const DAY_RE = /<span class="day">([^<]*)<\/span>/;
+const TIME_ISO_RE = /data-target="time">\s*([^<]+?)\s*<\/span>/;
+const TEAM1_RE = /<strong class="team-1">\s*<a href="([^"]*)">\s*([^<]*?)\s*<\/a>/;
+const TEAM2_RE = /<strong class="team-2">\s*<a[^>]*>\s*([^<]*?)\s*<\/a>/;
+const MATCHED_RE = /class="TMFORDESK">([^<]*)<\/span>/;
+const BOX_RE = /class="box\s+(-blue|-pink)[^"]*">\s*<strong>\s*([^<]*?)\s*<\/strong>\s*<span>\s*([^<]*?)\s*<\/span>/g;
+
+// "22.9k" → 22900, "3,099" → 3099, "-" / "" → 0
+function parseCompactNumber(str) {
+  if (str == null) return 0;
+  const s = String(str).trim().replace(/,/g, '');
+  if (!s || s === '-') return 0;
+  if (/k$/i.test(s)) {
+    const n = parseFloat(s);
+    return isNaN(n) ? 0 : Math.round(n * 1000);
+  }
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
+// "-" / "" → null (no price offered), warna float
+function parsePrice(str) {
+  const s = String(str ?? '').trim();
+  if (!s || s === '-') return null;
+  const n = parseFloat(s);
+  return isNaN(n) ? null : n;
+}
+
+function parseMatchRow(rowHtml, rowId, eventTypeId) {
+  const t1M = TEAM1_RE.exec(rowHtml);
+  const isoM = TIME_ISO_RE.exec(rowHtml);
+  if (!t1M || !isoM) return null; // row samajh nahi aayi — skip, crash mat karo
+
+  const dayM = DAY_RE.exec(rowHtml);
+  const t2M = TEAM2_RE.exec(rowHtml);
+  const matchedM = MATCHED_RE.exec(rowHtml);
+
+  const day = (dayM?.[1] || '').trim();
+  const startIso = isoM[1].trim();
+  const eventHref = t1M[1] || '';
+  const eventId = eventHref.split('/').filter(Boolean).pop() || rowId;
+  const team1Text = (t1M[2] || '').trim();
+  const team2Text = (t2M?.[1] || '').trim();
+
+  // Football jaisa format: team-1 anchor mein hi "Team A v Team B" poora
+  // aata hai, team-2 anchor khaali rehta hai — is liye " v " se split karo.
+  let homeName = team1Text;
+  let awayName = team2Text || null;
+  if (!awayName && / v /i.test(team1Text)) {
+    const parts = team1Text.split(/ v /i);
+    homeName = parts[0].trim();
+    awayName = parts.slice(1).join(' v ').trim();
+  }
+
+  const boxes = [];
+  BOX_RE.lastIndex = 0;
+  let boxM;
+  while ((boxM = BOX_RE.exec(rowHtml)) !== null) {
+    boxes.push({
+      side: boxM[1] === '-blue' ? 'back' : 'lay',
+      price: parsePrice(boxM[2]),
+      size: parseCompactNumber(boxM[3]),
+    });
+  }
+  // Expected order: back1, lay1, backX, layX, back2, lay2
+  const outcomeNames = [homeName || 'Runner 1', 'The Draw', awayName || 'Runner 2'];
+  const runners = [];
+  for (let i = 0; i < 3; i++) {
+    const back = boxes[i * 2];
+    const lay = boxes[i * 2 + 1];
+    // Dono side khaali ("-") → ye outcome market mein hi nahi hai (e.g.
+    // tennis mein "X"/Draw kabhi nahi hota) — skip karo, fake runner na banao.
+    if ((!back || back.price == null) && (!lay || lay.price == null)) continue;
+    runners.push({
+      selectionId: i + 1, // synthetic — sirf isi market ke andar unique/consistent
+      runnerName: outcomeNames[i],
+      sortPriority: i + 1,
+      handicap: 0,
+      metadata: {},
+      ex: {
+        availableToBack: back && back.price != null ? [{ price: back.price, size: back.size || 0 }] : [],
+        availableToLay:  lay  && lay.price  != null ? [{ price: lay.price,  size: lay.size  || 0 }] : [],
+      },
+    });
+  }
+
+  return {
+    id: rowId,
+    name: 'Match Odds',
+    start: startIso,
+    eventTypeId: String(eventTypeId),
+    inPlay: /^in\s*-?\s*play/i.test(day),
+    matched: parseCompactNumber(matchedM?.[1]),
+    competition: null,
+    event: {
+      id: eventId,
+      name: awayName ? `${homeName} v ${awayName}` : homeName,
+      countryCode: null,
+      venue: null,
+      openDate: startIso,
+    },
+    runners,
+  };
+}
+
+function parseMatchOddsSections(html) {
+  const sections = [];
+  let block;
+  HIGHLIGHTS_TABLE_RE.lastIndex = 0;
+  while ((block = HIGHLIGHTS_TABLE_RE.exec(html)) !== null) {
+    const blockHtml = block[1];
+    const labelM = SPORT_LABEL_RE.exec(blockHtml);
+    const label = labelM ? labelM[1] : '';
+    const eventTypeId = eventTypeIdForSportLabel(label);
+    if (!eventTypeId) continue; // is sport ki SPORT_MAP mein ID hi nahi mili — safe skip
+
+    const items = [];
+    let rowM;
+    MATCH_ROW_RE.lastIndex = 0;
+    while ((rowM = MATCH_ROW_RE.exec(blockHtml)) !== null) {
+      const item = parseMatchRow(rowM[0], rowM[1], eventTypeId);
+      if (item) items.push(item);
+    }
+    sections.push({ label, eventTypeId, items });
+  }
+  return sections;
+}
+
+async function getSportsHighlights(eventTypeId) {
+  const html = await getHighlightsHtml();
+  const sections = parseMatchOddsSections(html);
+  if (eventTypeId != null) {
+    const wanted = String(eventTypeId);
+    return sections.filter(s => String(s.eventTypeId) === wanted).flatMap(s => s.items);
+  }
+  return sections.flatMap(s => s.items);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
    ✅ REAL Betfair session/login — SETTLEMENT ke liye zinda hai
-   (listMarketProfitAndLoss). Market IDs genuine Betfair IDs hain
-   (origin:"BETFAIR" confirm), is liye settlement humesha real Betfair
-   API se hi query hoti hai — code bilkul waisa hi hai jo pehle tha.
+   (listMarketProfitAndLoss). Ye code bilkul waisa hi hai jo pehle tha
+   — UNCHANGED. Dhyaan rahe: ab sirf genuine Betfair-format market IDs
+   ke liye kaam karega (upar wala caveat dekh lo).
    ═══════════════════════════════════════════════════════════════════ */
 const APP_KEY  = process.env.BETFAIR_APP_KEY;
 const USERNAME = process.env.BETFAIR_USERNAME;
@@ -304,152 +504,43 @@ function getBanStatus() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   ✅ BetwayInfo — odds/listing data
+   sportItems() — sabhi sports ka single entry point, ab poori tarah
+   bpexch.live se (BetwayInfo hata diya gaya hai)
    ═══════════════════════════════════════════════════════════════════ */
-
-// eventTypeId → BetwayInfo/Betfair sport naam (SPORT_MAP se hi milta hai,
-// yahan sirf reverse-lookup ke liye rakha hai agar menu naam se sport
-// bataye, ID se nahi).
-const SPORT_NAME_TO_EVENT_TYPE = Object.fromEntries(
-  Object.entries(SPORT_MAP).map(([id, name]) => [name.toLowerCase(), id])
-);
-
-/* ── /api1/menu — cache (baar baar poori list na maangi jaaye) ────── */
-// ✅ TEST: pehle sirf ek unfiltered call hoti thi (jisme horse/greyhound
-// kabhi nahi aate the). Ab agar eventTypeId diya jaye to usay query param
-// ke taur par bhi bhejte hain — ho sakta hai server sirf tab racing
-// include kare jab explicitly maanga jaye. Har eventTypeId (aur "sab")
-// ka apna cache-slot hai taake football/cricket/tennis ka existing
-// (working) unfiltered-call flow bilkul na chhide.
-const _menuCache = new Map(); // key: eventTypeId || '__all__'  →  { data, expiresAt }
-const MENU_CACHE_TTL_MS = parseInt(process.env.BETWAY_MENU_CACHE_TTL_MS || '5000', 10);
-
-async function fetchMenu(eventTypeId = null) {
-  const cacheKey = eventTypeId ? String(eventTypeId) : '__all__';
-  const cached = _menuCache.get(cacheKey);
-  if (cached && Date.now() < cached.expiresAt) return cached.data;
-
-  // ✅ Client instruction: docs mein "/api/menu" likha tha, lekin
-  // client ne kaha "/api/ ki jagah /api1/ use karo" — is liye:
-  const url = `${BASE_URL}/api1/menu`;
-  // 🧪 TEST: eventTypeId diya ho to query param mein bhi bhejo (kai
-  // possible naam try karte hain — jo bhi server samjhe)
-  const params = eventTypeId
-    ? { eventTypeId, sportId: eventTypeId, sport: eventTypeId }
-    : undefined;
-  try {
-    const res = await axios.get(url, { params, timeout: TIMEOUT_MS });
-    const raw = res.data;
-    // ⚠️ Exact shape unconfirmed — kai plausible variants try karte hain
-    // (Rollwin migration mein bhi isi tarah defensive parsing kaam aayi thi)
-    const items = Array.isArray(raw)               ? raw
-                : Array.isArray(raw?.data)          ? raw.data
-                : Array.isArray(raw?.result)        ? raw.result
-                : Array.isArray(raw?.data?.result)  ? raw.data.result
-                : Array.isArray(raw?.markets)       ? raw.markets
-                : Array.isArray(raw?.menu)          ? raw.menu
-                : [];
-
-    // 🧪 TEST LOG: eventTypeId 7/4339 ke liye kya mila — dono cases
-    // clearly dikhao (kitne items aaye, aur unme se kitne genuinely
-    // horse/greyhound the vs sirf same purana unfiltered response wapas
-    // aa gaya)
-    if (eventTypeId === '7' || eventTypeId === '4339' || String(eventTypeId) === '7' || String(eventTypeId) === '4339') {
-      const matchingCount = items.filter(it => {
-        const etid = String(it.eventTypeId ?? it.eventtypeid ?? it.sportId ?? it.sport_id ?? '');
-        return etid === String(eventTypeId);
-      }).length;
-      logger.warn(
-        `[BetwayInfo][TEST] menu?eventTypeId=${eventTypeId} → ${items.length} total items, ` +
-        `${matchingCount} match this eventTypeId. ` +
-        `Sample eventTypeIds seen: ${JSON.stringify([...new Set(items.slice(0, 50).map(it => it.eventTypeId ?? it.eventtypeid ?? it.sportId ?? '?'))])}`
-      );
-    }
-
-    if (!items.length) {
-      logger.warn(`[BetwayInfo] menu(eventTypeId=${eventTypeId || 'none'}) — 0 items mile. Response top-level keys: ${JSON.stringify(Object.keys(raw || {}))}`);
-    }
-
-    _menuCache.set(cacheKey, { data: items, expiresAt: Date.now() + MENU_CACHE_TTL_MS });
-    return items;
-  } catch (err) {
-    logger.error(`[BetwayInfo] menu (${url}, eventTypeId=${eventTypeId || 'none'}) fetch failed: ${err.message}`);
-    throw err;
-  }
-}
-
-// ⚠️ UNCONFIRMED field-names — real /api1/menu sample milte hi verify/fix karo.
-function normalizeMenuItem(raw) {
-  const eventTypeId = String(
-    raw.eventTypeId ?? raw.eventtypeid ?? raw.sportId ?? raw.sport_id ??
-    raw.eventType?.id ?? (raw.sport ? SPORT_NAME_TO_EVENT_TYPE[String(raw.sport).toLowerCase()] : '') ?? ''
-  );
-
-  const marketId  = raw.marketId ?? raw.market_id ?? raw.matchId ?? raw.match_id ?? raw.id;
-  const eventIdRaw = raw.eventId ?? raw.event_id ?? raw.event?.id ?? raw.groupById ?? marketId;
-  const eventId    = String(eventIdRaw);
-  const eventName  = raw.eventname ?? raw.eventName ?? raw.event?.name ?? raw.name ?? raw.matchName ?? 'Unknown';
-
-  const compId   = raw.competitionId ?? raw.competition_id ?? raw.competition?.id ?? null;
-  const compName = raw.competitionName ?? raw.competition_name ?? raw.competition?.name ?? raw.league ?? null;
-  const competition = compId ? { id: String(compId), name: compName || 'Unknown League' } : null;
-
-  const startRaw = raw.marketStartTime ?? raw.startTime ?? raw.start_time ?? raw.start ?? raw.openDate ?? null;
-
-  return {
-    id: marketId != null ? String(marketId) : null,
-    name: raw.marketName ?? raw.market_name ?? 'Match Odds',
-    start: startRaw,
-    eventTypeId,
-    inPlay: !!(raw.inPlay ?? raw.inplay ?? raw.in_play),
-    matched: raw.totalMatched ?? raw.matched ?? 0,
-    competition,
-    event: {
-      id: eventId,
-      name: eventName,
-      countryCode: raw.countryCode ?? null,
-      venue: raw.venue ?? null,
-      openDate: startRaw,
-    },
-    runners: Array.isArray(raw.runners) ? raw.runners : [], // menu shayad runners na de — /data/catalogs se milenge
-  };
-}
-
 async function sportItems(eventTypeId) {
-  // ✅ Horse Racing (7) / Greyhound (4339) — ab bpexch.live se (confirmed)
-  if (RACING_EVENT_TYPE_IDS.has(String(eventTypeId))) {
+  if (isHorseRacingEventType(eventTypeId) || isGreyhoundEventType(eventTypeId)) {
     return getRacingHighlights(eventTypeId).catch(err => {
       logger.error(`[bpexch] racing highlights fetch failed (eventTypeId=${eventTypeId}): ${err.message}`);
       return [];
     });
   }
 
+  if (eventTypeId != null && (isCricketEventType(eventTypeId) || isTennisEventType(eventTypeId) || isFootballEventType(eventTypeId))) {
+    return getSportsHighlights(eventTypeId).catch(err => {
+      logger.error(`[bpexch] match-odds highlights fetch failed (eventTypeId=${eventTypeId}): ${err.message}`);
+      return [];
+    });
+  }
+
   if (!eventTypeId) {
-    // Sport specify nahi hui — purana BetwayInfo menu (football/cricket/
-    // tennis) + naya bpexch racing (horse+greyhound), dono mila ke do
-    const [menu, racing] = await Promise.all([
-      fetchMenu().then(m => m.map(normalizeMenuItem).filter(x => x.id)).catch(() => []),
+    // Sport specify nahi hui — racing + cricket/tennis/football, sab
+    // isi ek bpexch highlights response se mila ke do
+    const [racing, matchOdds] = await Promise.all([
       getRacingHighlights(null).catch(err => {
         logger.error(`[bpexch] racing highlights fetch failed: ${err.message}`);
         return [];
       }),
+      getSportsHighlights(null).catch(err => {
+        logger.error(`[bpexch] match-odds highlights fetch failed: ${err.message}`);
+        return [];
+      }),
     ]);
-    return [...menu, ...racing];
+    return [...racing, ...matchOdds];
   }
 
-  // ── Baaki sports (football/cricket/tennis) — purana BetwayInfo flow, unchanged ──
-  // 🧪 TEST: pehle eventTypeId-scoped call try karo (ho sakta hai server
-  // sirf tab include kare jab explicitly maanga jaye). Agar wo khaali
-  // aaye, unfiltered list se client-side filter karke bhi dekh lo.
-  let menu = await fetchMenu(eventTypeId).catch(() => []);
-  let items = menu.map(normalizeMenuItem).filter(m => m.id && m.eventTypeId === String(eventTypeId));
-
-  if (!items.length) {
-    const allMenu = await fetchMenu(null).catch(() => []);
-    items = allMenu.map(normalizeMenuItem).filter(m => m.id && m.eventTypeId === String(eventTypeId));
-  }
-
-  return items;
+  // Koi aur/unknown sport — BetwayInfo hat chuka hai, iske liye ab koi
+  // source nahi hai
+  return [];
 }
 
 /* ── Public helpers (Betfair-shaped — market.controller.js ke liye) ── */
@@ -491,8 +582,7 @@ async function listEvents(filter = {}) {
     if (!ev?.id) return;
     if (competitionIds && !competitionIds.includes(String(m.competition?.id))) return;
 
-    // Date string ya epoch — dono normalize karke compare karo (Rollwin
-    // migration mein yehi bug mila tha, is liye shuru se hi robust rakha hai)
+    // Date string ya epoch — dono normalize karke compare karo
     const startMs = m.start != null ? new Date(m.start).getTime() : NaN;
     if (fromMs !== null && !isNaN(startMs) && startMs < fromMs) return;
     if (toMs   !== null && !isNaN(startMs) && startMs > toMs)   return;
@@ -515,32 +605,12 @@ async function listEvents(filter = {}) {
   return Array.from(seen.values());
 }
 
-/* ── /data/catalogs (batch) — runners aur market-metadata ─────────── */
-async function fetchCatalogsBatch(marketIds) {
-  if (!marketIds.length) return {};
-  try {
-    const url = `${BASE_URL}/data/catalogs`;
-    const res = await axios.get(url, { params: { ids: marketIds.join(',') }, timeout: TIMEOUT_MS });
-    const raw  = res.data;
-    const list = Array.isArray(raw)              ? raw
-               : Array.isArray(raw?.data)         ? raw.data
-               : Array.isArray(raw?.result)       ? raw.result
-               : Array.isArray(raw?.data?.result) ? raw.data.result
-               : [];
-    const map = {};
-    list.forEach(c => {
-      const mid = c.marketId ?? c.market_id ?? c.id;
-      if (mid != null) map[String(mid)] = c;
-    });
-    return map;
-  } catch (err) {
-    logger.warn(`[BetwayInfo] catalogs (batch) fetch failed: ${err.message} — runners khali reh sakte hain is baar`);
-    return {};
-  }
-}
-
 // Betfair jaisa shape: [{ marketId, marketName, marketStartTime, totalMatched,
 //                          competition, event, eventType, runners:[{selectionId, runnerName, sortPriority}] }]
+//
+// ✅ Ab koi alag catalogs/catalog2 call nahi lagti — bpexch ki highlights
+// HTML mein hi runner names + prices dono ek saath aa jaate hain (racing
+// ke liye runners khaali rehte hain, jaisa pehle bhi tha).
 async function listMarketCatalogue(filter = {}, maxResults = '20', marketProjection) {
   const eventTypeId = filter?.eventTypeIds?.[0];
   let items = [];
@@ -548,7 +618,7 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
   if (eventTypeId) {
     items = await sportItems(eventTypeId);
   } else if (filter?.marketIds?.length || filter?.eventIds?.length) {
-    // Sport pata nahi — poori menu list mein se dhoondo
+    // Sport pata nahi — poori list mein se dhoondo
     const all = await sportItems(null);
     if (filter?.marketIds?.length) {
       const ids = filter.marketIds.map(String);
@@ -571,21 +641,13 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
   const sliced = items.slice(0, parseInt(maxResults, 10) || 20);
   if (!sliced.length) return [];
 
-  // ✅ /data/catalog2 (single) ki jagah /data/catalogs (batch) use karo —
-  // ek hi HTTP call mein saare markets ki details mil jaati hain (docs
-  // mein explicitly "optimized endpoint for fetching metadata for
-  // multiple related markets" likha hai).
-  const catalogMap = await fetchCatalogsBatch(sliced.map(m => m.id));
-
   return sliced.map(m => {
-    const cat = catalogMap[m.id] || {};
-    const runners = Array.isArray(cat.runners) ? cat.runners : m.runners;
     const startMs = m.start != null ? new Date(m.start).getTime() : NaN;
     const eid = String(m.eventTypeId || eventTypeId || '');
 
     return {
       marketId: m.id,
-      marketName: cat.marketName || cat.market_name || m.name,
+      marketName: m.name,
       marketStartTime: !isNaN(startMs) ? new Date(startMs).toISOString() : (m.event?.openDate || new Date().toISOString()),
       totalMatched: m.matched || 0,
       competition: m.competition ? { id: m.competition.id, name: m.competition.name } : null,
@@ -595,11 +657,9 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
         openDate: m.event.openDate || (!isNaN(startMs) ? new Date(startMs).toISOString() : null),
       } : null,
       eventType: { id: eid, name: SPORT_MAP[eid] || 'Other' },
-      runners: (runners || []).map(r => ({
-        // ✅ Number() se normalize — Data endpoint (/data/Data) ka runner.id
-        // bhi selectionId hi hota hai, aur dono jagah consistent type
-        // (number) rakhna zaroori hai warna frontend price ko sahi runner
-        // se match hi nahi kar pata (string "47998" !== number 47998)
+      runners: (m.runners || []).map(r => ({
+        // Number() se normalize — listMarketBook ka runner.selectionId bhi
+        // isi tarah number hota hai, dono jagah consistent type zaroori hai
         selectionId: Number(r.selectionId ?? r.id),
         runnerName:  r.runnerName ?? r.name,
         sortPriority: r.sortPriority ?? r.sort ?? 0,
@@ -621,84 +681,60 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
 
 // Betfair jaisa shape: [{ marketId, status, inplay, betDelay, totalMatched,
 //                          runners: [{selectionId, status, lastPriceTraded,
-//                                     ex: { availableToBack, availableToLay } }],
-//                          scoreboard? }]  ← scoreboard sirf cricket ke liye
+//                                     ex: { availableToBack, availableToLay }}] }]
 //
-// ✅ CONFIRMED (real in-play match se, marketId=1.259466913):
-//   marketBooks[0] = { id, winners, betDelay, totalMatched, marketStatus,
-//                       maxBetSize, bettingAllowed, isMarketDataDelayed,
-//                       runners:[{ id, price1..3, size1..3, lay1..3, ls1..3,
-//                                  status, handicap }], isRoot, timestamp, winnerIDs }
-//   → status field ka asal naam "marketStatus" hai (generic "status" nahi)
-//   → lay SIZE field "ls1/ls2/ls3" hai (pehle "laySize"/"lsize" try ho raha
-//     tha, jo kabhi match nahi hota tha — isi wajah se LAY size hamesha 0
-//     aata tha, aur frontend size=0 wale cells ko non-clickable/blank
-//     dikhata hai)
+// ✅ BetwayInfo ka /data/Data endpoint hata diya gaya hai. Cricket/Tennis/
+// Football ke liye prices already listing-time par hi bpexch highlights
+// HTML se mil jaate hain (getSportsHighlights() ke ex.back/lay), is liye
+// unhi ko yahan dobara lookup karke return kar dete hain — alag price-call
+// ki zaroorat nahi. Horse Racing/Greyhound ke liye abhi koi live-price
+// source nahi hai (highlights feed mein sirf listing hai, odds nahi) —
+// unke liye safe default (khaali runners) milta hai, jaisa pehle bhi tha.
+let _matchOddsLookupPromise = null;
+async function getMatchOddsLookup() {
+  if (_matchOddsLookupPromise) return _matchOddsLookupPromise;
+  _matchOddsLookupPromise = (async () => {
+    try {
+      const items = await getSportsHighlights(null);
+      return new Map(items.map(it => [String(it.id), it]));
+    } catch (err) {
+      logger.warn(`[bpexch] match-odds lookup for listMarketBook failed: ${err.message}`);
+      return new Map();
+    }
+  })();
+  // Highlights cache jitni der valid hai usi hisaab se ye lookup bhi
+  // dobara banega — is promise ko highlights cache expiry ke sath hi reset karo
+  setTimeout(() => { _matchOddsLookupPromise = null; }, HIGHLIGHTS_CACHE_TTL_MS);
+  return _matchOddsLookupPromise;
+}
+
 async function listMarketBook(marketIds = [], priceProjection) {
   if (!marketIds.length) return [];
 
-  const results = await Promise.all(marketIds.map(async (id) => {
-    try {
-      const url = `${BASE_URL}/data/Data`;
-      const res = await axios.get(url, { params: { id }, timeout: TIMEOUT_MS });
-      const raw = res.data;
+  const lookup = await getMatchOddsLookup();
 
-      // marketBooks empty ho sakta hai agar market abhi actively traded
-      // nahi ho raha (docs + humara apna test confirm karta hai)
-      const mbRaw = raw?.marketBooks;
-      const mb = Array.isArray(mbRaw) ? mbRaw[0] : mbRaw;
-
-      if (!mb) {
-        return { marketId: id, status: 'OPEN', inplay: false, betDelay: 0, totalMatched: 0, runners: [] };
-      }
-
-      const runners = mb.runners || mb.runner || [];
-
+  return marketIds.map((id) => {
+    const item = lookup.get(String(id));
+    if (item) {
       return {
         marketId: id,
-        // ✅ FIX: real field "marketStatus" hai, "status" nahi
-        status: mb.marketStatus || mb.status || 'OPEN',
-        inplay: !!(mb.inplay ?? mb.inPlay),
-        betDelay: mb.betDelay ?? 0,
-        totalMatched: mb.totalMatched ?? mb.matched ?? 0,
-        runners: runners.map(r => {
-          const back = [];
-          const lay  = [];
-          for (let i = 1; i <= 3; i++) {
-            if (r[`price${i}`] != null) back.push({ price: r[`price${i}`], size: r[`size${i}`] ?? 0 });
-            // ✅ FIX: lay size ka real field "ls1/ls2/ls3" hai
-            if (r[`lay${i}`]   != null) lay.push({ price: r[`lay${i}`], size: r[`ls${i}`] ?? r[`laySize${i}`] ?? r[`lsize${i}`] ?? 0 });
-          }
-          // Fallback: agar price1/lay1 style fields bilkul na milen, shayad
-          // Betfair-native "back"/"lay" array format bhi ho sakta hai
-          const backFallback = Array.isArray(r.back) ? r.back.map(b => ({ price: b.price, size: b.size })) : [];
-          const layFallback  = Array.isArray(r.lay)  ? r.lay.map(l  => ({ price: l.price, size: l.size }))  : [];
-
-          return {
-            // ✅ FIX: catalog2 ke selectionId se type-consistent rakhne ke
-            // liye Number() — warna frontend price ko runner se match hi
-            // nahi kar pata (string vs number mismatch se dono BACK aur
-            // LAY khaali/blank dikhte hain)
-            selectionId: Number(r.selectionId ?? r.id),
-            status: r.status || 'ACTIVE',
-            lastPriceTraded: r.lastPriceTraded ?? r.ltp ?? null,
-            ex: {
-              availableToBack: back.length ? back : backFallback,
-              availableToLay:  lay.length  ? lay  : layFallback,
-            },
-          };
-        }),
-        // ✅ Cricket scoreboard pass-through (t1_runs/t1_wickets/t1_overs/
-        // commentry) — controller ya frontend jahan zaroorat ho use kar sake
-        scoreboard: raw.scoreboard || null,
+        status: 'OPEN',
+        inplay: !!item.inPlay,
+        betDelay: 0,
+        totalMatched: item.matched || 0,
+        runners: (item.runners || []).map(r => ({
+          selectionId: Number(r.selectionId),
+          status: 'ACTIVE',
+          lastPriceTraded: null,
+          ex: r.ex,
+        })),
+        scoreboard: null,
       };
-    } catch (err) {
-      logger.error(`[BetwayInfo] Data?id=${id} failed: ${err.message}`);
-      return { marketId: id, status: 'OPEN', inplay: false, betDelay: 0, totalMatched: 0, runners: [] };
     }
-  }));
-
-  return results;
+    // Horse racing/greyhound ya unrecognized market — koi live price
+    // source abhi available nahi, safe default
+    return { marketId: id, status: 'OPEN', inplay: false, betDelay: 0, totalMatched: 0, runners: [] };
+  });
 }
 
 /* ── getEventDetails (orders.js compatible) ─────────────── */
