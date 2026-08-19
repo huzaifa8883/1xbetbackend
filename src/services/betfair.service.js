@@ -102,14 +102,6 @@ function resolveFootballId() {
   return resolveEventTypeIdByKeywords(['football', 'soccer'], null);
 }
 
-function eventTypeIdForSportLabel(label) {
-  const l = String(label || '').toLowerCase();
-  if (l.includes('cricket')) return resolveCricketId();
-  if (l.includes('tennis')) return resolveTennisId();
-  if (l.includes('football') || l.includes('soccer')) return resolveFootballId();
-  return null;
-}
-
 /* ── /Common/MarketHighlights — cached fetch (racing + match-odds
    sports dono isi ek response se aate hain) ───────────────────────── */
 let _highlightsHtmlCache = null;
@@ -208,9 +200,7 @@ async function getRacingHighlights(eventTypeId) {
    kaam karega jis din unka tbody bhi bhare)
    ═══════════════════════════════════════════════════════════════════ */
 
-const HIGHLIGHTS_TABLE_RE = /<div class="high_lights">([\s\S]*?)<\/table>\s*<\/div>/g;
 const MATCH_ROW_RE = /<tr id="([^"]+)"[^>]*class="[^"]*McomCustom[^"]*"[\s\S]*?<\/tr>/g;
-const SPORT_LABEL_RE = /<\/svg>\s*([A-Za-z]+)\s*<\/div>/;
 const DAY_RE = /<span class="day">([^<]*)<\/span>/;
 const TIME_ISO_RE = /data-target="time">\s*([^<]+?)\s*<\/span>/;
 const TEAM1_RE = /<strong class="team-1">\s*<a href="([^"]*)">\s*([^<]*?)\s*<\/a>/;
@@ -316,24 +306,64 @@ function parseMatchRow(rowHtml, rowId, eventTypeId) {
   };
 }
 
+// ⚠️ CHANGED: pehle wala approach `<div class="high_lights">...</table></div>`
+// wrapper + `<svg>` ke baad wale label text pe depend karta tha — ye sirf ek
+// static full-page HTML sample pe test hua tha, aur live /Common/MarketHighlights
+// AJAX response pe fail ho gaya (Cricket/Tennis/Football section hi detect
+// nahi ho rahe the, isliye 0 items — horse racing chalta raha kyunki uska
+// detection simple text-marker se hota hai, div/svg structure pe nahi).
+//
+// Naya approach: EXACT wahi proven pattern jo racing ke liye already kaam kar
+// raha hai (sliceBetweenMarkers, upar dekho) — plain text markers se section
+// boundaries nikaalna, structure/wrapper tags pe bharosa na karna. 'TABS SYSTEM'
+// marker (jo pehle se greyhound section ke end ko mark karta hai) ke baad hi
+// match-odds tabs (Cricket/Tennis/Football) shuru hote hain, isliye search
+// wahin se shuru karte hain.
+const SPORT_SECTION_DEFS = [
+  { resolveId: resolveCricketId,  markers: ['Cricket'] },
+  { resolveId: resolveTennisId,   markers: ['Tennis'] },
+  { resolveId: resolveFootballId, markers: ['Football', 'Soccer'] },
+];
+
+// Case-insensitive, region ke andar marker text ka pehla occurrence dhoondo
+function findFirstMarkerIndex(regionHtml, markers) {
+  let best = -1;
+  for (const marker of markers) {
+    const idx = regionHtml.search(new RegExp(marker, 'i'));
+    if (idx !== -1 && (best === -1 || idx < best)) best = idx;
+  }
+  return best;
+}
+
 function parseMatchOddsSections(html) {
+  const tabsIdx = html.indexOf('TABS SYSTEM');
+  const region = tabsIdx === -1 ? html : html.slice(tabsIdx);
+
+  const found = SPORT_SECTION_DEFS
+    .map(def => ({ ...def, startIdx: findFirstMarkerIndex(region, def.markers) }))
+    .filter(f => f.startIdx !== -1)
+    .sort((a, b) => a.startIdx - b.startIdx);
+
+  logger.info(`[bpexch] match-odds sections found: ${found.map(f => f.markers[0]).join(', ') || '(none)'}`);
+
   const sections = [];
-  let block;
-  HIGHLIGHTS_TABLE_RE.lastIndex = 0;
-  while ((block = HIGHLIGHTS_TABLE_RE.exec(html)) !== null) {
-    const blockHtml = block[1];
-    const labelM = SPORT_LABEL_RE.exec(blockHtml);
-    const label = labelM ? labelM[1] : '';
-    const eventTypeId = eventTypeIdForSportLabel(label);
-    if (!eventTypeId) continue; // is sport ki SPORT_MAP mein ID hi nahi mili — safe skip
+  for (let i = 0; i < found.length; i++) {
+    const cur = found[i];
+    const next = found[i + 1];
+    const sectionHtml = next ? region.slice(cur.startIdx, next.startIdx) : region.slice(cur.startIdx);
+    const label = cur.markers[0];
+    const eventTypeId = cur.resolveId();
 
     const items = [];
-    let rowM;
-    MATCH_ROW_RE.lastIndex = 0;
-    while ((rowM = MATCH_ROW_RE.exec(blockHtml)) !== null) {
-      const item = parseMatchRow(rowM[0], rowM[1], eventTypeId);
-      if (item) items.push(item);
+    if (eventTypeId) {
+      let rowM;
+      MATCH_ROW_RE.lastIndex = 0;
+      while ((rowM = MATCH_ROW_RE.exec(sectionHtml)) !== null) {
+        const item = parseMatchRow(rowM[0], rowM[1], eventTypeId);
+        if (item) items.push(item);
+      }
     }
+    logger.info(`[bpexch] section "${label}" -> eventTypeId=${eventTypeId} rows=${items.length}`);
     sections.push({ label, eventTypeId, items });
   }
   return sections;
