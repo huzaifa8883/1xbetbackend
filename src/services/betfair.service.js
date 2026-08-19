@@ -306,65 +306,65 @@ function parseMatchRow(rowHtml, rowId, eventTypeId) {
   };
 }
 
-// ⚠️ CHANGED: pehle wala approach `<div class="high_lights">...</table></div>`
-// wrapper + `<svg>` ke baad wale label text pe depend karta tha — ye sirf ek
-// static full-page HTML sample pe test hua tha, aur live /Common/MarketHighlights
-// AJAX response pe fail ho gaya (Cricket/Tennis/Football section hi detect
-// nahi ho rahe the, isliye 0 items — horse racing chalta raha kyunki uska
-// detection simple text-marker se hota hai, div/svg structure pe nahi).
+// ✅ REVERTED to div/svg-based block detection — verified directly against
+// REAL live HTML the user pasted from DevTools (not a guess this time).
+// Each sport genuinely lives in its own `<div class="high_lights">...
+// <table>...</table></div>` block, with the sport name inside `<title>`
+// (svg icon title, e.g. `<title>tennis</title>`) — that's the most stable
+// label source since it's semantic markup, not display text.
 //
-// Naya approach: EXACT wahi proven pattern jo racing ke liye already kaam kar
-// raha hai (sliceBetweenMarkers, upar dekho) — plain text markers se section
-// boundaries nikaalna, structure/wrapper tags pe bharosa na karna. 'TABS SYSTEM'
-// marker (jo pehle se greyhound section ke end ko mark karta hai) ke baad hi
-// match-odds tabs (Cricket/Tennis/Football) shuru hote hain, isliye search
-// wahin se shuru karte hain.
-const SPORT_SECTION_DEFS = [
-  { resolveId: resolveCricketId,  markers: ['Cricket'] },
-  { resolveId: resolveTennisId,   markers: ['Tennis'] },
-  { resolveId: resolveFootballId, markers: ['Football', 'Soccer'] },
-];
+// ⚠️ The PREVIOUS revision here (nav-order marker slicing) was wrong: it
+// found "Cricket"/"Tennis"/"Football" text in whatever order they first
+// appear in the page (which is the TAB-BUTTON nav, e.g. "Cricket, Tennis,
+// Football"), but the actual DATA sections appear in a different order
+// ("Football, Tennis, Cricket" in the real response) — so it sliced the
+// wrong regions and got 0 rows for Cricket/Tennis. Confirmed by testing
+// this block-based approach directly against the real pasted HTML.
+const HIGHLIGHTS_BLOCK_RE = /<div class="high_lights"[^>]*>([\s\S]*?)<\/table>\s*<\/div>/g;
+const SPORT_TITLE_RE = /<title>\s*([A-Za-z]+)\s*<\/title>/i;
+const SPORT_LABEL_FALLBACK_RE = /<\/svg>\s*([A-Za-z]+)\s*<\/div>/;
 
-// Case-insensitive, region ke andar marker text ka pehla occurrence dhoondo
-function findFirstMarkerIndex(regionHtml, markers) {
-  let best = -1;
-  for (const marker of markers) {
-    const idx = regionHtml.search(new RegExp(marker, 'i'));
-    if (idx !== -1 && (best === -1 || idx < best)) best = idx;
-  }
-  return best;
+function extractSportLabel(blockHtml) {
+  const titleM = SPORT_TITLE_RE.exec(blockHtml);
+  if (titleM) return titleM[1];
+  const fbM = SPORT_LABEL_FALLBACK_RE.exec(blockHtml);
+  return fbM ? fbM[1] : '';
+}
+
+function eventTypeIdForSportLabel(label) {
+  const l = String(label || '').toLowerCase();
+  if (l.includes('cricket')) return resolveCricketId();
+  if (l.includes('tennis')) return resolveTennisId();
+  if (l.includes('football') || l.includes('soccer')) return resolveFootballId();
+  return null;
 }
 
 function parseMatchOddsSections(html) {
-  const tabsIdx = html.indexOf('TABS SYSTEM');
-  const region = tabsIdx === -1 ? html : html.slice(tabsIdx);
-
-  const found = SPORT_SECTION_DEFS
-    .map(def => ({ ...def, startIdx: findFirstMarkerIndex(region, def.markers) }))
-    .filter(f => f.startIdx !== -1)
-    .sort((a, b) => a.startIdx - b.startIdx);
-
-  logger.info(`[bpexch] match-odds sections found: ${found.map(f => f.markers[0]).join(', ') || '(none)'}`);
-
   const sections = [];
-  for (let i = 0; i < found.length; i++) {
-    const cur = found[i];
-    const next = found[i + 1];
-    const sectionHtml = next ? region.slice(cur.startIdx, next.startIdx) : region.slice(cur.startIdx);
-    const label = cur.markers[0];
-    const eventTypeId = cur.resolveId();
+  let block;
+  HIGHLIGHTS_BLOCK_RE.lastIndex = 0;
+  let blockCount = 0;
+  while ((block = HIGHLIGHTS_BLOCK_RE.exec(html)) !== null) {
+    blockCount++;
+    const blockHtml = block[1];
+    const label = extractSportLabel(blockHtml);
+    const eventTypeId = eventTypeIdForSportLabel(label);
 
     const items = [];
     if (eventTypeId) {
       let rowM;
       MATCH_ROW_RE.lastIndex = 0;
-      while ((rowM = MATCH_ROW_RE.exec(sectionHtml)) !== null) {
+      while ((rowM = MATCH_ROW_RE.exec(blockHtml)) !== null) {
         const item = parseMatchRow(rowM[0], rowM[1], eventTypeId);
         if (item) items.push(item);
       }
     }
-    logger.info(`[bpexch] section "${label}" -> eventTypeId=${eventTypeId} rows=${items.length}`);
+    logger.info(`[bpexch] block#${blockCount} label="${label}" eventTypeId=${eventTypeId} rows=${items.length}`);
+    if (!eventTypeId) continue; // is sport ki SPORT_MAP mein ID hi nahi mili — safe skip
     sections.push({ label, eventTypeId, items });
+  }
+  if (!blockCount) {
+    logger.warn('[bpexch] no "high_lights" blocks found at all in MarketHighlights response');
   }
   return sections;
 }
