@@ -113,7 +113,16 @@ async function fetchSportMarkets(sportKey, eventTypeId, overrides = {}) {
   const maxResults    = String(cfg?.max_results   ?? overrides.maxResults  ?? 20);
   const marketTypes   = (cfg?.market_types ?? overrides.marketTypes ?? 'MATCH_ODDS').split(',').map(s => s.trim());
   const inPlayOnly    = cfg?.inplay_only  ?? overrides.inPlayOnly  ?? false;
-  const hoursAhead    = cfg?.hours_ahead  ?? overrides.hoursAhead  ?? 24;
+  // ✅ BUG FIX: pehle sab sports ke liye hoursAhead default 24 tha. Cricket
+  // matches (Tests/tournaments) aksar 24 ghante se zyada aage schedule hote
+  // hain — is default se wo upcoming window ke bahar chale jaate the aur
+  // listEvents() 0 return karta tha (poori tarah gayab ho jaate the, chahe
+  // data source mein match maujood ho). Ab sport ke hisaab se generous
+  // default hai — bpexch ka apna highlights feed already curated hai
+  // (sirf relevant matches deta hai), is liye wide window se koi clutter
+  // nahi aayega, bas cutoff nahi hoga.
+  const HOURS_AHEAD_DEFAULTS = { horse: 24, greyhound: 24, football: 72, cricket: 240, tennis: 120 };
+  const hoursAhead = cfg?.hours_ahead ?? overrides.hoursAhead ?? HOURS_AHEAD_DEFAULTS[sportKey] ?? 24;
 
   const now = new Date();
 
@@ -157,6 +166,7 @@ async function fetchSportMarkets(sportKey, eventTypeId, overrides = {}) {
   if (inPlayOnly) eventFilter.inPlayOnly = true;
 
   let events = await listEvents(eventFilter);
+  logger.info(`[markets:${sportKey}] window ${from} -> ${to} | events=${events.length}`);
   if (!events.length) return [];
 
   const catalogueFilter = {
@@ -224,17 +234,25 @@ async function getLiveTennis(req, res) {
 
   const maxResults = String(cfg?.max_results ?? 20);
   const now = new Date();
-  const hoursAhead = cfg?.hours_ahead ?? 24;
-  const to = new Date(now.getTime() + hoursAhead * 3600_000).toISOString();
+  // ✅ BUG FIX: pehle 'from' seedha `now` tha, jo koi bhi already-started
+  // (InPlay) match ko filter se bahar kar deta tha — kyunki uska start
+  // time hamesha "now" se pehle hota hai. Ab fetchSportMarkets() jaisa hi
+  // lookback window (360 min) use ho raha hai, taake in-play matches bhi
+  // shamil rahein. hoursAhead default bhi 24 se 120 kar diya — tennis
+  // tournaments 24 ghante se aage bhi schedule ho sakte hain.
+  const hoursAhead = cfg?.hours_ahead ?? 120;
+  const from = new Date(now.getTime() - 360 * 60_000).toISOString();
+  const to   = new Date(now.getTime() + hoursAhead * 3600_000).toISOString();
 
   const eventFilter = {
     eventTypeIds: ['2'],
-    marketStartTime: { from: now.toISOString(), to },
+    marketStartTime: { from, to },
   };
   if (cfg?.allowed_countries)      eventFilter.marketCountries = cfg.allowed_countries.split(',').map(s => s.trim());
   if (cfg?.allowed_competition_ids) eventFilter.competitionIds = cfg.allowed_competition_ids.split(',').map(s => s.trim());
 
   let events = await listEvents(eventFilter);
+  logger.info(`[markets:tennis] window ${from} -> ${to} | events=${events.length}`);
   events = events.filter(({ event }) => {
     const n = event.name.toLowerCase();
     return !n.includes('set') && !n.includes('game') && !n.includes('odds');
