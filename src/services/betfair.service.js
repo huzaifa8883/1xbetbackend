@@ -1,344 +1,473 @@
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
-   ⚠️ MIGRATION NOTICE (please read before relying on this file)
+   ⚠️ MIGRATION NOTICE — BetwayInfo (2nd migration, Rollwin/Shubdx se)
    ═══════════════════════════════════════════════════════════════════
-   Ye file pehle SEEDHA Betfair API call karti thi. Ab market/odds LIST
-   Shubdx (shubdxinternational.com) se aata hai — file ka NAAM same
-   rakha hai (betfair.service.js) taake market.controller.js aur baaki
-   consumers mein import paths na badalne padein.
+   Odds/listing data ab BetwayInfo (betwayinfo.com) se aata hai — ye
+   ek Betfair-RELAY hai (khud ka data nahi banata, seedha Betfair se
+   proxy karta hai). Confirm ho chuka hai: catalog2 response mein
+   "origin": "BETFAIR" milta hai, matlab market IDs ASAL Betfair market
+   IDs hain (jaise "1.255462233").
 
-   ✅ NEW: Cricket/Football/Tennis ke liye score-card endpoint bhi add
-   kiya hai (fetchScoreCard) — https://shubdxinternational.com/score/max<Sport>
-   — future mein settlement/live-score ke liye use ho sakta hai (abhi
-   sirf function ready hai, kahin call nahi ho raha — jab result-data
-   confirm ho jaye tab autoSettle_service.js mein wire karna).
+   Isi wajah se:
+   ✅ Odds/listing (listEvents, listMarketCatalogue, listMarketBook,
+      listCompetitions, listEventTypes) — BetwayInfo se (neeche).
+   ✅ Settlement (listMarketProfitAndLoss) — REAL Betfair API se hi
+      (login/session code neeche zinda rakha hai) — kyunki market IDs
+      genuine Betfair IDs hain, Betfair khud unhe pehchanta hai. Ye
+      bilkul wahi pattern hai jo Rollwin migration mein bhi tha.
 
-   FUNCTION NAMES aur RETURN SHAPES Betfair jaisi hi rakhi hain (event,
-   competition, runners[].back/lay waghera) — taake existing controller
-   code zyada tabdeeli ke bagair chal jaye.
+   Client instruction (verbatim): "/api/ ki jagah /api1/ use karo" —
+   is liye menu endpoint /api1/menu hai (docs mein /api/menu likha tha).
 
-   ✅ IMPORTANT DISCOVERY: Rollwin/Shubdx ek AGGREGATOR hai — har market
-   ke response mein "op" field batata hai asal source kya hai:
-     - op === "Betfair"  → market ID ASAL Betfair market ID hai
-                            (e.g. "1.260868269") — Betfair ISE PEHCHANTA
-                            HAI. Is liye settlement (listMarketProfitAndLoss)
-                            REAL Betfair API se hi ho sakti hai, jaisa
-                            pehle hota tha — code neeche waisa hi rakha hai.
-     - op === "Shubdx"   → market ID Shubdx ka apna synthetic ID hai
-                            (e.g. "1.72221158.3d57ee9d30") — Betfair ko
-                            ye pata hi nahi. Aise markets ke liye settlement
-                            abhi possible NAHI hai jab tak Shubdx khud
-                            result/winner data na de (unconfirmed).
+   ⚠️ UNCONFIRMED HISSA (abhi tak real sample se verify nahi hua):
+   1) /api1/menu ka EXACT response shape — sirf itna pata hai ke isse
+      "eventName → matchId" milta hai (docs se). eventTypeId/competition/
+      startTime jaise fields kis naam se aate hain, confirm nahi —
+      is liye normalizeMenuItem() mein kai plausible field-name variants
+      try kiye hain (defensive parsing), taake jo bhi shape ho crash na ho.
 
-   Practical asar: op:"Betfair" wale matches (jo majority lagte hain)
-   NORMAL settle hote rahenge. op:"Shubdx" wale matches settle nahi
-   honge jab tak alag se result-source confirm na ho — aise stuck
-   markets humara pehle se bana hua "STUCK MARKET" warning system
-   (autoSettle_service.js) khud pakad lega, chup-chaap nahi rahega.
+   ✅ CONFIRMED (real in-play match, marketId=1.259466913 se):
+   2) /data/Data ka marketBooks[].runners[] structure ab confirm ho chuka
+      hai: { id, price1/2/3, size1/2/3, lay1/2/3, ls1/2/3 (← lay SIZE,
+      "laySize" nahi), status, handicap }. listMarketBook() ab isi ke
+      hisab se sahi parse karta hai. Pehle "ls1/2/3" ki jagah "laySize"/
+      "lsize" try ho raha tha (kabhi match nahi hota tha → LAY size hamesha
+      0 aata tha), aur marketBooks[0].marketStatus field ko "status"
+      samjha ja raha tha (galat naam, hamesha default 'OPEN' fallback
+      chalta tha) — dono fix ho chuke hain.
+
+   ➡️ AGLA STEP (agar kuch bacha ho): /api1/menu ka real sample bhejna
+      taake normalizeMenuItem() ki defensive-parsing guesses confirm ho
+      sakein.
    ═══════════════════════════════════════════════════════════════════ */
 
 const axios  = require('axios');
 const logger = require('../utils/logger');
 const { SPORT_MAP } = require('../config/constants');
 
-const BASE_URL = process.env.SHUBDX_BASE_URL || 'https://shubdxinternational.com/sports';
+const BASE_URL = process.env.BETWAY_BASE_URL || 'https://betwayinfo.com';
 const TIMEOUT_MS = 15000;
 
-/* ── ✅ Real Betfair session/login — SETTLEMENT ke liye zinda rakha hai
-   (listMarketProfitAndLoss), kyunki op:"Betfair" wale markets ka ID
-   asal Betfair ko pata hota hai. Odds/listing ke liye ab iski zaroorat
-   nahi (wo Rollwin se aata hai), lekin settlement isi pe depend karta
-   hai — is liye original code bilkul waisa hi rakha hai. ──────────── */
-const BF_APP_KEY  = process.env.BETFAIR_APP_KEY;
-const BF_USERNAME = process.env.BETFAIR_USERNAME;
-const BF_PASSWORD = process.env.BETFAIR_PASSWORD;
-const BF_LOGIN_URL = process.env.BETFAIR_LOGIN_URL || 'https://identitysso.betfair.com/api/login';
-const BF_API_URL   = process.env.BETFAIR_API_URL   || 'https://api.betfair.com/exchange/betting/json-rpc/v1';
-const BF_TTL_MS     = parseInt(process.env.BETFAIR_SESSION_TTL_MINUTES || '25', 10) * 60 * 1000;
+/* ═══════════════════════════════════════════════════════════════════
+   ✅ bpexch.live migration — HORSE RACING (7) aur GREYHOUND (4339) ONLY
+   ═══════════════════════════════════════════════════════════════════
+   Client ne https://bpexch.live/Common/MarketHighlights?_=... diya.
+   Real HTML sample check kiya:
+   - Horse Race aur Grey Hound section HTML mein hi seedha embedded hain
+     (venue name, race start time (UTC), aur "/Common/Event/<id>" link) —
+     isliye ye 2 sports ab CONFIRMED bpexch.live se parse ho rahe hain
+     (neeche getRacingHighlights()).
+   - Cricket/Soccer/Tennis ka odds table (Matched, 1/X/2 prices) is HTML
+     response mein KHAALI (<tbody></tbody>) aata hai — wo data page-load
+     ke baad kisi ALAG AJAX call se JS bharta hai, jiska exact URL abhi
+     confirm nahi hua. Isi wajah se football/cricket/tennis abhi bhi
+     PURANE BetwayInfo source se hi aa rahe hain (neeche, unchanged) —
+     jaise hi real odds-AJAX endpoint mil jaye, wahi switch ho jayega.
+   ═══════════════════════════════════════════════════════════════════ */
+const BPEXCH_BASE_URL = process.env.BPEXCH_BASE_URL || 'https://bpexch.live';
+const RACING_EVENT_TYPE_IDS = new Set(['7', '4339']); // Horse Racing, Greyhound Racing
 
-let _bfCachedToken = null;
-let _bfTokenExpiry = null;
-let _bfLoginPromise = null;
+let _highlightsHtmlCache = null;
+let _highlightsHtmlExpiry = 0;
+// Chhota TTL rakha hai taake "time ke sath data update" ho — har naya
+// request (cache expire hone ke baad) fresh HTML khींchta hai.
+const HIGHLIGHTS_CACHE_TTL_MS = parseInt(process.env.BPEXCH_HIGHLIGHTS_CACHE_TTL_MS || '4000', 10);
 
-async function getBetfairSessionToken() {
-  if (_bfCachedToken && _bfTokenExpiry && Date.now() < _bfTokenExpiry) return _bfCachedToken;
-  if (_bfLoginPromise) return _bfLoginPromise;
+async function fetchHighlightsHtml() {
+  const url = `${BPEXCH_BASE_URL}/Common/MarketHighlights`;
+  const res = await axios.get(url, {
+    params: { _: Date.now() }, // site khud bhi cache-buster query bhejta hai
+    timeout: TIMEOUT_MS,
+    headers: {
+      'X-Requested-With': 'XMLHttpRequest',
+      Accept: 'text/html, */*',
+    },
+  });
+  return typeof res.data === 'string' ? res.data : String(res.data);
+}
 
-  _bfLoginPromise = (async () => {
+async function getHighlightsHtml() {
+  if (_highlightsHtmlCache && Date.now() < _highlightsHtmlExpiry) return _highlightsHtmlCache;
+  const html = await fetchHighlightsHtml();
+  _highlightsHtmlCache = html;
+  _highlightsHtmlExpiry = Date.now() + HIGHLIGHTS_CACHE_TTL_MS;
+  return html;
+}
+
+function sliceBetweenMarkers(html, startMarker, endMarker) {
+  const startIdx = html.indexOf(startMarker);
+  if (startIdx === -1) return '';
+  const from = startIdx + startMarker.length;
+  const endIdx = endMarker ? html.indexOf(endMarker, from) : -1;
+  return endIdx === -1 ? html.slice(startIdx) : html.slice(startIdx, endIdx);
+}
+
+// Har race-card block ka pattern (real sample se confirmed):
+// <a href="/Common/Event/35954463.1822">...utctime...2026-08-19T18:22:00...
+// ...slidename'>Finger Lakes (US)...
+const RACE_ITEM_RE = /href="\/Common\/Event\/([^"]+)"[\s\S]*?utctime[^>]*>\s*([^<]+?)\s*<\/span>[\s\S]*?slidename'>\s*([^<]+?)\s*<\/span>/g;
+
+function parseRaceItems(sectionHtml, eventTypeId) {
+  const items = [];
+  let m;
+  RACE_ITEM_RE.lastIndex = 0;
+  while ((m = RACE_ITEM_RE.exec(sectionHtml)) !== null) {
+    const [, hrefId, startIsoRaw, venueRaw] = m;
+    const id = hrefId.trim(); // e.g. "35954463.1822" — poora string hi unique race id hai (prefix meeting/venue ka hai, poora string specific race ka)
+    const venue = venueRaw.trim();
+    const startIso = startIsoRaw.trim();
+    items.push({
+      id,
+      name: `${venue} - Win`,
+      start: startIso,
+      eventTypeId: String(eventTypeId),
+      inPlay: false,
+      matched: 0,
+      competition: null,
+      event: {
+        id,
+        name: venue,
+        countryCode: null,
+        venue,
+        openDate: startIso,
+      },
+      runners: [], // is highlights feed mein runners nahi aate — sirf meeting/race listing hai
+    });
+  }
+  return items;
+}
+
+async function getRacingHighlights(eventTypeId) {
+  const html = await getHighlightsHtml();
+  const horseSection = sliceBetweenMarkers(html, 'Horse Race', 'Grey Hound');
+  const greyhoundSection = sliceBetweenMarkers(html, 'Grey Hound', 'TABS SYSTEM');
+
+  if (String(eventTypeId) === '7') return parseRaceItems(horseSection, '7');
+  if (String(eventTypeId) === '4339') return parseRaceItems(greyhoundSection, '4339');
+
+  return [...parseRaceItems(horseSection, '7'), ...parseRaceItems(greyhoundSection, '4339')];
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   ✅ REAL Betfair session/login — SETTLEMENT ke liye zinda hai
+   (listMarketProfitAndLoss). Market IDs genuine Betfair IDs hain
+   (origin:"BETFAIR" confirm), is liye settlement humesha real Betfair
+   API se hi query hoti hai — code bilkul waisa hi hai jo pehle tha.
+   ═══════════════════════════════════════════════════════════════════ */
+const APP_KEY  = process.env.BETFAIR_APP_KEY;
+const USERNAME = process.env.BETFAIR_USERNAME;
+const PASSWORD = process.env.BETFAIR_PASSWORD;
+const LOGIN_URL  = process.env.BETFAIR_LOGIN_URL  || 'https://identitysso.betfair.com/api/login';
+const API_URL    = process.env.BETFAIR_API_URL     || 'https://api.betfair.com/exchange/betting/json-rpc/v1';
+const TTL_MS     = parseInt(process.env.BETFAIR_SESSION_TTL_MINUTES || '25', 10) * 60 * 1000;
+
+const BASE_BAN_COOLDOWN_MS = parseInt(process.env.BETFAIR_BAN_COOLDOWN_MINUTES || '30', 10) * 60 * 1000;
+const MAX_BAN_COOLDOWN_MS  = parseInt(process.env.BETFAIR_MAX_BAN_COOLDOWN_MINUTES || '360', 10) * 60 * 1000;
+
+let cachedToken = null;
+let tokenExpiry = null;
+let loginPromise = null;
+let bannedUntil = null;
+let consecutiveBans = 0;
+
+function currentCooldownMs() {
+  const scaled = BASE_BAN_COOLDOWN_MS * Math.pow(2, consecutiveBans);
+  return Math.min(scaled, MAX_BAN_COOLDOWN_MS);
+}
+
+async function getSessionToken() {
+  if (bannedUntil && Date.now() < bannedUntil) {
+    const waitMin = Math.ceil((bannedUntil - Date.now()) / 60000);
+    throw new Error(`Betfair temporarily banned — cooldown active, ~${waitMin} min baaki (login try nahi kiya jaa raha, is se ban renew hone se bach raha hai)`);
+  }
+  if (bannedUntil && Date.now() >= bannedUntil) {
+    bannedUntil = null;
+  }
+
+  if (cachedToken && tokenExpiry && Date.now() < tokenExpiry) {
+    return cachedToken;
+  }
+
+  if (loginPromise) {
+    return loginPromise;
+  }
+
+  loginPromise = (async () => {
     try {
       logger.info('Betfair: Requesting new session token...');
       const res = await axios.post(
-        BF_LOGIN_URL,
-        new URLSearchParams({ username: BF_USERNAME, password: BF_PASSWORD }),
-        { headers: { 'X-Application': BF_APP_KEY, 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
+        LOGIN_URL,
+        new URLSearchParams({ username: USERNAME, password: PASSWORD }),
+        {
+          headers: {
+            'X-Application': APP_KEY,
+            'Content-Type': 'application/x-www-form-urlencoded'
+          },
+          timeout: 10000
+        }
       );
+
       if (res.data.status !== 'SUCCESS') {
-        _bfCachedToken = null; _bfTokenExpiry = null;
-        throw new Error(`Betfair login failed: ${res.data.error || 'UNKNOWN_ERROR'}`);
+        const errorMsg = res.data.error || 'UNKNOWN_ERROR';
+        cachedToken = null;
+        tokenExpiry = null;
+
+        if (String(errorMsg).includes('TEMPORARY_BAN') || String(errorMsg).includes('TOO_MANY_REQUESTS')) {
+          consecutiveBans += 1;
+          const cooldown = currentCooldownMs();
+          bannedUntil = Date.now() + cooldown;
+          logger.error(
+            `Betfair: TEMPORARY_BAN detected (${consecutiveBans}${consecutiveBans === 1 ? 'st' : consecutiveBans === 2 ? 'nd' : 'th'} baar) — ` +
+            `${Math.round(cooldown / 60000)} min ke liye login attempts ROK diye gaye. ` +
+            `Is dauran koi bhi Betfair request nahi jayegi.`
+          );
+        }
+        throw new Error(`Betfair login failed: ${errorMsg}`);
       }
-      _bfCachedToken = res.data.token;
-      _bfTokenExpiry = Date.now() + BF_TTL_MS;
+
+      consecutiveBans = 0;
+      bannedUntil = null;
+
+      cachedToken = res.data.token;
+      tokenExpiry = Date.now() + TTL_MS;
       logger.info('Betfair: New session token successfully generated');
-      return _bfCachedToken;
+      return cachedToken;
     } catch (err) {
-      _bfCachedToken = null; _bfTokenExpiry = null;
+      cachedToken = null;
+      tokenExpiry = null;
       throw err;
     } finally {
-      _bfLoginPromise = null;
+      loginPromise = null;
     }
   })();
-  return _bfLoginPromise;
+
+  return loginPromise;
 }
 
-async function bfJsonRpc(method, params, isRetry = false) {
+async function jsonRpc(method, params, isRetry = false) {
   try {
-    const token = await getBetfairSessionToken();
+    const token = await getSessionToken();
     const body  = [{ jsonrpc: '2.0', method, params, id: 1 }];
-    const resp  = await axios.post(BF_API_URL, body, {
-      headers: { 'X-Application': BF_APP_KEY, 'X-Authentication': token, 'Content-Type': 'application/json' },
-      timeout: 15000,
+    const resp  = await axios.post(API_URL, body, {
+      headers: {
+        'X-Application': APP_KEY,
+        'X-Authentication': token,
+        'Content-Type': 'application/json'
+      },
+      timeout: 15000
     });
+
     const result = resp.data[0]?.result;
     const error  = resp.data[0]?.error;
 
     if (error && (error.code === -32099 || error.data?.APINGException?.errorCode === 'INVALID_SESSION_INFORMATION')) {
       logger.warn('Betfair: Session invalidated on RPC call, clearing cached token');
-      _bfCachedToken = null; _bfTokenExpiry = null;
-      if (!isRetry) return bfJsonRpc(method, params, true);
+      cachedToken = null;
+      tokenExpiry = null;
+      if (!isRetry) {
+        return jsonRpc(method, params, true);
+      }
     }
-    if (!result) throw new Error(`No result from Betfair: ${method} - error: ${JSON.stringify(error)}`);
+
+    if (!result) {
+      throw new Error(`No result from Betfair: ${method} - error: ${JSON.stringify(error)}`);
+    }
+
     return result;
   } catch (err) {
     if (err.message.includes('INVALID_SESSION') || err.message.includes('login failed')) {
-      _bfCachedToken = null; _bfTokenExpiry = null;
+      cachedToken = null;
+      tokenExpiry = null;
     }
     throw err;
   }
 }
 
-// Betfair eventTypeId → Shubdx/Rollwin URL sport-segment mapping.
-// SPORT_MAP (config/constants) se hi eventTypeId → naam milta hai,
-// yahan sirf naam ko API ke URL-friendly slug mein convert kar rahe hain.
-//
-// ⚠️ Horse/Greyhound slugs env var se override ho sakti hain — agar
-// Rollwin/Shubdx pe inka asal URL-segment "horse"/"greyhound" se
-// different nikle (404 error dekh kar), .env mein
-// SHUBDX_SLUG_HORSE / SHUBDX_SLUG_GREYHOUND set karke bina code
-// badle turant test kiya ja sakta hai.
-const EVENT_TYPE_TO_SPORT_SLUG = {
-  '1':    'football',
-  '2':    'tennis',
-  '4':    'cricket',
-  '7':    process.env.SHUBDX_SLUG_HORSE     || 'horse',
-  '4339': process.env.SHUBDX_SLUG_GREYHOUND || 'greyhound',
-};
+async function listMarketProfitAndLoss(marketIds = []) {
+  return jsonRpc('SportsAPING/v1.0/listMarketProfitAndLoss', {
+    marketIds,
+    includeSettledBets: true,
+    includeBspBets: true,
+    netOfCommission: false,
+  });
+}
 
-/* ── Short-TTL cache: ek hi sport ke liye baar baar "allmatches" na
-   maara jaaye jab multiple functions (events/competitions/catalogue)
-   thodi thodi der mein call ho rahe hon. ────────────────────────── */
-const _cache = new Map(); // sportSlug → { data, expiresAt, isError }
-const CACHE_TTL_MS = parseInt(process.env.SHUBDX_CACHE_TTL_MS || '4000', 10);
-// ✅ Failure bhi cache karo — warna ek hamesha-404-dene-wala slug (jaise
-// abhi horse/greyhound) HAR single request pe dobara hit hota hai, khaas
-// taur pe listMarketCatalogue/listMarketBook jab sirf marketId diya ho
-// (getRunnerBook/catalog2/AutoSettle) to woh SAARE 5 sports try karte hain
-// — matlab ek hi settlement cycle mein horse+greyhound dono baar baar fail
-// ho rahe the, chahe market unse related bhi na ho. Negative-cache is
-// noise/load ko bohot kam kar deta hai jab tak asal slug fix na ho.
-const ERROR_CACHE_TTL_MS = parseInt(process.env.SHUBDX_ERROR_CACHE_TTL_MS || '30000', 10);
-
-// Horse Race / Greyhound Betfair "races" hote hain, "matches" nahi —
-// Rollwin/Shubdx pe inka list-endpoint bhi alag naam se hai: "allraces"
-// (allmatches nahi). Env var se override bhi ho sakta hai agar naam
-// aage kabhi badle.
-const RACING_SLUGS = new Set([
-  process.env.SHUBDX_SLUG_HORSE     || 'horse',
-  process.env.SHUBDX_SLUG_GREYHOUND || 'greyhound',
-]);
-function isRacingSlug(sportSlug) { return RACING_SLUGS.has(sportSlug); }
-const ALL_LIST_ENDPOINT = process.env.SHUBDX_RACES_ENDPOINT || 'allraces'; // horse/greyhound
-const ONE_MATCH_ENDPOINT_RACING = process.env.SHUBDX_FETCHRACE_ENDPOINT || 'fetchrace'; // horse/greyhound
-
-// Reverse lookup: sportSlug → eventTypeId (racing normalizer ke liye chahiye)
-const SPORT_SLUG_TO_EVENT_TYPE = Object.fromEntries(
-  Object.entries(EVENT_TYPE_TO_SPORT_SLUG).map(([id, slug]) => [slug, id])
-);
-
-/* ═══════════════════════════════════════════════════════════════
-   ✅ BUG FIX: Horse Race / Greyhound "allraces" endpoint ka response
-   shape team-sports "allmatches" se BILKUL ALAG (flat) hai:
-
-     allmatches (football/cricket/tennis) → { id, event:{id,name,...}, competition:{...}, start, runners:[...] }
-     allraces   (horse/greyhound)         → { id, countryCode, venue, startTime, marketId, isBettable, inPlay }
-                                              ⚠️ koi nested "event" object NAHI hai!
-
-   Baaki poora file (listEvents, listMarketCatalogue, listMarketBook)
-   hamesha `m.event.id`, `m.event.name`, `m.start` waghera padhta hai —
-   racing ke flat items mein `m.event` hi undefined hota hai, is liye
-   `if (!ev?.id) return;` HAR race ko silently skip kar deta tha →
-   horse/greyhound mein hamesha khali data aata tha (admin panel ho ya
-   dashboard, dono jagah).
-
-   Fix: racing items ko yahin (source par) generic "event"-shaped object
-   mein normalize kar do — is se baaki file mein KUCH badalne ki
-   zaroorat nahi, sab already-existing code automatically kaam karega.
-──────────────────────────────────────────────────────────────── */
-function normalizeRacingItem(r, sportSlug) {
-  const startIso   = r.startTime || null;
-  const timeLabel  = startIso ? new Date(startIso).toISOString().slice(11, 16) : '';
-  const venueName  = r.venue || 'Race';
-  const displayName = timeLabel ? `${venueName} ${timeLabel}` : venueName;
-
+function getBanStatus() {
+  if (!bannedUntil || Date.now() >= bannedUntil) return { banned: false, consecutiveBans };
   return {
-    // ⚠️ marketId abhi tak Betfair/Shubdx se assign nahi hua ho sakta
-    // (raw "marketId" often null jab tak race bettable-window ke qareeb
-    // na aaye) — tab tak race ki apni unique id (e.g. "35911818.1734")
-    // hi placeholder ki tarah use karo, taake downstream code crash na
-    // ho. Jaise hi real marketId aata hai wo automatically use hoga.
-    id:     r.marketId || r.id,
-    name:   displayName,
-    start:  startIso,
-    status: r.isBettable === false ? 'CLOSED' : 'OPEN',
-    inPlay: !!r.inPlay,
-    matched: 0,
-    competition: null, // racing mein "competition" jaisi cheez nahi hoti — track/venue hi grouping hai
-    event: {
-      id: r.id,          // ✅ race ki apni unique id — ye hi per-race "eventId" hai
-      name: displayName,
-      countryCode: r.countryCode || null,
-      venue: venueName,
-      openDate: startIso,
-    },
-    eventTypeId: SPORT_SLUG_TO_EVENT_TYPE[sportSlug] || null,
-    runners: r.runners || [], // "allraces" list mein runners nahi hote — "fetchrace" (single) mein aate hain
+    banned: true,
+    consecutiveBans,
+    retryAfterMs: bannedUntil - Date.now(),
+    retryAt: new Date(bannedUntil).toISOString(),
   };
 }
 
-async function fetchAllMatches(sportSlug) {
-  const cached = _cache.get(sportSlug);
-  if (cached && Date.now() < cached.expiresAt) {
-    if (cached.isError) throw cached.error;
-    return cached.data;
-  }
+/* ═══════════════════════════════════════════════════════════════════
+   ✅ BetwayInfo — odds/listing data
+   ═══════════════════════════════════════════════════════════════════ */
 
-  const endpoint = isRacingSlug(sportSlug) ? ALL_LIST_ENDPOINT : 'allmatches';
-  const url = `${BASE_URL}/${sportSlug}/${endpoint}`;
-  try {
-    const res = await axios.get(url, { timeout: TIMEOUT_MS });
-    const raw = res.data;
-    // ✅ Confirmed shapes (asal server response se):
-    //   allmatches:  { status:"success", data: { status:{...}, success:true, result:[...] } }
-    //   fetchmatch:  { status:{...}, success:true, result:[...] }
-    let markets = Array.isArray(raw?.data?.result) ? raw.data.result   // allmatches shape
-                  : Array.isArray(raw?.result)       ? raw.result        // fetchmatch shape
-                  : Array.isArray(raw)                ? raw
-                  : Array.isArray(raw?.data)          ? raw.data
-                  : [];
+// eventTypeId → BetwayInfo/Betfair sport naam (SPORT_MAP se hi milta hai,
+// yahan sirf reverse-lookup ke liye rakha hai agar menu naam se sport
+// bataye, ID se nahi).
+const SPORT_NAME_TO_EVENT_TYPE = Object.fromEntries(
+  Object.entries(SPORT_MAP).map(([id, name]) => [name.toLowerCase(), id])
+);
 
-    if (!markets.length) {
-      logger.warn(`[Shubdx] ${endpoint}(${sportSlug}) — 0 markets mile. Response shape: ${JSON.stringify(Object.keys(raw || {}))}`);
-    }
+/* ── /api1/menu — cache (baar baar poori list na maangi jaaye) ────── */
+// ✅ TEST: pehle sirf ek unfiltered call hoti thi (jisme horse/greyhound
+// kabhi nahi aate the). Ab agar eventTypeId diya jaye to usay query param
+// ke taur par bhi bhejte hain — ho sakta hai server sirf tab racing
+// include kare jab explicitly maanga jaye. Har eventTypeId (aur "sab")
+// ka apna cache-slot hai taake football/cricket/tennis ka existing
+// (working) unfiltered-call flow bilkul na chhide.
+const _menuCache = new Map(); // key: eventTypeId || '__all__'  →  { data, expiresAt }
+const MENU_CACHE_TTL_MS = parseInt(process.env.BETWAY_MENU_CACHE_TTL_MS || '5000', 10);
 
-    // ✅ BUG FIX: racing (horse/greyhound) ka flat shape ko generic
-    // event-shaped object mein normalize karo (dekho normalizeRacingItem
-    // ka comment upar) — warna listEvents() etc. mein har race silently
-    // skip ho jata tha kyunke m.event kabhi milta hi nahi tha.
-    if (isRacingSlug(sportSlug)) {
-      markets = markets.map(r => normalizeRacingItem(r, sportSlug));
-    }
+async function fetchMenu(eventTypeId = null) {
+  const cacheKey = eventTypeId ? String(eventTypeId) : '__all__';
+  const cached = _menuCache.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt) return cached.data;
 
-    _cache.set(sportSlug, { data: markets, expiresAt: Date.now() + CACHE_TTL_MS, isError: false });
-    return markets;
-  } catch (err) {
-    const status = err.response?.status;
-    if (status === 404) {
-      logger.error(`[Shubdx] ${endpoint}(${sportSlug}) failed: 404 — URL check karo (${url}). Sport slug ya endpoint naam galat ho sakta hai — SHUBDX_SLUG_HORSE / SHUBDX_SLUG_GREYHOUND / SHUBDX_RACES_ENDPOINT env var se adjust karo.`);
-    } else {
-      logger.error(`[Shubdx] ${endpoint}(${sportSlug}) failed: ${err.message}`);
-    }
-    // Negative-cache — is se agla ${ERROR_CACHE_TTL_MS}ms tak yahi error
-    // turant (bina naya HTTP call kiye) return hoga, server par load kam.
-    _cache.set(sportSlug, { error: err, expiresAt: Date.now() + ERROR_CACHE_TTL_MS, isError: true });
-    throw err;
-  }
-}
-
-async function fetchOneMatch(sportSlug, matchOrEventId) {
-  const isRacing = isRacingSlug(sportSlug);
-  const endpoint = isRacing ? ONE_MATCH_ENDPOINT_RACING : 'fetchmatch';
-  const url      = `${BASE_URL}/${sportSlug}/${endpoint}`;
-  // ✅ FIX: racing ("fetchrace") ka query param bhi "match" hai —
-  // pehle galti se "raceNumber" bhej rahe the, is liye Shubdx ka
-  // fetchrace endpoint kabhi sahi data hi nahi deta tha (chahe URL/slug
-  // sahi ho). Ab dono (team-sport "fetchmatch" aur racing "fetchrace")
-  // ke liye SAME param naam "match" use hota hai:
-  //   https://shubdxinternational.com/sports/horse/fetchrace?match=${groupById}
-  //   https://shubdxinternational.com/sports/greyhound/fetchrace?match=${groupById}
-  const params = { match: matchOrEventId };
+  // ✅ Client instruction: docs mein "/api/menu" likha tha, lekin
+  // client ne kaha "/api/ ki jagah /api1/ use karo" — is liye:
+  const url = `${BASE_URL}/api1/menu`;
+  // 🧪 TEST: eventTypeId diya ho to query param mein bhi bhejo (kai
+  // possible naam try karte hain — jo bhi server samjhe)
+  const params = eventTypeId
+    ? { eventTypeId, sportId: eventTypeId, sport: eventTypeId }
+    : undefined;
   try {
     const res = await axios.get(url, { params, timeout: TIMEOUT_MS });
-    return res.data;
+    const raw = res.data;
+    // ⚠️ Exact shape unconfirmed — kai plausible variants try karte hain
+    // (Rollwin migration mein bhi isi tarah defensive parsing kaam aayi thi)
+    const items = Array.isArray(raw)               ? raw
+                : Array.isArray(raw?.data)          ? raw.data
+                : Array.isArray(raw?.result)        ? raw.result
+                : Array.isArray(raw?.data?.result)  ? raw.data.result
+                : Array.isArray(raw?.markets)       ? raw.markets
+                : Array.isArray(raw?.menu)          ? raw.menu
+                : [];
+
+    // 🧪 TEST LOG: eventTypeId 7/4339 ke liye kya mila — dono cases
+    // clearly dikhao (kitne items aaye, aur unme se kitne genuinely
+    // horse/greyhound the vs sirf same purana unfiltered response wapas
+    // aa gaya)
+    if (eventTypeId === '7' || eventTypeId === '4339' || String(eventTypeId) === '7' || String(eventTypeId) === '4339') {
+      const matchingCount = items.filter(it => {
+        const etid = String(it.eventTypeId ?? it.eventtypeid ?? it.sportId ?? it.sport_id ?? '');
+        return etid === String(eventTypeId);
+      }).length;
+      logger.warn(
+        `[BetwayInfo][TEST] menu?eventTypeId=${eventTypeId} → ${items.length} total items, ` +
+        `${matchingCount} match this eventTypeId. ` +
+        `Sample eventTypeIds seen: ${JSON.stringify([...new Set(items.slice(0, 50).map(it => it.eventTypeId ?? it.eventtypeid ?? it.sportId ?? '?'))])}`
+      );
+    }
+
+    if (!items.length) {
+      logger.warn(`[BetwayInfo] menu(eventTypeId=${eventTypeId || 'none'}) — 0 items mile. Response top-level keys: ${JSON.stringify(Object.keys(raw || {}))}`);
+    }
+
+    _menuCache.set(cacheKey, { data: items, expiresAt: Date.now() + MENU_CACHE_TTL_MS });
+    return items;
   } catch (err) {
-    logger.error(`[Shubdx] fetchOneMatch(${sportSlug}, ${matchOrEventId}) via ${endpoint} failed: ${err.message}`);
+    logger.error(`[BetwayInfo] menu (${url}, eventTypeId=${eventTypeId || 'none'}) fetch failed: ${err.message}`);
     throw err;
   }
 }
 
-// ✅ NEW: Score-card endpoint — Cricket/Football/Tennis ke liye.
-// URL pattern shubdxinternational.com/score/max<Sport>?event_id=<groupById>
-// Sport-naam yahan capitalized/specific hai (maxCricket/maxFootball/
-// maxTennis) — /sports/<slug>/... wale lowercase slugs se ALAG hai,
-// is liye apna khud ka mapping rakha hai.
-const SCORE_BASE_URL = process.env.SHUBDX_SCORE_BASE_URL || 'https://shubdxinternational.com/score';
-const SPORT_SLUG_TO_SCORE_PATH = {
-  cricket:  'maxCricket',
-  football: 'maxFootball',
-  tennis:   'maxTennis',
-};
+// ⚠️ UNCONFIRMED field-names — real /api1/menu sample milte hi verify/fix karo.
+function normalizeMenuItem(raw) {
+  const eventTypeId = String(
+    raw.eventTypeId ?? raw.eventtypeid ?? raw.sportId ?? raw.sport_id ??
+    raw.eventType?.id ?? (raw.sport ? SPORT_NAME_TO_EVENT_TYPE[String(raw.sport).toLowerCase()] : '') ?? ''
+  );
 
-async function fetchScoreCard(sportSlug, eventId) {
-  const scorePath = SPORT_SLUG_TO_SCORE_PATH[sportSlug];
-  if (!scorePath) {
-    throw new Error(`fetchScoreCard: '${sportSlug}' ke liye koi score-card endpoint maloom nahi (sirf cricket/football/tennis available hain)`);
-  }
-  const url = `${SCORE_BASE_URL}/${scorePath}`;
-  try {
-    const res = await axios.get(url, { params: { event_id: eventId }, timeout: TIMEOUT_MS });
-    return res.data;
-  } catch (err) {
-    logger.error(`[Shubdx] fetchScoreCard(${sportSlug}, ${eventId}) failed: ${err.message}`);
-    throw err;
-  }
+  const marketId  = raw.marketId ?? raw.market_id ?? raw.matchId ?? raw.match_id ?? raw.id;
+  const eventIdRaw = raw.eventId ?? raw.event_id ?? raw.event?.id ?? raw.groupById ?? marketId;
+  const eventId    = String(eventIdRaw);
+  const eventName  = raw.eventname ?? raw.eventName ?? raw.event?.name ?? raw.name ?? raw.matchName ?? 'Unknown';
+
+  const compId   = raw.competitionId ?? raw.competition_id ?? raw.competition?.id ?? null;
+  const compName = raw.competitionName ?? raw.competition_name ?? raw.competition?.name ?? raw.league ?? null;
+  const competition = compId ? { id: String(compId), name: compName || 'Unknown League' } : null;
+
+  const startRaw = raw.marketStartTime ?? raw.startTime ?? raw.start_time ?? raw.start ?? raw.openDate ?? null;
+
+  return {
+    id: marketId != null ? String(marketId) : null,
+    name: raw.marketName ?? raw.market_name ?? 'Match Odds',
+    start: startRaw,
+    eventTypeId,
+    inPlay: !!(raw.inPlay ?? raw.inplay ?? raw.in_play),
+    matched: raw.totalMatched ?? raw.matched ?? 0,
+    competition,
+    event: {
+      id: eventId,
+      name: eventName,
+      countryCode: raw.countryCode ?? null,
+      venue: raw.venue ?? null,
+      openDate: startRaw,
+    },
+    runners: Array.isArray(raw.runners) ? raw.runners : [], // menu shayad runners na de — /data/catalogs se milenge
+  };
 }
 
-function sportSlugFromEventTypeId(eventTypeId) {
-  const slug = EVENT_TYPE_TO_SPORT_SLUG[String(eventTypeId)];
-  if (!slug) throw new Error(`Unknown eventTypeId for Shubdx mapping: ${eventTypeId}`);
-  return slug;
+async function sportItems(eventTypeId) {
+  // ✅ Horse Racing (7) / Greyhound (4339) — ab bpexch.live se (confirmed)
+  if (RACING_EVENT_TYPE_IDS.has(String(eventTypeId))) {
+    return getRacingHighlights(eventTypeId).catch(err => {
+      logger.error(`[bpexch] racing highlights fetch failed (eventTypeId=${eventTypeId}): ${err.message}`);
+      return [];
+    });
+  }
+
+  if (!eventTypeId) {
+    // Sport specify nahi hui — purana BetwayInfo menu (football/cricket/
+    // tennis) + naya bpexch racing (horse+greyhound), dono mila ke do
+    const [menu, racing] = await Promise.all([
+      fetchMenu().then(m => m.map(normalizeMenuItem).filter(x => x.id)).catch(() => []),
+      getRacingHighlights(null).catch(err => {
+        logger.error(`[bpexch] racing highlights fetch failed: ${err.message}`);
+        return [];
+      }),
+    ]);
+    return [...menu, ...racing];
+  }
+
+  // ── Baaki sports (football/cricket/tennis) — purana BetwayInfo flow, unchanged ──
+  // 🧪 TEST: pehle eventTypeId-scoped call try karo (ho sakta hai server
+  // sirf tab include kare jab explicitly maanga jaye). Agar wo khaali
+  // aaye, unfiltered list se client-side filter karke bhi dekh lo.
+  let menu = await fetchMenu(eventTypeId).catch(() => []);
+  let items = menu.map(normalizeMenuItem).filter(m => m.id && m.eventTypeId === String(eventTypeId));
+
+  if (!items.length) {
+    const allMenu = await fetchMenu(null).catch(() => []);
+    items = allMenu.map(normalizeMenuItem).filter(m => m.id && m.eventTypeId === String(eventTypeId));
+  }
+
+  return items;
 }
 
-/* ── Public helpers (Betfair-shaped) ─────────────────────────────── */
+/* ── Public helpers (Betfair-shaped — market.controller.js ke liye) ── */
 
-// Betfair jaisa shape: [{ eventType: { id, name }, marketCount }]
-// Shubdx ke paas "list all sports" wala endpoint nahi hai — SPORT_MAP
-// (config/constants, jo already existing hai) se hi static list deta hai.
 async function listEventTypes(filter = {}) {
   return Object.entries(SPORT_MAP).map(([id, name]) => ({
     eventType: { id, name },
-    marketCount: 0, // Shubdx count nahi deta upfront — UI isko normally ignore karta hai
+    marketCount: 0,
   }));
 }
 
-// Betfair jaisa shape: [{ competition: {id, name}, marketCount }]
 async function listCompetitions(filter = {}) {
   const eventTypeId = filter?.eventTypeIds?.[0];
   if (!eventTypeId) return [];
-  const sportSlug = sportSlugFromEventTypeId(eventTypeId);
-  const markets = await fetchAllMatches(sportSlug);
+  const items = await sportItems(eventTypeId);
 
-  const seen = new Map(); // competitionId → { competition, count }
-  markets.forEach(m => {
+  const seen = new Map();
+  items.forEach(m => {
     const comp = m.competition;
     if (!comp?.id) return;
     if (!seen.has(comp.id)) seen.set(comp.id, { competition: { id: comp.id, name: comp.name }, marketCount: 0 });
@@ -347,29 +476,23 @@ async function listCompetitions(filter = {}) {
   return Array.from(seen.values());
 }
 
-// Betfair jaisa shape: [{ event: {id,name,countryCode,timezone,venue,openDate}, marketCount }]
 async function listEvents(filter = {}) {
   const eventTypeId = filter?.eventTypeIds?.[0];
   if (!eventTypeId) return [];
-  const sportSlug = sportSlugFromEventTypeId(eventTypeId);
-  const markets = await fetchAllMatches(sportSlug);
+  const items = await sportItems(eventTypeId);
 
   const competitionIds = filter?.competitionIds?.map(String) || null;
   const fromMs = filter?.marketStartTime?.from ? new Date(filter.marketStartTime.from).getTime() : null;
   const toMs   = filter?.marketStartTime?.to   ? new Date(filter.marketStartTime.to).getTime()   : null;
 
-  const seen = new Map(); // eventId → { event, marketCount }
-  markets.forEach(m => {
+  const seen = new Map();
+  items.forEach(m => {
     const ev = m.event;
     if (!ev?.id) return;
     if (competitionIds && !competitionIds.includes(String(m.competition?.id))) return;
 
-    // ✅ FIX: m.start Shubdx response mein number (epoch ms) ya string
-    // (ISO date) — dono ho sakta hai. Pehle seedha numeric comparison
-    // (m.start < fromMs) hoti thi jo agar m.start string ho to hamesha
-    // fail hoti (NaN comparison) — is se date-range filter silently
-    // kaam nahi karta tha, ya to sab match gayab ho jaate ya sab reh jaate.
-    // Ab hamesha Date object se normalize karke compare karte hain.
+    // Date string ya epoch — dono normalize karke compare karo (Rollwin
+    // migration mein yehi bug mila tha, is liye shuru se hi robust rakha hai)
     const startMs = m.start != null ? new Date(m.start).getTime() : NaN;
     if (fromMs !== null && !isNaN(startMs) && startMs < fromMs) return;
     if (toMs   !== null && !isNaN(startMs) && startMs > toMs)   return;
@@ -392,94 +515,77 @@ async function listEvents(filter = {}) {
   return Array.from(seen.values());
 }
 
+/* ── /data/catalogs (batch) — runners aur market-metadata ─────────── */
+async function fetchCatalogsBatch(marketIds) {
+  if (!marketIds.length) return {};
+  try {
+    const url = `${BASE_URL}/data/catalogs`;
+    const res = await axios.get(url, { params: { ids: marketIds.join(',') }, timeout: TIMEOUT_MS });
+    const raw  = res.data;
+    const list = Array.isArray(raw)              ? raw
+               : Array.isArray(raw?.data)         ? raw.data
+               : Array.isArray(raw?.result)       ? raw.result
+               : Array.isArray(raw?.data?.result) ? raw.data.result
+               : [];
+    const map = {};
+    list.forEach(c => {
+      const mid = c.marketId ?? c.market_id ?? c.id;
+      if (mid != null) map[String(mid)] = c;
+    });
+    return map;
+  } catch (err) {
+    logger.warn(`[BetwayInfo] catalogs (batch) fetch failed: ${err.message} — runners khali reh sakte hain is baar`);
+    return {};
+  }
+}
+
 // Betfair jaisa shape: [{ marketId, marketName, marketStartTime, totalMatched,
 //                          competition, event, eventType, runners:[{selectionId, runnerName, sortPriority}] }]
-async function listMarketCatalogue(filter = {}, maxResults = '20', marketProjection = ['EVENT', 'RUNNER_METADATA']) {
+async function listMarketCatalogue(filter = {}, maxResults = '20', marketProjection) {
   const eventTypeId = filter?.eventTypeIds?.[0];
-  let markets = [];
+  let items = [];
 
-  // ✅ BUG FIX: pehle sirf "eventTypeIds" ya "marketIds" diye jaane par
-  // hi Shubdx se data fetch hota tha. Lekin getLiveHorse/getLiveGreyhound
-  // (aur kai aur callers) sirf { eventIds, marketTypeCodes } bhejte hain
-  // — na eventTypeIds na marketIds — is liye ye function hamesha `[]`
-  // return karta tha, chahe events pehle se mil chuke hon. Isi wajah se
-  // frontend par data kabhi nahi aata tha (dashboard.html har request
-  // ke liye pehle listEvents() se events leta hai, phir listMarketCatalogue
-  // se unki details — ye doosra step hamesha khali aata tha).
-  // Ab agar sirf eventIds diye gaye hon, saare sports mein dhoondo
-  // (jaisa marketIds ke liye pehle se hota hai).
   if (eventTypeId) {
-    const sportSlug = sportSlugFromEventTypeId(eventTypeId);
-    markets = await fetchAllMatches(sportSlug);
+    items = await sportItems(eventTypeId);
   } else if (filter?.marketIds?.length || filter?.eventIds?.length) {
-    // Sport pata nahi — saare sports try karo jab tak match na mile
-    // (getEventDetails/getRunnerBook/getLiveHorse jaise callers sirf
-    // marketId ya eventId dete hain, sport slug nahi)
-    for (const slug of Object.values(EVENT_TYPE_TO_SPORT_SLUG)) {
-      const list = await fetchAllMatches(slug).catch(() => []);
-      if (filter?.marketIds?.length) {
-        const hit = list.filter(m => filter.marketIds.includes(m.id));
-        if (hit.length) { markets = hit; break; } // marketId unique hai ek sport mein, mil gaya to ruk jao
-      } else if (filter?.eventIds?.length) {
-        // eventIds multiple sports mein spread ho sakte hain (theoretically) —
-        // is liye har slug se accumulate karo, break mat karo
-        markets = markets.concat(list.filter(m => filter.eventIds.includes(m.event?.id)));
-      }
+    // Sport pata nahi — poori menu list mein se dhoondo
+    const all = await sportItems(null);
+    if (filter?.marketIds?.length) {
+      const ids = filter.marketIds.map(String);
+      items = all.filter(m => ids.includes(m.id));
+    } else if (filter?.eventIds?.length) {
+      const ids = filter.eventIds.map(String);
+      items = all.filter(m => ids.includes(m.event?.id));
     }
   }
 
   if (filter?.eventIds?.length) {
-    markets = markets.filter(m => filter.eventIds.includes(m.event?.id));
+    const ids = filter.eventIds.map(String);
+    items = items.filter(m => ids.includes(m.event?.id));
   }
   if (filter?.marketIds?.length) {
-    markets = markets.filter(m => filter.marketIds.includes(m.id));
+    const ids = filter.marketIds.map(String);
+    items = items.filter(m => ids.includes(m.id));
   }
 
-  const sliced = markets.slice(0, parseInt(maxResults, 10) || 20);
+  const sliced = items.slice(0, parseInt(maxResults, 10) || 20);
+  if (!sliced.length) return [];
 
-  // Racing markets ke liye fetchrace se runners fetch karo (allraces mein runners nahi hote)
-  // Pehle determine karo kaunse markets racing hain
-  const racingFetches = new Map(); // groupById → Promise<raceItem>
-  for (const m of sliced) {
-    const eid  = String(m.eventTypeId || '');
-    const slug = EVENT_TYPE_TO_SPORT_SLUG[eid];
-    if (slug && isRacingSlug(slug) && !(m.runners && m.runners.length)) {
-      const groupById = m.event?.id || m.groupById;
-      if (groupById && !racingFetches.has(groupById)) {
-        racingFetches.set(groupById, fetchOneMatch(slug, groupById)
-          .then(res => {
-            const raw  = res?.data || res;
-            return Array.isArray(raw?.result) ? raw.result[0] : null;
-          })
-          .catch(() => null)
-        );
-      }
-    }
-  }
-  // Sab racing fetches parallel mein resolve karo
-  if (racingFetches.size > 0) {
-    await Promise.all([...racingFetches.values()]);
-  }
+  // ✅ /data/catalog2 (single) ki jagah /data/catalogs (batch) use karo —
+  // ek hi HTTP call mein saare markets ki details mil jaati hain (docs
+  // mein explicitly "optimized endpoint for fetching metadata for
+  // multiple related markets" likha hai).
+  const catalogMap = await fetchCatalogsBatch(sliced.map(m => m.id));
 
-  const resultArr = [];
-  for (const m of sliced) {
+  return sliced.map(m => {
+    const cat = catalogMap[m.id] || {};
+    const runners = Array.isArray(cat.runners) ? cat.runners : m.runners;
     const startMs = m.start != null ? new Date(m.start).getTime() : NaN;
-    const eid     = String(m.eventTypeId || '');
-    const slug    = EVENT_TYPE_TO_SPORT_SLUG[eid];
-    let runners   = m.runners || [];
+    const eid = String(m.eventTypeId || eventTypeId || '');
 
-    // Racing runners: fetchrace se lo agar allraces mein nahi the
-    if (slug && isRacingSlug(slug) && runners.length === 0) {
-      const groupById = m.event?.id || m.groupById;
-      if (groupById && racingFetches.has(groupById)) {
-        const raceItem = await racingFetches.get(groupById);
-        runners = raceItem?.runners || [];
-      }
-    }
-
-    resultArr.push({
+    return {
       marketId: m.id,
-      marketName: m.name,
+      marketName: cat.marketName || cat.market_name || m.name,
       marketStartTime: !isNaN(startMs) ? new Date(startMs).toISOString() : (m.event?.openDate || new Date().toISOString()),
       totalMatched: m.matched || 0,
       competition: m.competition ? { id: m.competition.id, name: m.competition.name } : null,
@@ -489,11 +595,15 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
         openDate: m.event.openDate || (!isNaN(startMs) ? new Date(startMs).toISOString() : null),
       } : null,
       eventType: { id: eid, name: SPORT_MAP[eid] || 'Other' },
-      runners: runners.map(r => ({
-        selectionId: r.id || r.selectionId,
-        runnerName:  r.name || r.runnerName,
-        sortPriority: r.sort || r.sortPriority || 0,
-        handicap: r.hdp || 0,
+      runners: (runners || []).map(r => ({
+        // ✅ Number() se normalize — Data endpoint (/data/Data) ka runner.id
+        // bhi selectionId hi hota hai, aur dono jagah consistent type
+        // (number) rakhna zaroori hai warna frontend price ko sahi runner
+        // se match hi nahi kar pata (string "47998" !== number 47998)
+        selectionId: Number(r.selectionId ?? r.id),
+        runnerName:  r.runnerName ?? r.name,
+        sortPriority: r.sortPriority ?? r.sort ?? 0,
+        handicap: r.handicap ?? r.hdp ?? 0,
         metadata: {
           ...r.metadata,
           CLOTH_NUMBER: r.metadata?.CLOTH_NUMBER ?? r.clothNumber ?? r.cloth ?? null,
@@ -501,118 +611,94 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
           TRAINER_NAME: r.metadata?.TRAINER_NAME ?? r.trainer ?? r.trainerName ?? null,
           STALL_DRAW:   r.metadata?.STALL_DRAW   ?? r.stallDraw ?? r.stall ?? null,
           COLOURS_FILENAME_URL: r.metadata?.COLOURS_FILENAME_URL ?? r.silk ?? r.silkUrl ?? null,
-          COLOURS_FILENAME_BASE64: r.metadata?.COLOURS_FILENAME_BASE64 ?? null,
           FORM: r.metadata?.FORM ?? r.form ?? null,
           AGE:  r.metadata?.AGE  ?? r.age  ?? null,
         },
       })),
-    });
-  }
-  return resultArr;
+    };
+  });
 }
 
-// Betfair jaisa shape: [{ marketId, status, inplay, betDelay,
+// Betfair jaisa shape: [{ marketId, status, inplay, betDelay, totalMatched,
 //                          runners: [{selectionId, status, lastPriceTraded,
-//                                     ex: { availableToBack, availableToLay } }] }]
+//                                     ex: { availableToBack, availableToLay } }],
+//                          scoreboard? }]  ← scoreboard sirf cricket ke liye
+//
+// ✅ CONFIRMED (real in-play match se, marketId=1.259466913):
+//   marketBooks[0] = { id, winners, betDelay, totalMatched, marketStatus,
+//                       maxBetSize, bettingAllowed, isMarketDataDelayed,
+//                       runners:[{ id, price1..3, size1..3, lay1..3, ls1..3,
+//                                  status, handicap }], isRoot, timestamp, winnerIDs }
+//   → status field ka asal naam "marketStatus" hai (generic "status" nahi)
+//   → lay SIZE field "ls1/ls2/ls3" hai (pehle "laySize"/"lsize" try ho raha
+//     tha, jo kabhi match nahi hota tha — isi wajah se LAY size hamesha 0
+//     aata tha, aur frontend size=0 wale cells ko non-clickable/blank
+//     dikhata hai)
 async function listMarketBook(marketIds = [], priceProjection) {
   if (!marketIds.length) return [];
 
-  // marketIds mein se sport pata nahi hota — saare sports mein dhoondo
-  // Racing sports (horse/greyhound) ke liye allraces mein runners nahi hote —
-  // fetchrace (single market) se alag se fetch karna padta hai
-
-  // Step 1: allmatches/allraces se basic market info lo
-  const basicMap = new Map(); // marketId → { m, slug }
-  for (const [eid, slug] of Object.entries(EVENT_TYPE_TO_SPORT_SLUG)) {
-    const list = await fetchAllMatches(slug).catch(() => []);
-    list.forEach(m => {
-      if (marketIds.includes(m.id) && !basicMap.has(m.id)) {
-        basicMap.set(m.id, { m, slug });
-      }
-    });
-    if (basicMap.size >= marketIds.length) break;
-  }
-
-  // Step 2: Racing markets ke liye fetchrace se runners + odds fetch karo
-  // groupById = m.event.id (e.g. "35916518.1827")
-  const fetchraceCache = new Map(); // groupById → fetchrace result
-
-  async function getRacingMarketData(m, slug) {
-    const groupById = m.event?.id || m.groupById;
-    if (!groupById) return null;
-    if (fetchraceCache.has(groupById)) return fetchraceCache.get(groupById);
-
+  const results = await Promise.all(marketIds.map(async (id) => {
     try {
-      const res = await fetchOneMatch(slug, groupById);
-      // Response: res.data.result[0] ya res.result[0]
-      const raw  = res?.data || res;
-      const item = Array.isArray(raw?.result) ? raw.result[0] : null;
-      fetchraceCache.set(groupById, item);
-      return item;
-    } catch(e) {
-      logger.warn(`[listMarketBook] fetchrace failed for ${groupById}: ${e.message}`);
-      fetchraceCache.set(groupById, null);
-      return null;
-    }
-  }
+      const url = `${BASE_URL}/data/Data`;
+      const res = await axios.get(url, { params: { id }, timeout: TIMEOUT_MS });
+      const raw = res.data;
 
-  // Step 3: Build results
-  const results = [];
-  for (const [marketId, { m, slug }] of basicMap.entries()) {
-    let runners = m.runners || [];
+      // marketBooks empty ho sakta hai agar market abhi actively traded
+      // nahi ho raha (docs + humara apna test confirm karta hai)
+      const mbRaw = raw?.marketBooks;
+      const mb = Array.isArray(mbRaw) ? mbRaw[0] : mbRaw;
 
-    if (isRacingSlug(slug) && runners.length === 0) {
-      // Racing: fetchrace se runners + live odds lo
-      const raceData = await getRacingMarketData(m, slug);
-      if (raceData) {
-        // Agar marketId match kare (fetchrace ka m.id)
-        runners = raceData.runners || [];
-        // Status bhi update karo
-        m.status = raceData.status || m.status;
-        m.inPlay = raceData.inPlay ?? m.inPlay;
+      if (!mb) {
+        return { marketId: id, status: 'OPEN', inplay: false, betDelay: 0, totalMatched: 0, runners: [] };
       }
+
+      const runners = mb.runners || mb.runner || [];
+
+      return {
+        marketId: id,
+        // ✅ FIX: real field "marketStatus" hai, "status" nahi
+        status: mb.marketStatus || mb.status || 'OPEN',
+        inplay: !!(mb.inplay ?? mb.inPlay),
+        betDelay: mb.betDelay ?? 0,
+        totalMatched: mb.totalMatched ?? mb.matched ?? 0,
+        runners: runners.map(r => {
+          const back = [];
+          const lay  = [];
+          for (let i = 1; i <= 3; i++) {
+            if (r[`price${i}`] != null) back.push({ price: r[`price${i}`], size: r[`size${i}`] ?? 0 });
+            // ✅ FIX: lay size ka real field "ls1/ls2/ls3" hai
+            if (r[`lay${i}`]   != null) lay.push({ price: r[`lay${i}`], size: r[`ls${i}`] ?? r[`laySize${i}`] ?? r[`lsize${i}`] ?? 0 });
+          }
+          // Fallback: agar price1/lay1 style fields bilkul na milen, shayad
+          // Betfair-native "back"/"lay" array format bhi ho sakta hai
+          const backFallback = Array.isArray(r.back) ? r.back.map(b => ({ price: b.price, size: b.size })) : [];
+          const layFallback  = Array.isArray(r.lay)  ? r.lay.map(l  => ({ price: l.price, size: l.size }))  : [];
+
+          return {
+            // ✅ FIX: catalog2 ke selectionId se type-consistent rakhne ke
+            // liye Number() — warna frontend price ko runner se match hi
+            // nahi kar pata (string vs number mismatch se dono BACK aur
+            // LAY khaali/blank dikhte hain)
+            selectionId: Number(r.selectionId ?? r.id),
+            status: r.status || 'ACTIVE',
+            lastPriceTraded: r.lastPriceTraded ?? r.ltp ?? null,
+            ex: {
+              availableToBack: back.length ? back : backFallback,
+              availableToLay:  lay.length  ? lay  : layFallback,
+            },
+          };
+        }),
+        // ✅ Cricket scoreboard pass-through (t1_runs/t1_wickets/t1_overs/
+        // commentry) — controller ya frontend jahan zaroorat ho use kar sake
+        scoreboard: raw.scoreboard || null,
+      };
+    } catch (err) {
+      logger.error(`[BetwayInfo] Data?id=${id} failed: ${err.message}`);
+      return { marketId: id, status: 'OPEN', inplay: false, betDelay: 0, totalMatched: 0, runners: [] };
     }
+  }));
 
-    results.push({
-      marketId: m.id,
-      status:   m.status || 'OPEN',
-      inplay:   !!m.inPlay,
-      betDelay: m.betDelay || 0,
-      totalMatched: m.matched || 0,
-      runners: runners.map(r => ({
-        selectionId:     r.id || r.selectionId,
-        status:          r.status || 'ACTIVE',
-        lastPriceTraded: r.lastPriceTraded || null,
-        ex: {
-          availableToBack: (r.back || []).map(b => ({ price: b.price, size: b.size })),
-          availableToLay:  (r.lay  || []).map(l => ({ price: l.price, size: l.size })),
-        },
-      })),
-    });
-  }
   return results;
-}
-
-// ⚠️ INTENTIONALLY DISABLED — dekhein file ke top wala notice.
-// Shubdx ke market IDs Betfair ko pata nahi, is liye Betfair se
-// settlement query karna hamesha fail hoga. Jab tak Shubdx khud
-// result/winner data confirm na kare, ye function explicitly error
-// deti hai — chup-chaap galat/khaali data return nahi karti, taake
-// autoSettle_service.js turant pata laga sake ke ye layer available
-// nahi hai (uska already-maujood fallback/warning system use hoga).
-// ✅ RESTORED: op:"Betfair" wale markets ka ID asal Betfair ko pata hota
-// hai, is liye settlement REAL Betfair API se hi query karte hain —
-// bilkul jaisa migration se pehle hota tha. op:"Shubdx" wale markets ke
-// liye Betfair ye query fail karega (INVALID_MARKET_ID jaisa error) —
-// wo autoSettle_service.js mein already-maujood "winner not determinable"
-// / stuck-market warning flow mein visible ho jayega, chup-chaap nahi.
-async function listMarketProfitAndLoss(marketIds = []) {
-  return bfJsonRpc('SportsAPING/v1.0/listMarketProfitAndLoss', {
-    marketIds,
-    includeSettledBets: true,
-    includeBspBets: true,
-    netOfCommission: false,
-  });
 }
 
 /* ── getEventDetails (orders.js compatible) ─────────────── */
@@ -642,13 +728,14 @@ async function getRunnerBook(marketId, selectionId) {
 }
 
 module.exports = {
+  getSessionToken,
+  getEventDetails,
+  getRunnerBook,
   listEventTypes,
   listCompetitions,
   listEvents,
   listMarketCatalogue,
   listMarketBook,
   listMarketProfitAndLoss,
-  getEventDetails,
-  getRunnerBook,
-  fetchScoreCard,   // ✅ NEW — abhi kahin call nahi ho raha, future settlement/live-score ke liye ready
+  getBanStatus,
 };
