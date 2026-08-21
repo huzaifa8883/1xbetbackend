@@ -863,6 +863,178 @@ async function getRunnerBook(marketId, selectionId) {
   }
 }
 
+
+/* ═══════════════════════════════════════════════════════════════════
+   bpexch catalog2 / catalogs / live Data — market page ke liye
+   (Bookmaker, Fancy, Figure, scoreboard, commentary)
+   ═══════════════════════════════════════════════════════════════════ */
+
+const PRICES7_BASE = process.env.PRICES7_BASE_URL || 'https://prices7.mgs11.com';
+
+async function fetchBpexchCatalog2(marketId) {
+  const url = `${BPEXCH_BASE_URL}/api/markets/catalog2/`;
+  const res = await axios.get(url, {
+    params: { id: marketId },
+    timeout: TIMEOUT_MS,
+    headers: {
+      Accept: 'application/json',
+      'X-Requested-With': 'XMLHttpRequest',
+      Referer: `${BPEXCH_BASE_URL}/`,
+    },
+    validateStatus: s => s < 500,
+  });
+  if (res.status !== 200 || !res.data) return null;
+  // bpexch kabhi { data: {...} } wrap karta hai, kabhi seedha object
+  const d = res.data.data || res.data;
+  if (!d || !d.marketId) return null;
+  return d;
+}
+
+async function fetchBpexchCatalogs(marketIds = []) {
+  if (!marketIds.length) return [];
+  const url = `${BPEXCH_BASE_URL}/api/markets/catalogs/`;
+  const res = await axios.get(url, {
+    params: { ids: marketIds.join(',') },
+    timeout: TIMEOUT_MS,
+    headers: {
+      Accept: 'application/json',
+      'X-Requested-With': 'XMLHttpRequest',
+      Referer: `${BPEXCH_BASE_URL}/`,
+    },
+    validateStatus: s => s < 500,
+  });
+  if (res.status !== 200) return [];
+  const raw = res.data;
+  if (Array.isArray(raw)) return raw;
+  if (Array.isArray(raw?.data)) return raw.data;
+  return [];
+}
+
+/**
+ * Live prices + scoreboard + commentary.
+ * prices7 JWT user-session token maangta hai — agar env PRICES7_TOKEN
+ * set ho to use hoga, warna null (scoreboard optional).
+ */
+async function fetchPrices7MarketData(marketId, token) {
+  const tok = token || process.env.PRICES7_TOKEN || '';
+  if (!tok) return null;
+  try {
+    const url = `${PRICES7_BASE}/api/Markets/Data`;
+    const res = await axios.get(url, {
+      params: { id: marketId, token: tok },
+      timeout: TIMEOUT_MS,
+      headers: { Accept: 'application/json' },
+      validateStatus: s => s < 500,
+    });
+    if (res.status !== 200 || !res.data) return null;
+    return res.data;
+  } catch (err) {
+    logger.warn(`[prices7] Data fetch failed for ${marketId}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Full market page payload: main catalog + subMarkets + optional scoreboard.
+ * Prefer bpexch APIs (real 1.xxx / 9.xxx IDs). Fallback null → controller
+ * purane listMarketCatalogue path pe chala jayega.
+ */
+async function getBpexchMarketPage(marketId, pricesToken) {
+  const main = await fetchBpexchCatalog2(marketId).catch(err => {
+    logger.warn(`[bpexch] catalog2 failed for ${marketId}: ${err.message}`);
+    return null;
+  });
+  if (!main) return null;
+
+  // Related sub-market IDs: kabhi catalog2 response mein related/markets
+  // array hota hai; warna prices7 Data ke marketBooks se nikaalte hain.
+  let subIds = [];
+  if (Array.isArray(main.relatedMarketIds)) subIds = main.relatedMarketIds.map(String);
+  if (Array.isArray(main.subMarketIds)) subIds = subIds.concat(main.subMarketIds.map(String));
+
+  const live = await fetchPrices7MarketData(marketId, pricesToken).catch(() => null);
+  if (live?.marketBooks?.length) {
+    for (const mb of live.marketBooks) {
+      if (mb.id && String(mb.id) !== String(marketId)) subIds.push(String(mb.id));
+    }
+  }
+  subIds = [...new Set(subIds.filter(id => id && id !== String(marketId)))];
+
+  let subCatalogs = [];
+  if (subIds.length) {
+    subCatalogs = await fetchBpexchCatalogs(subIds).catch(err => {
+      logger.warn(`[bpexch] catalogs failed: ${err.message}`);
+      return [];
+    });
+  }
+
+  // Map live prices onto main + subs when available
+  const bookById = new Map();
+  if (live?.marketBooks) {
+    for (const mb of live.marketBooks) bookById.set(String(mb.id), mb);
+  }
+
+  function attachLive(cat) {
+    const mb = bookById.get(String(cat.marketId));
+    if (!mb) return cat;
+    const runners = (cat.runners || []).map(r => {
+      const lr = (mb.runners || []).find(x => String(x.id) === String(r.selectionId));
+      if (!lr) return r;
+      return {
+        ...r,
+        status: lr.status || r.status,
+        // price ladder (back/lay) for UI
+        back: [
+          lr.price1 != null ? { price: lr.price1, size: lr.size1 || 0 } : null,
+          lr.price2 != null ? { price: lr.price2, size: lr.size2 || 0 } : null,
+          lr.price3 != null ? { price: lr.price3, size: lr.size3 || 0 } : null,
+        ].filter(Boolean),
+        lay: [
+          lr.lay1 != null ? { price: lr.lay1, size: lr.ls1 || 0 } : null,
+          lr.lay2 != null ? { price: lr.lay2, size: lr.ls2 || 0 } : null,
+          lr.lay3 != null ? { price: lr.lay3, size: lr.ls3 || 0 } : null,
+        ].filter(Boolean),
+      };
+    });
+    return {
+      ...cat,
+      status: mb.marketStatus || cat.status,
+      totalMatched: mb.totalMatched ?? cat.totalMatched,
+      betDelay: mb.betDelay ?? cat.betDelay,
+      runners,
+    };
+  }
+
+  const mainEnriched = attachLive(main);
+  const subMarkets = subCatalogs.map(c => {
+    const enriched = attachLive(c);
+    const t = String(enriched.marketType || '').toUpperCase();
+    const n = String(enriched.marketName || '').toLowerCase();
+    let category = 'other';
+    if (t === 'BOOKMAKER' || n.includes('bookmaker') || enriched.isBmMarket) category = 'bookmaker';
+    else if (t === 'TOSS' || n.includes('toss')) category = 'toss';
+    else if (t === 'FANCY2' || t === 'LOCAL_FANCY' || n.includes('fancy')) category = 'fancy2';
+    else if (t === 'FIGURE' || n.includes('figure')) category = 'figure';
+    else if (t === 'ODD_FIGURE' || n.includes('odd')) category = 'oddFigure';
+    else if (t.includes('FANCY') || n.includes('session') || n.includes('over')) category = 'fancy';
+    return { ...enriched, category };
+  });
+
+  return {
+    ...mainEnriched,
+    eventId: main.eventId || main.event?.id,
+    eventName: main.eventName || main.event?.name,
+    eventTypeId: String(main.eventTypeId || main.sport?.id || ''),
+    eventType: main.eventType || main.sport?.name,
+    subMarkets,
+    scoreboard: live?.scoreboard || null,
+    scores: live?.scores || null,
+    news: live?.news || main.news || '',
+    source: 'bpexch',
+  };
+}
+
+
 module.exports = {
   getSessionToken,
   getEventDetails,
@@ -874,4 +1046,9 @@ module.exports = {
   listMarketBook,
   listMarketProfitAndLoss,
   getBanStatus,
+  // market page (Bookmaker/Fancy/scoreboard)
+  fetchBpexchCatalog2,
+  fetchBpexchCatalogs,
+  fetchPrices7MarketData,
+  getBpexchMarketPage,
 };
