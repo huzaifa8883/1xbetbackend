@@ -658,33 +658,32 @@ async function listEvents(filter = {}) {
     isFootballEventType(eventTypeId);
 
   const seen = new Map();
+  let kept = 0, droppedComp = 0, droppedTime = 0, droppedNoId = 0;
   items.forEach(m => {
     const ev = m.event;
-    if (!ev?.id) return;
-    if (competitionIds && !competitionIds.includes(String(m.competition?.id))) return;
+    if (!ev?.id) { droppedNoId++; return; }
 
-    // Date string ya epoch — dono normalize karke compare karo
+    // ✅ CRITICAL: match-odds items have competition: null always (bpexch
+    // highlights mein competition/league id nahi aata). Agar SportConfig
+    // mein allowed_competition_ids set ho to purana code har row discard
+    // kar deta tha → events=0 even when rows parsed. Skip competition
+    // filter for cricket/tennis/football.
+    if (!isMatchOddsSport) {
+      if (competitionIds && !competitionIds.includes(String(m.competition?.id))) {
+        droppedComp++;
+        return;
+      }
+    }
+
     const startMs = m.start != null ? new Date(m.start).getTime() : NaN;
 
     if (!isMatchOddsSport) {
-      // Racing: strict window (pehle jaisa)
-      if (fromMs !== null && !isNaN(startMs) && startMs < fromMs) return;
-      if (toMs   !== null && !isNaN(startMs) && startMs > toMs)   return;
-    } else {
-      // Match-odds: In-Play hamesha include; invalid/missing start = include;
-      // otherwise only drop if clearly outside a *very* wide window
-      // (7 days back / 14 days ahead) — bpexch already curated.
-      if (m.inPlay) {
-        // keep
-      } else if (isNaN(startMs)) {
-        // keep (parse failed — still show)
-      } else {
-        const wideFrom = fromMs != null ? fromMs - 7 * 24 * 3600_000 : null;
-        const wideTo   = toMs   != null ? toMs   + 14 * 24 * 3600_000 : null;
-        if (wideFrom !== null && startMs < wideFrom) return;
-        if (wideTo   !== null && startMs > wideTo)   return;
-      }
+      // Racing: strict window
+      if (fromMs !== null && !isNaN(startMs) && startMs < fromMs) { droppedTime++; return; }
+      if (toMs   !== null && !isNaN(startMs) && startMs > toMs)   { droppedTime++; return; }
     }
+    // Match-odds: NO time filter — bpexch highlights already curated.
+    // (previous wide-window still dropped some edge cases)
 
     if (!seen.has(ev.id)) {
       seen.set(ev.id, {
@@ -700,7 +699,9 @@ async function listEvents(filter = {}) {
       });
     }
     seen.get(ev.id).marketCount++;
+    kept++;
   });
+  logger.info(`[listEvents] eventTypeId=${eventTypeId} matchOdds=${isMatchOddsSport} items=${items.length} kept=${kept} droppedComp=${droppedComp} droppedTime=${droppedTime} droppedNoId=${droppedNoId} events=${seen.size}`);
   return Array.from(seen.values());
 }
 
