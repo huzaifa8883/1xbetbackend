@@ -8,6 +8,7 @@ const {
   listCompetitions,
   listEventTypes,
   getBpexchMarketPage,
+  normalizeMarketId,
 } = require('../services/betfair.service');
 const { sendSuccess, sendError } = require('../utils/response');
 const { SPORT_MAP } = require('../config/constants');
@@ -647,8 +648,12 @@ async function getMarketData(req, res) {
 }
 
 async function getMarketCatalog2(req, res) {
-  const { id: marketId } = req.query;
-  if (!marketId) return sendError(res, 'marketId query parameter is required', 400);
+  const { id: rawId } = req.query;
+  if (!rawId) return sendError(res, 'marketId query parameter is required', 400);
+  const marketId = normalizeMarketId(rawId); // m_1_261306873 → 1.261306873
+  if (String(rawId) !== String(marketId)) {
+    logger.info(`[catalog2] normalized ${rawId} → ${marketId}`);
+  }
 
   // ✅ Prefer bpexch catalog2 + catalogs + (optional) prices7 scoreboard
   // Real Betfair-style IDs (1.xxx / 9.xxx) ke liye ye path Bookmaker/Fancy/
