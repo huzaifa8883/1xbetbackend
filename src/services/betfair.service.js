@@ -137,6 +137,122 @@ let _highlightsHtmlExpiry = 0;
 // request (cache expire hone ke baad) fresh HTML khींchta hai.
 const HIGHLIGHTS_CACHE_TTL_MS = parseInt(process.env.BPEXCH_HIGHLIGHTS_CACHE_TTL_MS || '4000', 10);
 
+/* ── /api1/markethighlights JSON endpoint — PRIMARY data source
+   Ye bpexch ka native JSON feed hai (HTML scraping se zyada reliable).
+   HTML scraping ab FALLBACK hai agar ye fail ho.                       */
+const HIGHLIGHTS_JSON_TTL_MS = parseInt(process.env.BETWAY_HIGHLIGHTS_CACHE_TTL_MS || '5000', 10);
+let _highlightsJsonCache  = null;
+let _highlightsJsonExpiry = 0;
+let _highlightsJsonPromise = null;  // in-flight dedup
+
+async function fetchMarkethighlightsJson() {
+  const url = `${BPEXCH_BASE_URL}/api1/markethighlights`;
+  const res = await axios.get(url, {
+    timeout: TIMEOUT_MS,
+    headers: {
+      Accept: 'application/json, text/plain, */*',
+      'X-Requested-With': 'XMLHttpRequest',
+      Referer: `${BPEXCH_BASE_URL}/Common/Dashboard`,
+      Origin: BPEXCH_BASE_URL,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    },
+    validateStatus: s => s < 500,
+  });
+  if (res.status !== 200 || !res.data) throw new Error(`markethighlights HTTP ${res.status}`);
+  return res.data;
+}
+
+async function getMarkethighlightsJson() {
+  if (_highlightsJsonCache && Date.now() < _highlightsJsonExpiry) return _highlightsJsonCache;
+  if (_highlightsJsonPromise) return _highlightsJsonPromise;
+  _highlightsJsonPromise = fetchMarkethighlightsJson()
+    .then(data => {
+      _highlightsJsonCache  = data;
+      _highlightsJsonExpiry = Date.now() + HIGHLIGHTS_JSON_TTL_MS;
+      _highlightsJsonPromise = null;
+      logger.info('[bpexch] markethighlights JSON fetched successfully');
+      return data;
+    })
+    .catch(err => {
+      _highlightsJsonPromise = null;
+      throw err;
+    });
+  return _highlightsJsonPromise;
+}
+
+/**
+ * normalizeHighlightItem — raw markethighlights JSON item → internal format
+ * Compatible with parseMatchRow output shape.
+ */
+function normalizeHighlightItem(item) {
+  if (!item) return null;
+
+  // marketId: m_1_XXXXXXXX → 1.XXXXXXXX
+  const rawId   = String(item.id || item.marketId || '');
+  const marketId = normalizeMarketId(rawId);
+  if (!marketId) return null;
+
+  // eventTypeId — map sport label strings to Betfair IDs
+  let eventTypeId = String(item.eventTypeId || item.sport?.id || '');
+  if (!eventTypeId || eventTypeId === 'undefined') {
+    const label = String(item.sport?.name || item.sportName || item.eventType || '').toLowerCase();
+    if (label.includes('cricket'))              eventTypeId = '4';
+    else if (label.includes('tennis'))          eventTypeId = '2';
+    else if (label.includes('football') || label.includes('soccer')) eventTypeId = '1';
+    else if (label.includes('horse'))           eventTypeId = '7';
+    else if (label.includes('grey') || label.includes('dog')) eventTypeId = '4339';
+  }
+  if (!eventTypeId) return null;
+
+  const startIso = item.startTime || item.openDate || item.marketStartTime
+    || item.event?.openDate || new Date().toISOString();
+
+  // Event id — prefer href-based / field
+  const eventId = item.eventId || item.event?.id || item.event?.eventId || rawId;
+
+  // Team / runner names
+  const team1 = item.team1 || item.home || item.runner1 || '';
+  const team2 = item.team2 || item.away || item.runner2 || '';
+  const eventName = item.eventName || item.event?.name
+    || (team1 && team2 ? `${team1} v ${team2}` : team1 || marketId);
+
+  // Runners — some highlights feeds include them, some don't
+  let runners = [];
+  if (Array.isArray(item.runners) && item.runners.length) {
+    runners = item.runners.map((r, i) => ({
+      selectionId: r.selectionId || r.id || (i + 1),
+      runnerName:  r.runnerName  || r.name || `Runner ${i + 1}`,
+      sortPriority: r.sortPriority || r.sort || (i + 1),
+      handicap: r.handicap || r.hdp || 0,
+      metadata: r.metadata || {},
+      ex: {
+        availableToBack: (r.back || r.availableToBack || []).slice(0, 3).map(b =>
+          ({ price: b.price ?? b, size: b.size || 0 })),
+        availableToLay:  (r.lay  || r.availableToLay  || []).slice(0, 3).map(l =>
+          ({ price: l.price ?? l, size: l.size || 0 })),
+      },
+    }));
+  }
+
+  return {
+    id: marketId,
+    name: item.marketName || item.name || 'Match Odds',
+    start: startIso,
+    eventTypeId,
+    inPlay: !!(item.inPlay || item.inplay || item.isInPlay),
+    matched: item.totalMatched || item.matched || 0,
+    competition: item.competition || (item.competitionName ? { id: item.competitionId || '', name: item.competitionName } : null),
+    event: {
+      id:          String(eventId),
+      name:        eventName,
+      countryCode: item.countryCode || item.event?.countryCode || null,
+      venue:       item.venue       || item.event?.venue       || null,
+      openDate:    startIso,
+    },
+    runners,
+  };
+}
+
 async function fetchHighlightsHtml() {
   const url = `${BPEXCH_BASE_URL}/Common/MarketHighlights`;
   const res = await axios.get(url, {
@@ -205,18 +321,25 @@ function parseRaceItems(sectionHtml, eventTypeId) {
 }
 
 async function getRacingHighlights(eventTypeId) {
+  // PRIMARY: try markethighlights JSON (may include racing sections)
+  try {
+    const jsonItems = await getSportsHighlightsFromJson(eventTypeId);
+    if (jsonItems !== null && jsonItems.length > 0) return jsonItems;
+  } catch(e) { /* fall through */ }
+
+  // FALLBACK: HTML scraping (always worked for racing)
   const html = await getHighlightsHtml();
-  const horseSection = sliceBetweenMarkers(html, 'Horse Race', 'Grey Hound');
+  const horseSection     = sliceBetweenMarkers(html, 'Horse Race', 'Grey Hound');
   const greyhoundSection = sliceBetweenMarkers(html, 'Grey Hound', 'TABS SYSTEM');
 
   if (eventTypeId != null) {
     if (isHorseRacingEventType(eventTypeId)) return parseRaceItems(horseSection, eventTypeId);
-    if (isGreyhoundEventType(eventTypeId)) return parseRaceItems(greyhoundSection, eventTypeId);
+    if (isGreyhoundEventType(eventTypeId))   return parseRaceItems(greyhoundSection, eventTypeId);
     return [];
   }
 
   return [
-    ...parseRaceItems(horseSection, resolveHorseRacingId()),
+    ...parseRaceItems(horseSection,     resolveHorseRacingId()),
     ...parseRaceItems(greyhoundSection, resolveGreyhoundId()),
   ];
 }
@@ -427,7 +550,55 @@ function parseMatchOddsSections(html) {
   return sections;
 }
 
+async function getSportsHighlightsFromJson(eventTypeId) {
+  try {
+    const data = await getMarkethighlightsJson();
+    // Response may be: { cricket:[...], football:[...], tennis:[...] }
+    // OR: [ { eventTypeId, markets:[...] } ]
+    // OR: flat array of items
+    let items = [];
+
+    if (Array.isArray(data)) {
+      // Flat array or array of sport groups
+      for (const entry of data) {
+        if (Array.isArray(entry.markets)) {
+          items.push(...entry.markets.map(normalizeHighlightItem).filter(Boolean));
+        } else if (entry.id || entry.marketId) {
+          const n = normalizeHighlightItem(entry);
+          if (n) items.push(n);
+        }
+      }
+    } else if (data && typeof data === 'object') {
+      // Key → array shape: { cricket:[...], football:[...] }
+      for (const [key, val] of Object.entries(data)) {
+        if (!Array.isArray(val)) continue;
+        for (const item of val) {
+          const n = normalizeHighlightItem(item);
+          if (n) items.push(n);
+        }
+      }
+    }
+
+    if (!items.length) throw new Error('markethighlights JSON returned 0 items');
+
+    if (eventTypeId != null) {
+      const wanted = String(eventTypeId);
+      items = items.filter(m => String(m.eventTypeId) === wanted);
+    }
+    logger.info(`[bpexch] markethighlights JSON: ${items.length} items (eventTypeId=${eventTypeId ?? 'all'})`);
+    return items;
+  } catch (err) {
+    logger.warn(`[bpexch] markethighlights JSON failed (eventTypeId=${eventTypeId}): ${err.message} — falling back to HTML`);
+    return null;  // null = caller falls back to HTML scraper
+  }
+}
+
 async function getSportsHighlights(eventTypeId) {
+  // PRIMARY: markethighlights JSON API
+  const jsonItems = await getSportsHighlightsFromJson(eventTypeId);
+  if (jsonItems !== null) return jsonItems;
+
+  // FALLBACK: HTML scraping (original)
   const html = await getHighlightsHtml();
   const sections = parseMatchOddsSections(html);
   if (eventTypeId != null) {
