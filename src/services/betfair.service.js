@@ -77,13 +77,21 @@ function isGreyhoundEventType(eventTypeId) {
   return isEventTypeMatching(eventTypeId, ['grey', 'dog racing']) || String(eventTypeId) === '4339';
 }
 function isCricketEventType(eventTypeId) {
-  return isEventTypeMatching(eventTypeId, ['cricket']);
+  // ✅ FIX: horse/greyhound ki tarah hi hardcoded standard Betfair ID
+  // fallback add kiya — pehle sirf SPORT_MAP naam-match pe depend karta
+  // tha, aur agar wahan "cricket" keyword match nahi hota (naam missing
+  // ya thoda different likha ho) to ye function hamesha false deta,
+  // aur sportItems() cricket ke liye chup-chaap khaali [] return karta
+  // — yahi wajah thi ke dashboard mein cricket data kabhi nahi aata tha.
+  return isEventTypeMatching(eventTypeId, ['cricket']) || String(eventTypeId) === '4';
 }
 function isTennisEventType(eventTypeId) {
-  return isEventTypeMatching(eventTypeId, ['tennis']);
+  // ✅ FIX: same reason — standard Betfair tennis eventTypeId '2' fallback
+  return isEventTypeMatching(eventTypeId, ['tennis']) || String(eventTypeId) === '2';
 }
 function isFootballEventType(eventTypeId) {
-  return isEventTypeMatching(eventTypeId, ['football', 'soccer']);
+  // ✅ FIX: same reason — standard Betfair soccer eventTypeId '1' fallback
+  return isEventTypeMatching(eventTypeId, ['football', 'soccer']) || String(eventTypeId) === '1';
 }
 
 function resolveHorseRacingId() {
@@ -93,13 +101,18 @@ function resolveGreyhoundId() {
   return resolveEventTypeIdByKeywords(['grey', 'dog racing'], '4339');
 }
 function resolveCricketId() {
-  return resolveEventTypeIdByKeywords(['cricket'], null);
+  // ✅ FIX: pehle fallback null tha — agar SPORT_MAP mein "cricket" naam
+  // match na ho to null milta, aur parseMatchOddsSections() us block ko
+  // "eventTypeId hi nahi mili" bol ke skip kar deta (rows parse hone ke
+  // baad bhi discard ho jaate). Ab horse('7')/greyhound('4339') jaisa hi
+  // hardcoded standard Betfair ID fallback hai.
+  return resolveEventTypeIdByKeywords(['cricket'], '4');
 }
 function resolveTennisId() {
-  return resolveEventTypeIdByKeywords(['tennis'], null);
+  return resolveEventTypeIdByKeywords(['tennis'], '2');
 }
 function resolveFootballId() {
-  return resolveEventTypeIdByKeywords(['football', 'soccer'], null);
+  return resolveEventTypeIdByKeywords(['football', 'soccer'], '1');
 }
 
 /* ── /Common/MarketHighlights — cached fetch (racing + match-odds
