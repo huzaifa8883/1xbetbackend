@@ -56,6 +56,20 @@ const TIMEOUT_MS = 15000;
 
 const BPEXCH_BASE_URL = process.env.BPEXCH_BASE_URL || 'https://bpexch.live';
 
+/**
+ * bpexch highlights row id "m_1_261306873" → real Betfair marketId "1.261306873"
+ * "m_2_123" → "1.123" still uses 1. prefix (Betfair market ids always 1.xxx)
+ * Already "1.261306873" / "9.20660370" / "35962147.1654" → unchanged
+ */
+function normalizeMarketId(id) {
+  if (id == null) return id;
+  const s = String(id).trim();
+  const m = /^m_(\d+)_(.+)$/i.exec(s);
+  if (m) return `1.${m[2]}`;
+  return s;
+}
+
+
 /* ── eventTypeId resolution — SPORT_MAP se naam-based match (ID
    hardcode nahi karte, jaisi Rollwin/Greyhound fix mein pehle bhi
    pattern tha) ─────────────────────────────────────────────────── */
@@ -319,8 +333,11 @@ function parseMatchRow(rowHtml, rowId, eventTypeId) {
     });
   }
 
+  // ✅ m_1_261306873 → 1.261306873 taake Market.html?id= catalog2 / bpexch se match kare
+  const marketId = normalizeMarketId(rowId);
+
   return {
-    id: rowId,
+    id: marketId,
     name: 'Match Odds',
     start: startIso,
     eventTypeId: String(eventTypeId),
@@ -721,21 +738,30 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
     // Sport pata nahi — poori list mein se dhoondo
     const all = await sportItems(null);
     if (filter?.marketIds?.length) {
-      const ids = filter.marketIds.map(String);
-      items = all.filter(m => ids.includes(m.id));
+      const ids = new Set();
+      for (const raw of filter.marketIds.map(String)) {
+        ids.add(raw);
+        ids.add(normalizeMarketId(raw));
+      }
+      items = all.filter(m => ids.has(String(m.id)) || ids.has(normalizeMarketId(m.id)));
     } else if (filter?.eventIds?.length) {
       const ids = filter.eventIds.map(String);
-      items = all.filter(m => ids.includes(m.event?.id));
+      items = all.filter(m => ids.includes(String(m.event?.id)));
     }
   }
 
   if (filter?.eventIds?.length) {
     const ids = filter.eventIds.map(String);
-    items = items.filter(m => ids.includes(m.event?.id));
+    items = items.filter(m => ids.includes(String(m.event?.id)));
   }
   if (filter?.marketIds?.length) {
-    const ids = filter.marketIds.map(String);
-    items = items.filter(m => ids.includes(m.id));
+    // accept both raw and normalized forms (m_1_xxx ↔ 1.xxx)
+    const ids = new Set();
+    for (const raw of filter.marketIds.map(String)) {
+      ids.add(raw);
+      ids.add(normalizeMarketId(raw));
+    }
+    items = items.filter(m => ids.has(String(m.id)) || ids.has(normalizeMarketId(m.id)));
   }
 
   const sliced = items.slice(0, parseInt(maxResults, 10) || 20);
@@ -872,22 +898,42 @@ async function getRunnerBook(marketId, selectionId) {
 const PRICES7_BASE = process.env.PRICES7_BASE_URL || 'https://prices7.mgs11.com';
 
 async function fetchBpexchCatalog2(marketId) {
-  const url = `${BPEXCH_BASE_URL}/api/markets/catalog2/`;
-  const res = await axios.get(url, {
-    params: { id: marketId },
-    timeout: TIMEOUT_MS,
-    headers: {
-      Accept: 'application/json',
-      'X-Requested-With': 'XMLHttpRequest',
-      Referer: `${BPEXCH_BASE_URL}/`,
-    },
-    validateStatus: s => s < 500,
-  });
-  if (res.status !== 200 || !res.data) return null;
-  // bpexch kabhi { data: {...} } wrap karta hai, kabhi seedha object
-  const d = res.data.data || res.data;
-  if (!d || !d.marketId) return null;
-  return d;
+  const id = normalizeMarketId(marketId);
+  // try a few URL shapes (trailing slash / no slash) — CF/proxy sometimes picky
+  const urls = [
+    `${BPEXCH_BASE_URL}/api/markets/catalog2/?id=${encodeURIComponent(id)}`,
+    `${BPEXCH_BASE_URL}/api/markets/catalog2?id=${encodeURIComponent(id)}`,
+  ];
+  let lastErr = null;
+  for (const url of urls) {
+    try {
+      const res = await axios.get(url, {
+        timeout: TIMEOUT_MS,
+        headers: {
+          Accept: 'application/json, text/plain, */*',
+          'X-Requested-With': 'XMLHttpRequest',
+          Referer: `${BPEXCH_BASE_URL}/Common/Dashboard`,
+          Origin: BPEXCH_BASE_URL,
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        },
+        validateStatus: s => s < 500,
+      });
+      if (res.status !== 200 || !res.data) {
+        lastErr = `status=${res.status}`;
+        continue;
+      }
+      const d = res.data.data || res.data;
+      if (!d || !(d.marketId || d.marketName)) {
+        lastErr = 'empty body';
+        continue;
+      }
+      return d;
+    } catch (err) {
+      lastErr = err.message;
+    }
+  }
+  logger.warn(`[bpexch] catalog2 all attempts failed for ${id}: ${lastErr}`);
+  return null;
 }
 
 async function fetchBpexchCatalogs(marketIds = []) {
@@ -940,25 +986,29 @@ async function fetchPrices7MarketData(marketId, token) {
  * purane listMarketCatalogue path pe chala jayega.
  */
 async function getBpexchMarketPage(marketId, pricesToken) {
-  const main = await fetchBpexchCatalog2(marketId).catch(err => {
-    logger.warn(`[bpexch] catalog2 failed for ${marketId}: ${err.message}`);
+  const normalizedId = normalizeMarketId(marketId);
+  const main = await fetchBpexchCatalog2(normalizedId).catch(err => {
+    logger.warn(`[bpexch] catalog2 failed for ${normalizedId}: ${err.message}`);
     return null;
   });
   if (!main) return null;
 
-  // Related sub-market IDs: kabhi catalog2 response mein related/markets
-  // array hota hai; warna prices7 Data ke marketBooks se nikaalte hain.
+  // Related sub-market IDs from catalog2 fields if present
   let subIds = [];
   if (Array.isArray(main.relatedMarketIds)) subIds = main.relatedMarketIds.map(String);
   if (Array.isArray(main.subMarketIds)) subIds = subIds.concat(main.subMarketIds.map(String));
+  // common bpexch shape: hasBookmakerMarkets / linked ids in externalId patterns — ignore
 
-  const live = await fetchPrices7MarketData(marketId, pricesToken).catch(() => null);
+  // ✅ Scorecard/prices7 SKIP by default (JWT required). Only if explicit token.
+  const live = pricesToken
+    ? await fetchPrices7MarketData(normalizedId, pricesToken).catch(() => null)
+    : null;
   if (live?.marketBooks?.length) {
     for (const mb of live.marketBooks) {
-      if (mb.id && String(mb.id) !== String(marketId)) subIds.push(String(mb.id));
+      if (mb.id && String(mb.id) !== String(normalizedId)) subIds.push(String(mb.id));
     }
   }
-  subIds = [...new Set(subIds.filter(id => id && id !== String(marketId)))];
+  subIds = [...new Set(subIds.filter(id => id && id !== String(normalizedId)))];
 
   let subCatalogs = [];
   if (subIds.length) {
@@ -1046,7 +1096,7 @@ module.exports = {
   listMarketBook,
   listMarketProfitAndLoss,
   getBanStatus,
-  // market page (Bookmaker/Fancy/scoreboard)
+  normalizeMarketId,
   fetchBpexchCatalog2,
   fetchBpexchCatalogs,
   fetchPrices7MarketData,
