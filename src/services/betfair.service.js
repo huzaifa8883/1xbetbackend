@@ -215,7 +215,14 @@ async function getRacingHighlights(eventTypeId) {
 
 const MATCH_ROW_RE = /<tr id="([^"]+)"[^>]*class="[^"]*McomCustom[^"]*"[\s\S]*?<\/tr>/g;
 const DAY_RE = /<span class="day">([^<]*)<\/span>/;
-const TIME_ISO_RE = /data-target="time">\s*([^<]+?)\s*<\/span>/;
+// ✅ FIX: pehle `[^<]+` tha (kam se kam 1 char required) — is-play/live
+// matches ke liye bpexch ye span KHAALI chhod deta hai (kyunki unka koi
+// future start-time dikhana nahi hota, bas "In-Play" status day-span mein
+// dikhta hai). Khaali span pe match fail ho jata tha aur poori row hi
+// discard ho jaati thi — yahi wajah thi ke exactly live/in-play matches
+// (jo dashboard pe sabse zyada chahiye) gayab ho rahe the. Ab `*` use
+// kar rahe hain (0 ya zyada chars) taake khaali span bhi match ho.
+const TIME_ISO_RE = /data-target="time">\s*([^<]*?)\s*<\/span>/;
 const TEAM1_RE = /<strong class="team-1">\s*<a href="([^"]*)">\s*([^<]*?)\s*<\/a>/;
 const TEAM2_RE = /<strong class="team-2">\s*<a[^>]*>\s*([^<]*?)\s*<\/a>/;
 const MATCHED_RE = /class="TMFORDESK">([^<]*)<\/span>/;
@@ -244,15 +251,21 @@ function parsePrice(str) {
 
 function parseMatchRow(rowHtml, rowId, eventTypeId) {
   const t1M = TEAM1_RE.exec(rowHtml);
-  const isoM = TIME_ISO_RE.exec(rowHtml);
-  if (!t1M || !isoM) return null; // row samajh nahi aayi — skip, crash mat karo
+  if (!t1M) return null; // team hi na mili to row samajh nahi aayi — skip, crash mat karo
 
+  const isoM = TIME_ISO_RE.exec(rowHtml);
   const dayM = DAY_RE.exec(rowHtml);
   const t2M = TEAM2_RE.exec(rowHtml);
   const matchedM = MATCHED_RE.exec(rowHtml);
 
   const day = (dayM?.[1] || '').trim();
-  const startIso = isoM[1].trim();
+  // ✅ FIX: in-play matches ke liye time span khaali hota hai (upar
+  // TIME_ISO_RE comment dekho). Khaali/missing ho to "abhi" (current
+  // timestamp) use karo — match already chal raha hai, is liye "start"
+  // ko past/now maan lena sahi hai aur ye listEvents() ke window filter
+  // se bhi bahar nahi jayega.
+  const rawIso = (isoM?.[1] || '').trim();
+  const startIso = rawIso || new Date().toISOString();
   const eventHref = t1M[1] || '';
   const eventId = eventHref.split('/').filter(Boolean).pop() || rowId;
   const team1Text = (t1M[2] || '').trim();
