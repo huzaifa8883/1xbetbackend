@@ -7,6 +7,7 @@ const {
   listMarketBook,
   listCompetitions,
   listEventTypes,
+  getBpexchMarketPage,
 } = require('../services/betfair.service');
 const { sendSuccess, sendError } = require('../utils/response');
 const { SPORT_MAP } = require('../config/constants');
@@ -649,6 +650,65 @@ async function getMarketCatalog2(req, res) {
   const { id: marketId } = req.query;
   if (!marketId) return sendError(res, 'marketId query parameter is required', 400);
 
+  // ✅ Prefer bpexch catalog2 + catalogs + (optional) prices7 scoreboard
+  // Real Betfair-style IDs (1.xxx / 9.xxx) ke liye ye path Bookmaker/Fancy/
+  // Figure + scorecard/commentary laata hai — bilkul bpexch market page jaisa.
+  try {
+    const pricesToken = req.headers['x-prices-token'] || req.query.pricesToken || null;
+    const bpx = await getBpexchMarketPage(marketId, pricesToken);
+    if (bpx && bpx.marketId) {
+      const eventTypeId = String(bpx.eventTypeId || bpx.sport?.id || '');
+      const sportName = bpx.eventType || bpx.sport?.name || SPORT_MAP[eventTypeId] || 'Unknown';
+      const iconMap = {
+        Cricket: 'cricket.svg', Tennis: 'tennis.svg',
+        'Horse Racing': 'horse.svg', Soccer: 'soccer.svg',
+        'Greyhound Racing': 'greyhound-racing.svg',
+      };
+      logger.info(`[catalog2] bpexch hit marketId=${marketId} subs=${(bpx.subMarkets||[]).length} scoreboard=${!!bpx.scoreboard}`);
+      return sendSuccess(res, {
+        marketId:            bpx.marketId,
+        marketName:          bpx.marketName || 'Match Odds',
+        marketStartTime:     bpx.marketStartTime || bpx.marketStartTimeUtc || null,
+        marketStartTimeUtc:  bpx.marketStartTimeUtc || bpx.marketStartTime || null,
+        eventTypeId,
+        eventType:           sportName,
+        eventId:             bpx.eventId,
+        eventName:           bpx.eventName,
+        competitionId:       bpx.competitionId || null,
+        status:              bpx.status || 'OPEN',
+        isTurnInPlayEnabled: bpx.isTurnInPlayEnabled ?? true,
+        betDelay:            bpx.betDelay ?? 0,
+        maxBetSize:          bpx.maxBetSize ?? 0,
+        rules:               bpx.rules || '',
+        sport: { name: sportName, image: iconMap[sportName] || 'default.svg', active: true },
+        winners:             bpx.winners ?? 1,
+        runners: (bpx.runners || []).map(r => ({
+          selectionId:  r.selectionId,
+          runnerName:   r.runnerName,
+          handicap:     r.handicap || 0,
+          sortPriority: r.sortPriority || 0,
+          status:       r.status || 'ACTIVE',
+          back:         r.back || [],
+          lay:          r.lay || [],
+          clothNumber:  r.clothNumber || null,
+          clothColor:   r.silkColor || null,
+          silkUrl:      null,
+          jockeyName:   r.jockeyName || null,
+          trainerName:  r.trainerName || null,
+          metadataDict: r.metadata || null,
+        })),
+        subMarkets: bpx.subMarkets || [],
+        scoreboard: bpx.scoreboard || null,
+        scores:     bpx.scores || null,
+        news:       bpx.news || '',
+        updatedAt:  new Date().toISOString(),
+      });
+    }
+  } catch (err) {
+    logger.warn(`[catalog2] bpexch path failed for ${marketId}: ${err.message} — falling back`);
+  }
+
+  // ── Fallback: highlights-based listMarketCatalogue (synthetic IDs) ──
   const [catalogues, books] = await Promise.all([
     listMarketCatalogue({ marketIds: [marketId] }, '1', [
       'EVENT', 'MARKET_START_TIME', 'RUNNER_DESCRIPTION', 'RUNNER_METADATA',
