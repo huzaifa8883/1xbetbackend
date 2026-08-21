@@ -264,7 +264,13 @@ function parseMatchRow(rowHtml, rowId, eventTypeId) {
   // timestamp) use karo — match already chal raha hai, is liye "start"
   // ko past/now maan lena sahi hai aur ye listEvents() ke window filter
   // se bhi bahar nahi jayega.
-  const rawIso = (isoM?.[1] || '').trim();
+  // bpexch kabhi-kabhi "2026-08-21T14:00:00.0000000Z" (7 frac digits) deta
+  // hai — Node parse kar leta hai, lekin safe normalize: frac digits ko 3
+  // tak truncate + trim newlines/spaces.
+  let rawIso = (isoM?.[1] || '').trim().replace(/\s+/g, '');
+  if (rawIso) {
+    rawIso = rawIso.replace(/(\.\d{3})\d+(Z)$/i, '$1$2');
+  }
   const startIso = rawIso || new Date().toISOString();
   const eventHref = t1M[1] || '';
   const eventId = eventHref.split('/').filter(Boolean).pop() || rowId;
@@ -346,7 +352,10 @@ function parseMatchRow(rowHtml, rowId, eventTypeId) {
 // ("Football, Tennis, Cricket" in the real response) — so it sliced the
 // wrong regions and got 0 rows for Cricket/Tennis. Confirmed by testing
 // this block-based approach directly against the real pasted HTML.
-const HIGHLIGHTS_BLOCK_RE = /<div class="high_lights"[^>]*>([\s\S]*?)<\/table>\s*<\/div>/g;
+// ✅ More robust: don't require exact "</table></div>" adjacency (live HTML
+// sometimes has whitespace/comments/extra wrappers). Capture until the next
+// high_lights block or end of string; rows are still found via MATCH_ROW_RE.
+const HIGHLIGHTS_BLOCK_RE = /<div class="high_lights"[^>]*>([\s\S]*?)(?=<div class="high_lights"|$)/g;
 const SPORT_TITLE_RE = /<title>\s*([A-Za-z]+)\s*<\/title>/i;
 const SPORT_LABEL_FALLBACK_RE = /<\/svg>\s*([A-Za-z]+)\s*<\/div>/;
 
@@ -358,10 +367,16 @@ function extractSportLabel(blockHtml) {
 }
 
 function eventTypeIdForSportLabel(label) {
+  // ✅ CRITICAL FIX: marketcontroller.js cricket/tennis/football endpoints
+  // hardcode standard Betfair IDs (4 / 2 / 1). Agar SPORT_MAP mein naam
+  // match ho ke koi ALAG id return ho jaye, to getSportsHighlights() exact
+  // string filter fail ho jata hai → events=0. Is liye yahan hamesha
+  // standard Betfair IDs force karo — resolve* sirf is*EventType / racing
+  // ke liye use hote hain.
   const l = String(label || '').toLowerCase();
-  if (l.includes('cricket')) return resolveCricketId();
-  if (l.includes('tennis')) return resolveTennisId();
-  if (l.includes('football') || l.includes('soccer')) return resolveFootballId();
+  if (l.includes('cricket')) return '4';
+  if (l.includes('tennis')) return '2';
+  if (l.includes('football') || l.includes('soccer')) return '1';
   return null;
 }
 
@@ -632,6 +647,16 @@ async function listEvents(filter = {}) {
   const fromMs = filter?.marketStartTime?.from ? new Date(filter.marketStartTime.from).getTime() : null;
   const toMs   = filter?.marketStartTime?.to   ? new Date(filter.marketStartTime.to).getTime()   : null;
 
+  // Cricket / Tennis / Football highlights already curated by bpexch
+  // (sirf relevant current + upcoming). Tight marketStartTime window
+  // (esp. jab SportConfig.hours_ahead chhota ho ya In-Play match ka
+  // start lookback se pehle ho) unhe discard kar deta tha → events=0.
+  // Racing ke liye filter zaroori hai, match-odds ke liye soft.
+  const isMatchOddsSport =
+    isCricketEventType(eventTypeId) ||
+    isTennisEventType(eventTypeId) ||
+    isFootballEventType(eventTypeId);
+
   const seen = new Map();
   items.forEach(m => {
     const ev = m.event;
@@ -640,8 +665,26 @@ async function listEvents(filter = {}) {
 
     // Date string ya epoch — dono normalize karke compare karo
     const startMs = m.start != null ? new Date(m.start).getTime() : NaN;
-    if (fromMs !== null && !isNaN(startMs) && startMs < fromMs) return;
-    if (toMs   !== null && !isNaN(startMs) && startMs > toMs)   return;
+
+    if (!isMatchOddsSport) {
+      // Racing: strict window (pehle jaisa)
+      if (fromMs !== null && !isNaN(startMs) && startMs < fromMs) return;
+      if (toMs   !== null && !isNaN(startMs) && startMs > toMs)   return;
+    } else {
+      // Match-odds: In-Play hamesha include; invalid/missing start = include;
+      // otherwise only drop if clearly outside a *very* wide window
+      // (7 days back / 14 days ahead) — bpexch already curated.
+      if (m.inPlay) {
+        // keep
+      } else if (isNaN(startMs)) {
+        // keep (parse failed — still show)
+      } else {
+        const wideFrom = fromMs != null ? fromMs - 7 * 24 * 3600_000 : null;
+        const wideTo   = toMs   != null ? toMs   + 14 * 24 * 3600_000 : null;
+        if (wideFrom !== null && startMs < wideFrom) return;
+        if (wideTo   !== null && startMs > wideTo)   return;
+      }
+    }
 
     if (!seen.has(ev.id)) {
       seen.set(ev.id, {
