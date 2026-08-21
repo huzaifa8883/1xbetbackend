@@ -56,6 +56,164 @@ const TIMEOUT_MS = 15000;
 
 const BPEXCH_BASE_URL = process.env.BPEXCH_BASE_URL || 'https://bpexch.live';
 
+/* ═══════════════════════════════════════════════════════════════════
+   ✅ bpexch.live — AUTO-LOGIN SESSION (catalog2 / catalogs ke liye)
+   ═══════════════════════════════════════════════════════════════════
+   catalog2/catalogs APIs bina logged-in session cookie ke INVALID_SESSION
+   dete hain (confirm ho chuka hai — curl test: {"error":"INVALID_SESSION"}).
+   Login flow (Network tab se capture kiya gaya, verbatim):
+
+     1. GET  <BPEXCH_LOGIN_PAGE_URL>
+        → HTML mein hidden input <input name="__RequestVerificationToken"
+          value="...">, aur Set-Cookie mein AntiForgery.WebExchange cookie
+          milta hai. Ye dono ek session-bound PAIR hain — token sirf usi
+          cookie ke saath valid hota hai jis GET request se mila.
+
+     2. POST https://bpexch.live/Users/Login   (form-urlencoded body):
+          user.Username, user.Password, Device, UtcOffset,
+          __RequestVerificationToken
+        → Success par 302 Found, aur Set-Cookie mein real session cookies
+          (wex3authtoken JWT, wex3reftoken, wexscktoken, etc.) milte hain.
+
+   wex3authtoken JWT decode karne par mila: exp - iat = 3600s (1 ghanta).
+   Is liye session ko HAR ~50 MINUTE mein proactively refresh karte hain
+   (real expiry se 10 min pehle) — + reactively bhi jab beech mein kabhi
+   INVALID_SESSION mil jaaye.
+
+   ⚠️ Credentials .env se aate hain (BPEXCH_USERNAME / BPEXCH_PASSWORD) —
+   code mein kahin hardcode nahi hain.
+   ═══════════════════════════════════════════════════════════════════ */
+const BPEXCH_LOGIN_PAGE_URL = process.env.BPEXCH_LOGIN_PAGE_URL || `${BPEXCH_BASE_URL}/Common/Dashboard`;
+const BPEXCH_LOGIN_URL = process.env.BPEXCH_LOGIN_URL || `${BPEXCH_BASE_URL}/Users/Login`;
+const BPEXCH_USERNAME = process.env.BPEXCH_USERNAME;
+const BPEXCH_PASSWORD = process.env.BPEXCH_PASSWORD;
+// Real cookie 60 min mein expire hoti hai — 50 min par proactively refresh
+// karte hain taake kabhi bhi live request INVALID_SESSION na dekhe.
+const BPEXCH_SESSION_TTL_MS = parseInt(process.env.BPEXCH_SESSION_TTL_MINUTES || '50', 10) * 60 * 1000;
+
+const BPEXCH_COMMON_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept': 'application/json, text/plain, */*',
+  'Referer': `${BPEXCH_BASE_URL}/Common/Dashboard`,
+  'Origin': BPEXCH_BASE_URL,
+};
+
+let bpexchCookieJar = null;     // "k1=v1; k2=v2; ..." string, saari cookies combined
+let bpexchCookieExpiry = null;
+let bpexchLoginPromise = null;  // login-in-progress dedup (Betfair session pattern jaisa)
+
+// Set-Cookie header array (jaisa axios deta hai: ["name=value; Path=/; ...", ...])
+// ko ek existing cookie-jar string ke saath merge karta hai (naye keys
+// purano ko overwrite karte hain — jaisa asal browser cookie jar karta hai).
+function mergeSetCookies(setCookieHeaders, existingJarString) {
+  const jar = {};
+  (existingJarString || '').split(';').forEach(pair => {
+    const idx = pair.indexOf('=');
+    if (idx === -1) return;
+    const k = pair.slice(0, idx).trim();
+    const v = pair.slice(idx + 1).trim();
+    if (k) jar[k] = v;
+  });
+  (setCookieHeaders || []).forEach(raw => {
+    const first = raw.split(';')[0]; // "name=value" hissa, attributes (Path/Expires/etc.) chhod do
+    const idx = first.indexOf('=');
+    if (idx === -1) return;
+    const k = first.slice(0, idx).trim();
+    const v = first.slice(idx + 1).trim();
+    if (k) jar[k] = v;
+  });
+  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+async function bpexchLogin() {
+  if (!BPEXCH_USERNAME || !BPEXCH_PASSWORD) {
+    throw new Error('[bpexch] BPEXCH_USERNAME / BPEXCH_PASSWORD env vars missing hain — auto-login nahi ho sakta');
+  }
+
+  // Step 1: login page hit karke fresh antiforgery token + uski matching
+  // cookie nikalo (dono session-bound pair hain, purana/hardcoded token
+  // reuse nahi ho sakta).
+  const pageRes = await axios.get(BPEXCH_LOGIN_PAGE_URL, {
+    headers: BPEXCH_COMMON_HEADERS,
+    timeout: TIMEOUT_MS,
+    validateStatus: () => true,
+  });
+
+  const pageCookies = mergeSetCookies(pageRes.headers['set-cookie'], null);
+  const tokenMatch = /name="__RequestVerificationToken"[^>]*value="([^"]+)"/i.exec(pageRes.data || '');
+  const csrfToken = tokenMatch?.[1];
+
+  if (!csrfToken) {
+    logger.error('[bpexch] Login page se __RequestVerificationToken nahi mila — page HTML structure badal gaya ho sakta hai ya BPEXCH_LOGIN_PAGE_URL galat hai');
+    throw new Error('[bpexch] antiforgery token extraction failed');
+  }
+
+  // Step 2: actual login POST — exact field names jo Network tab se capture
+  // hue the (user.Username, user.Password, Device, UtcOffset).
+  const body = new URLSearchParams({
+    'user.Username': BPEXCH_USERNAME,
+    'user.Password': BPEXCH_PASSWORD,
+    'Device': 'Google Chrome',
+    'UtcOffset': '300',
+    '__RequestVerificationToken': csrfToken,
+  });
+
+  const loginRes = await axios.post(BPEXCH_LOGIN_URL, body, {
+    headers: {
+      ...BPEXCH_COMMON_HEADERS,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Cookie: pageCookies,
+    },
+    timeout: TIMEOUT_MS,
+    maxRedirects: 0,       // 302 khud capture karna hai (Set-Cookie usi response par hoti hai)
+    validateStatus: () => true,
+  });
+
+  if (loginRes.status !== 302 && loginRes.status !== 200) {
+    logger.error(`[bpexch] Login failed — HTTP ${loginRes.status}: ${JSON.stringify(loginRes.data).slice(0, 200)}`);
+    throw new Error(`[bpexch] login failed with status ${loginRes.status}`);
+  }
+
+  const finalCookies = mergeSetCookies(loginRes.headers['set-cookie'], pageCookies);
+
+  if (!finalCookies.includes('wex3authtoken')) {
+    logger.error('[bpexch] Login response aaya lekin wex3authtoken cookie nahi mila — credentials galat ho sakte hain ya login flow site par badal gaya hai');
+    throw new Error('[bpexch] login "succeeded" but session cookie missing');
+  }
+
+  logger.info('[bpexch] Naya session mil gaya (auto-login successful)');
+  return finalCookies;
+}
+
+async function getBpexchSession() {
+  if (bpexchCookieJar && bpexchCookieExpiry && Date.now() < bpexchCookieExpiry) {
+    return bpexchCookieJar;
+  }
+  if (bpexchLoginPromise) return bpexchLoginPromise;
+
+  bpexchLoginPromise = (async () => {
+    try {
+      const cookies = await bpexchLogin();
+      bpexchCookieJar = cookies;
+      bpexchCookieExpiry = Date.now() + BPEXCH_SESSION_TTL_MS;
+      return cookies;
+    } catch (err) {
+      bpexchCookieJar = null;
+      bpexchCookieExpiry = null;
+      throw err;
+    } finally {
+      bpexchLoginPromise = null;
+    }
+  })();
+
+  return bpexchLoginPromise;
+}
+
+function invalidateBpexchSession() {
+  bpexchCookieJar = null;
+  bpexchCookieExpiry = null;
+}
+
 /**
  * bpexch highlights row id "m_1_261306873" → real Betfair marketId "1.261306873"
  * "m_2_123" → "1.123" still uses 1. prefix (Betfair market ids always 1.xxx)
@@ -938,7 +1096,34 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
   const sliced = items.slice(0, parseInt(maxResults, 10) || 20);
   if (!sliced.length) return [];
 
-  return sliced.map(m => {
+  // ✅ Racing (Horse/Greyhound) highlights feed runners KABHI nahi deta
+  // (sirf venue/time listing hai) — is liye jin racing markets ke runners
+  // khaali hain, unke liye bpexch catalog2 (jo composite racing IDs jaise
+  // "35962147.1828" bhi accept karta hai) se enrich karte hain. Cricket/
+  // Tennis/Football ke liye ye zaroori nahi (highlights mein already
+  // runners aate hain), is liye sirf horse/greyhound + empty-runners
+  // condition mein hi extra HTTP call lagti hai.
+  const enrichedSliced = await Promise.all(sliced.map(async (m) => {
+    const mEventTypeId = String(m.eventTypeId || eventTypeId || '');
+    if ((m.runners || []).length || !(isHorseRacingEventType(mEventTypeId) || isGreyhoundEventType(mEventTypeId))) {
+      return m;
+    }
+    try {
+      const cat2 = await fetchBpexchCatalog2(m.id);
+      if (cat2 && Array.isArray(cat2.runners) && cat2.runners.length) {
+        logger.info(`[listMarketCatalogue] racing runners enriched via bpexch catalog2 for ${m.id}: ${cat2.runners.length} runners`);
+        return { ...m, runners: cat2.runners };
+      }
+    } catch (err) {
+      logger.warn(`[listMarketCatalogue] catalog2 runner-enrich failed for ${m.id}: ${err.message}`);
+    }
+    // catalog2 se bhi kuch nahi mila — page chrome (title/timer/OPEN status)
+    // todna nahi hai, is liye khaali runners ke saath aage badho (jaisa
+    // pehle bhi tha), crash nahi hona chahiye.
+    return m;
+  }));
+
+  return enrichedSliced.map(m => {
     const startMs = m.start != null ? new Date(m.start).getTime() : NaN;
     const eid = String(m.eventTypeId || eventTypeId || '');
 
@@ -1068,14 +1253,19 @@ async function getRunnerBook(marketId, selectionId) {
 
 const PRICES7_BASE = process.env.PRICES7_BASE_URL || 'https://prices7.mgs11.com';
 
-async function fetchBpexchCatalog2(marketId) {
+async function fetchBpexchCatalog2(marketId, isRetry = false) {
   const id = normalizeMarketId(marketId);
+  const cookie = await getBpexchSession().catch(err => {
+    logger.error(`[bpexch] session fetch failed before catalog2(${id}): ${err.message}`);
+    return null;
+  });
   // try a few URL shapes (trailing slash / no slash) — CF/proxy sometimes picky
   const urls = [
     `${BPEXCH_BASE_URL}/api/markets/catalog2/?id=${encodeURIComponent(id)}`,
     `${BPEXCH_BASE_URL}/api/markets/catalog2?id=${encodeURIComponent(id)}`,
   ];
   let lastErr = null;
+  let sawInvalidSession = false;
   for (const url of urls) {
     try {
       const res = await axios.get(url, {
@@ -1086,9 +1276,15 @@ async function fetchBpexchCatalog2(marketId) {
           Referer: `${BPEXCH_BASE_URL}/Common/Dashboard`,
           Origin: BPEXCH_BASE_URL,
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          ...(cookie ? { Cookie: cookie } : {}),
         },
         validateStatus: s => s < 500,
       });
+      if (res.data?.error === 'INVALID_SESSION') {
+        sawInvalidSession = true;
+        lastErr = 'INVALID_SESSION';
+        continue;
+      }
       if (res.status !== 200 || !res.data) {
         lastErr = `status=${res.status}`;
         continue;
@@ -1103,12 +1299,25 @@ async function fetchBpexchCatalog2(marketId) {
       lastErr = err.message;
     }
   }
+
+  // Session expire ho chuki ho sakti hai (upstream ne humare 50-min proactive
+  // refresh se pehle hi invalidate kar diya) — ek baar fresh login karke retry.
+  if (sawInvalidSession && !isRetry) {
+    logger.warn(`[bpexch] catalog2(${id}) — INVALID_SESSION, session refresh karke ek baar retry ho raha hai`);
+    invalidateBpexchSession();
+    return fetchBpexchCatalog2(marketId, true);
+  }
+
   logger.warn(`[bpexch] catalog2 all attempts failed for ${id}: ${lastErr}`);
   return null;
 }
 
-async function fetchBpexchCatalogs(marketIds = []) {
+async function fetchBpexchCatalogs(marketIds = [], isRetry = false) {
   if (!marketIds.length) return [];
+  const cookie = await getBpexchSession().catch(err => {
+    logger.error(`[bpexch] session fetch failed before catalogs(${marketIds.length} ids): ${err.message}`);
+    return null;
+  });
   const url = `${BPEXCH_BASE_URL}/api/markets/catalogs/`;
   const res = await axios.get(url, {
     params: { ids: marketIds.join(',') },
@@ -1117,9 +1326,21 @@ async function fetchBpexchCatalogs(marketIds = []) {
       Accept: 'application/json',
       'X-Requested-With': 'XMLHttpRequest',
       Referer: `${BPEXCH_BASE_URL}/`,
+      ...(cookie ? { Cookie: cookie } : {}),
     },
     validateStatus: s => s < 500,
   });
+
+  if (res.data?.error === 'INVALID_SESSION') {
+    if (!isRetry) {
+      logger.warn(`[bpexch] catalogs(${marketIds.length} ids) — INVALID_SESSION, session refresh karke ek baar retry ho raha hai`);
+      invalidateBpexchSession();
+      return fetchBpexchCatalogs(marketIds, true);
+    }
+    logger.warn(`[bpexch] catalogs still INVALID_SESSION after refresh retry`);
+    return [];
+  }
+
   if (res.status !== 200) return [];
   const raw = res.data;
   if (Array.isArray(raw)) return raw;
@@ -1272,4 +1493,7 @@ module.exports = {
   fetchBpexchCatalogs,
   fetchPrices7MarketData,
   getBpexchMarketPage,
+  // ✅ bpexch.live auto-login session — diagnostics/health-check ke liye
+  getBpexchSession,
+  invalidateBpexchSession,
 };
