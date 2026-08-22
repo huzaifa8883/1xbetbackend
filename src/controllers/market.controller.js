@@ -1,3 +1,4 @@
+
 'use strict';
 
 const { v4: uuidv4 } = require('uuid');
@@ -671,6 +672,59 @@ async function getMarketCatalog2(req, res) {
         'Greyhound Racing': 'greyhound-racing.svg',
       };
       logger.info(`[catalog2] bpexch hit marketId=${marketId} subs=${(bpx.subMarkets||[]).length} scoreboard=${!!bpx.scoreboard}`);
+
+      // If catalog2 runners have no prices, fill from highlights listMarketBook
+      let runnersOut = (bpx.runners || []).map(r => ({
+          selectionId:  r.selectionId,
+          runnerName:   r.runnerName,
+          handicap:     r.handicap || 0,
+          sortPriority: r.sortPriority || 0,
+          status:       r.status || 'ACTIVE',
+          back:         r.back || [],
+          lay:          r.lay || [],
+          clothNumber:  r.clothNumber || null,
+          clothColor:   r.silkColor || null,
+          silkUrl:      null,
+          jockeyName:   r.jockeyName || null,
+          trainerName:  r.trainerName || null,
+          metadataDict: r.metadata || null,
+        }));
+      const needOdds = runnersOut.every(r => !(r.back && r.back.length) && !(r.lay && r.lay.length));
+      if (needOdds) {
+        try {
+          const books = await listMarketBook([marketId]);
+          const book = books?.[0];
+          if (book?.runners?.length) {
+            runnersOut = runnersOut.map(r => {
+              const rb = book.runners.find(x => Number(x.selectionId) === Number(r.selectionId))
+                || book.runners.find((x, i) => i === runnersOut.indexOf(r));
+              if (!rb?.ex) return r;
+              return {
+                ...r,
+                back: (rb.ex.availableToBack || []).slice(0, 3),
+                lay:  (rb.ex.availableToLay  || []).slice(0, 3),
+                status: rb.status || r.status,
+              };
+            });
+            // name-based fallback if selectionIds differ (synthetic vs real)
+            if (runnersOut.every(r => !(r.back && r.back.length))) {
+              runnersOut = runnersOut.map((r, i) => {
+                const rb = book.runners[i];
+                if (!rb?.ex) return r;
+                return {
+                  ...r,
+                  back: (rb.ex.availableToBack || []).slice(0, 3),
+                  lay:  (rb.ex.availableToLay  || []).slice(0, 3),
+                };
+              });
+            }
+            logger.info(`[catalog2] filled odds from listMarketBook for ${marketId}`);
+          }
+        } catch (e) {
+          logger.warn(`[catalog2] listMarketBook odds fill failed: ${e.message}`);
+        }
+      }
+
       return sendSuccess(res, {
         marketId:            bpx.marketId,
         marketName:          bpx.marketName || 'Match Odds',
@@ -688,21 +742,7 @@ async function getMarketCatalog2(req, res) {
         rules:               bpx.rules || '',
         sport: { name: sportName, image: iconMap[sportName] || 'default.svg', active: true },
         winners:             bpx.winners ?? 1,
-        runners: (bpx.runners || []).map(r => ({
-          selectionId:  r.selectionId,
-          runnerName:   r.runnerName,
-          handicap:     r.handicap || 0,
-          sortPriority: r.sortPriority || 0,
-          status:       r.status || 'ACTIVE',
-          back:         r.back || [],
-          lay:          r.lay || [],
-          clothNumber:  r.clothNumber || null,
-          clothColor:   r.silkColor || null,
-          silkUrl:      null,
-          jockeyName:   r.jockeyName || null,
-          trainerName:  r.trainerName || null,
-          metadataDict: r.metadata || null,
-        })),
+        runners: runnersOut,
         subMarkets: bpx.subMarkets || [],
         // scoreboard — Vue score prop se directly bind hota hai market.html mein
         // fields: team1, t1_runs, t1_wickets, t1_overs, t1_crr,
