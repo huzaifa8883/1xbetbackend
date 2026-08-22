@@ -1,4 +1,3 @@
-
 'use strict';
 
 const { v4: uuidv4 } = require('uuid');
@@ -11,6 +10,7 @@ const {
   getBpexchMarketPage,
   getBpexchEventMarkets,
   resolveMarketIdFromEventId,
+  fetchPrices7MarketData,
   normalizeMarketId,
 } = require('../services/betfair.service');
 const { sendSuccess, sendError } = require('../utils/response');
@@ -551,10 +551,37 @@ async function getLiveSport(req, res) {
 /* ── Market detail endpoints ────────────────────────────── */
 
 async function getMarketData(req, res) {
-  const { id: marketId } = req.query;
-  if (!marketId) return sendError(res, 'marketId query parameter is required', 400);
+  let { id: rawId } = req.query;
+  if (!rawId) return sendError(res, 'marketId query parameter is required', 400);
 
-  // Step 1: Main market ka catalog lo — eventId nikalna hai
+  let marketId = normalizeMarketId(rawId);
+  // eventId-only (path style) → resolve
+  if (!String(rawId).includes('.') && !/^[mM]_/.test(String(rawId))) {
+    const resolved = await resolveMarketIdFromEventId(String(rawId)).catch(() => null);
+    if (resolved) marketId = resolved;
+  }
+
+  const pricesToken = req.headers['x-prices-token'] || req.query.pricesToken || null;
+
+  // ── PRIMARY: prices7 Data — full 3-level ladder + all related market books ──
+  // mv2.min.js polls this endpoint; shape must match prices7 marketBooks
+  try {
+    const live = await fetchPrices7MarketData(marketId, pricesToken);
+    if (live && Array.isArray(live.marketBooks) && live.marketBooks.length) {
+      logger.info(`[marketData] prices7 books=${live.marketBooks.length} for ${marketId}`);
+      return sendSuccess(res, {
+        requestId: uuidv4(),
+        marketBooks: live.marketBooks,
+        news: live.news || '',
+        scores: live.scores || null,
+        scoreboard: live.scoreboard || null,
+      });
+    }
+  } catch (e) {
+    logger.warn(`[marketData] prices7 failed: ${e.message}`);
+  }
+
+  // ── FALLBACK: highlights listMarketBook (1-level only) ──
   const [catalogues, mainBooks] = await Promise.all([
     listMarketCatalogue({ marketIds: [marketId] }, '1', ['EVENT', 'RUNNER_DESCRIPTION']),
     listMarketBook([marketId]),
@@ -564,89 +591,60 @@ async function getMarketData(req, res) {
   const mainBook = mainBooks?.[0];
   if (!mainBook) return sendError(res, 'Market not found', 404);
 
-  // Runner name map for main market
   const runnerMap = {};
   (catalog?.runners || []).forEach(r => { runnerMap[r.selectionId] = r.runnerName; });
 
-  // Helper: book ko mv2.min.js ka expected shape mein convert karo
   function bookToMarketBook(book, rMap) {
     return {
       id:             book.marketId,
-      betDelay:       book.betDelay       || 0,
-      totalMatched:   book.totalMatched   || 0,
-      marketStatus:   book.status         || 'OPEN',
+      betDelay:       book.betDelay || 0,
+      totalMatched:   book.totalMatched || 0,
+      marketStatus:   book.status || 'OPEN',
       bettingAllowed: true,
-      runners: (book.runners || []).map(r => ({
-        id:     r.selectionId,
-        name:   rMap[r.selectionId] || '',
-        price1: r.ex?.availableToBack?.[0]?.price || 0,
-        price2: r.ex?.availableToBack?.[1]?.price || 0,
-        price3: r.ex?.availableToBack?.[2]?.price || 0,
-        size1:  r.ex?.availableToBack?.[0]?.size  || 0,
-        size2:  r.ex?.availableToBack?.[1]?.size  || 0,
-        size3:  r.ex?.availableToBack?.[2]?.size  || 0,
-        lay1:   r.ex?.availableToLay?.[0]?.price  || 0,
-        lay2:   r.ex?.availableToLay?.[1]?.price  || 0,
-        lay3:   r.ex?.availableToLay?.[2]?.price  || 0,
-        ls1:    r.ex?.availableToLay?.[0]?.size   || 0,
-        ls2:    r.ex?.availableToLay?.[1]?.size   || 0,
-        ls3:    r.ex?.availableToLay?.[2]?.size   || 0,
-        status: r.status || 'ACTIVE',
-      })),
-      timestamp: book.lastMatchTime || '0001-01-01T00:00:00',
+      isRoot:         String(book.marketId) === String(marketId),
+      runners: (book.runners || []).map(r => {
+        const backs = r.ex?.availableToBack || [];
+        const lays  = r.ex?.availableToLay || [];
+        // Highlights often only have 1 level — put it on price3/lay1 (center columns near spread)
+        const b0 = backs[0] || {};
+        const b1 = backs[1] || {};
+        const b2 = backs[2] || {};
+        const l0 = lays[0] || {};
+        const l1 = lays[1] || {};
+        const l2 = lays[2] || {};
+        // If only 1 price, map to best-back (price3) and best-lay (lay1) for UI
+        let price1 = b0.price, price2 = b1.price, price3 = b2.price;
+        let size1 = b0.size, size2 = b1.size, size3 = b2.size;
+        let lay1 = l0.price, lay2 = l1.price, lay3 = l2.price;
+        let ls1 = l0.size, ls2 = l1.size, ls3 = l2.size;
+        if (backs.length === 1 && !b1.price && !b2.price) {
+          price3 = b0.price; size3 = b0.size;
+          price1 = undefined; size1 = undefined;
+          price2 = undefined; size2 = undefined;
+        }
+        if (lays.length === 1 && !l1.price && !l2.price) {
+          lay1 = l0.price; ls1 = l0.size;
+          lay2 = undefined; ls2 = undefined;
+          lay3 = undefined; ls3 = undefined;
+        }
+        return {
+          id: r.selectionId,
+          name: rMap[r.selectionId] || r.runnerName || '',
+          price1: price1 || 0, price2: price2 || 0, price3: price3 || 0,
+          size1: size1 || 0, size2: size2 || 0, size3: size3 || 0,
+          lay1: lay1 || 0, lay2: lay2 || 0, lay3: lay3 || 0,
+          ls1: ls1 || 0, ls2: ls2 || 0, ls3: ls3 || 0,
+          status: r.status || 'ACTIVE',
+          handicap: 0,
+        };
+      }),
+      timestamp: book.lastMatchTime || new Date().toISOString(),
       winnerIDs: [],
     };
   }
 
-  // Step 2: Main market book — always included
   const marketBooks = [bookToMarketBook(mainBook, runnerMap)];
-
-  // Step 3: Saare sub-markets bhi fetch karo (usi event ke)
-  // mv2.min.js ProcessSubMarkets() ko marketBooks mein SAARE markets chahiye
-  // warna woh subMarkets array se delete kar deta hai unhe
-  const eventId = catalog?.event?.id;
-  if (eventId) {
-    try {
-      // Is event ke baaki sub-markets dhundo
-      const subCatalogues = await listMarketCatalogue(
-        { eventIds: [String(eventId)] },
-        '200',
-        ['RUNNER_DESCRIPTION'],
-      );
-
-      const subMarketIds = subCatalogues
-        .map(m => m.marketId)
-        .filter(id => id !== marketId);  // main market exclude karo
-
-      if (subMarketIds.length > 0) {
-        // Chunk mein books fetch karo (Betfair max 200)
-        const CHUNK = 200;
-        let allSubBooks = [];
-        for (let i = 0; i < subMarketIds.length; i += CHUNK) {
-          const chunk = subMarketIds.slice(i, i + CHUNK);
-          const sb = await listMarketBook(chunk).catch(() => []);
-          allSubBooks = allSubBooks.concat(sb);
-        }
-
-        // Har sub-market ke liye runner map banao aur marketBooks mein push karo
-        const subCatalogMap = {};
-        subCatalogues.forEach(m => { subCatalogMap[m.marketId] = m; });
-
-        allSubBooks.forEach(subBook => {
-          const subCat = subCatalogMap[subBook.marketId];
-          const subRunnerMap = {};
-          (subCat?.runners || []).forEach(r => { subRunnerMap[r.selectionId] = r.runnerName; });
-          marketBooks.push(bookToMarketBook(subBook, subRunnerMap));
-        });
-
-        logger.info(`getMarketData: returning ${marketBooks.length} books (1 main + ${allSubBooks.length} sub)`);
-      }
-    } catch (err) {
-      // Sub-market fetch fail ho to sirf main market return karo — crash mat karo
-      logger.warn(`getMarketData sub-markets fetch failed: ${err.message}`);
-    }
-  }
-
+  logger.info(`[marketData] highlights fallback books=1 for ${marketId}`);
   return sendSuccess(res, { requestId: uuidv4(), marketBooks, news: '' });
 }
 
