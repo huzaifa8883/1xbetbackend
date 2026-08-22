@@ -192,18 +192,18 @@ async function fetchSportMarkets(sportKey, eventTypeId, overrides = {}) {
     allBooks = allBooks.concat(books);
   }
 
-  return catalogues.map(market => {
+  const mapped = catalogues.map(market => {
     const book  = allBooks.find(b => b.marketId === market.marketId);
     const event = events.find(e => e.event.id === market.event?.id);
     return {
       marketId:       market.marketId,
+      eventId:        market.event?.id || event?.event?.id || null,
       match:          event?.event.name || market.marketName || 'Unknown',
       startTime:      event?.event.openDate || '',
       marketStatus:   book?.status || 'UNKNOWN',
       inPlay:         (() => {
         if (book?.inPlay === true) return true;
         if (book?.status === 'IN_PLAY') return true;
-        // startTime past mein hai aur market OPEN hai = live match
         const st = event?.event?.openDate;
         if (st && new Date(st) <= new Date() && book?.status === 'OPEN') return true;
         return false;
@@ -214,6 +214,19 @@ async function fetchSportMarkets(sportKey, eventTypeId, overrides = {}) {
       competitionName: market.competition?.name || null,
     };
   }).sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+
+  // Dedupe by marketId (and by match+start minute as secondary)
+  const seenId = new Set();
+  const seenKey = new Set();
+  return mapped.filter(m => {
+    const id = String(m.marketId || '');
+    if (id && seenId.has(id)) return false;
+    if (id) seenId.add(id);
+    const key = `${(m.match || '').toLowerCase()}__${(m.startTime || '').slice(0, 16)}`;
+    if (seenKey.has(key)) return false;
+    seenKey.add(key);
+    return true;
+  });
 }
 
 /* ── Sport endpoints ─────────────────────────────────────── */
@@ -275,9 +288,10 @@ async function getLiveTennis(req, res) {
     const event = events.find(e => e.event.id === market.event?.id);
     return {
       marketId:        market.marketId,
+      eventId:         market.event?.id || event?.event?.id || null,
       match:           event?.event.name || 'Unknown',
       startTime:       event?.event.openDate || '',
-        inPlay:         (() => {
+      inPlay:         (() => {
           if (book?.inPlay === true) return true;
           if (book?.status === 'IN_PLAY') return true;
           const st = event?.event?.openDate || market?.marketStartTime;
@@ -291,7 +305,15 @@ async function getLiveTennis(req, res) {
     };
   });
 
-  return sendSuccess(res, data);
+  const seen = new Set();
+  const deduped = data.filter(m => {
+    const id = String(m.marketId || '');
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+
+  return sendSuccess(res, deduped);
 }
 
 async function getLiveHorse(req, res) {
