@@ -1,3 +1,4 @@
+
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -286,23 +287,55 @@ function sliceBetweenMarkers(html, startMarker, endMarker) {
    Horse Racing / Greyhound — HTML-embedded slider (CONFIRMED, unchanged)
    ═══════════════════════════════════════════════════════════════════ */
 
-// <a href="/Common/Event/35954463.1822">...utctime...2026-08-19T18:22:00...
-// ...slidename'>Finger Lakes (US)...
-const RACE_ITEM_RE = /href="\/Common\/Event\/([^"]+)"[\s\S]*?utctime[^>]*>\s*([^<]+?)\s*<\/span>[\s\S]*?slidename'>\s*([^<]+?)\s*<\/span>/g;
+// Race slider links: /Common/Event/35954463.1822 + time + venue
+// Also match ?id= form and data-utc / datetime attributes when present
+const RACE_ITEM_RE = /href="\/Common\/Event\/(?:\?id=)?([^"]+)"([\s\S]{0,800}?)<span[^>]*class="[^"]*slidename[^"]*"[^>]*>\s*([^<]+?)\s*<\/span>/gi;
+const RACE_TIME_RE = /(?:utctime[^>]*>\s*([^<]+?)\s*<|data-(?:utc|time|start)=["']([^"']+)["']|datetime=["']([^"']+)["'])/i;
+
+function normalizeRaceStart(raw) {
+  if (!raw) return null;
+  let s = String(raw).trim();
+  if (!s || /^in[\s-]?play$/i.test(s) || s === '-' || s === '--') return null;
+  // pure time HH:mm → assume today UTC (better than Invalid Date)
+  if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(s)) {
+    const d = new Date();
+    const [hh, mm, ss] = s.split(':').map(Number);
+    d.setUTCHours(hh, mm, ss || 0, 0);
+    return d.toISOString();
+  }
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return null;
+  // Guard absurd years (e.g. year 1 / Invalid Date fallbacks)
+  const y = d.getUTCFullYear();
+  if (y < 2020 || y > 2100) return null;
+  return d.toISOString();
+}
 
 function parseRaceItems(sectionHtml, eventTypeId) {
   const items = [];
+  const seen = new Set();
   let m;
   RACE_ITEM_RE.lastIndex = 0;
-  while ((m = RACE_ITEM_RE.exec(sectionHtml)) !== null) {
-    const [, hrefId, startIsoRaw, venueRaw] = m;
-    const id = hrefId.trim(); // poora string hi unique race id hai
-    const venue = venueRaw.trim();
-    const startIso = startIsoRaw.trim();
+  while ((m = RACE_ITEM_RE.exec(sectionHtml || '')) !== null) {
+    const id = decodeURIComponent(m[1]).trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const chunk = m[2] || '';
+    const venue = (m[3] || '').trim() || 'Race';
+    const tm = RACE_TIME_RE.exec(chunk);
+    const startRaw = (tm && (tm[1] || tm[2] || tm[3])) ? String(tm[1] || tm[2] || tm[3]).trim() : '';
+    const startIso = normalizeRaceStart(startRaw);
+    // Skip races with no parseable time OR more than 2h in the past / 36h ahead
+    if (startIso) {
+      const t = new Date(startIso).getTime();
+      const now = Date.now();
+      if (t < now - 2 * 3600 * 1000) continue; // too old
+      if (t > now + 36 * 3600 * 1000) continue; // too far
+    }
     items.push({
       id,
       name: `${venue} - Win`,
-      start: startIso,
+      start: startIso || new Date().toISOString(),
       eventTypeId: String(eventTypeId),
       inPlay: false,
       matched: 0,
@@ -312,12 +345,171 @@ function parseRaceItems(sectionHtml, eventTypeId) {
         name: venue,
         countryCode: null,
         venue,
-        openDate: startIso,
+        openDate: startIso || new Date().toISOString(),
       },
-      runners: [], // is highlights feed mein runners nahi aate — sirf meeting/race listing hai
+      runners: [],
     });
   }
+  logger.info(`[bpexch] parseRaceItems eventTypeId=${eventTypeId} races=${items.length}`);
   return items;
+}
+
+/**
+ * Scrape bpexch race Event page for runners (horse/greyhound).
+ * catalog2 often 404s on composite ids like 35965023.2207 — HTML still has the card.
+ */
+async function scrapeBpexchRaceEventPage(raceId) {
+  const id = String(raceId || '').trim();
+  if (!id) return null;
+  await ensureBpexchSession();
+  const urls = [
+    `${BPEXCH_BASE_URL}/Common/Event/${encodeURIComponent(id)}`,
+    `${BPEXCH_BASE_URL}/Common/Event?id=${encodeURIComponent(id)}`,
+  ];
+  for (const url of urls) {
+    try {
+      const res = await axios.get(url, {
+        timeout: TIMEOUT_MS,
+        headers: bpexchHeaders({ Accept: 'text/html,application/xhtml+xml' }),
+        validateStatus: s => s < 500,
+        maxRedirects: 5,
+      });
+      if (res.status !== 200 || typeof res.data !== 'string') continue;
+      const html = res.data;
+      if (res.headers['set-cookie']) {
+        _bpexchCookie = mergeSetCookie(_bpexchCookie, res.headers['set-cookie']);
+      }
+
+      // Venue / race title
+      let eventName = null;
+      const titleM = html.match(/<h[12][^>]*>([^<]{2,80})<\/h[12]>/i)
+        || html.match(/class="[^"]*event-name[^"]*"[^>]*>([^<]+)/i)
+        || html.match(/<title>([^|<]+)/i);
+      if (titleM) eventName = titleM[1].replace(/\s+/g, ' ').trim();
+
+      // Start time
+      let startIso = null;
+      const timeM = html.match(/utctime[^>]*>\s*([^<]+)/i)
+        || html.match(/data-(?:utc|start)=["']([^"']+)["']/i);
+      if (timeM) startIso = normalizeRaceStart(timeM[1]);
+
+      // Runners: cloth number + name patterns common on exchange race cards
+      const runners = [];
+      const seenSel = new Set();
+      // Table rows with runner names
+      const rowRe = /<(?:tr|div)[^>]*(?:runner|selection|horse|grey)[^>]*>[\s\S]{0,500}?<\/(?:tr|div)>/gi;
+      // Fallback: numbered runners "1. Horse Name" or silk + name
+      const nameRes = [
+        /(?:selectionId|selection_id|data-selection)["'=\s:]+(\d+)[\s\S]{0,120}?(?:runnerName|runner-name|name)["'=\s:]+([^"'<\n]{2,60})/gi,
+        /class="[^"]*runner-name[^"]*"[^>]*>\s*([^<]{2,60})/gi,
+        /<td[^>]*class="[^"]*(?:runner|name)[^"]*"[^>]*>\s*(?:<[^>]+>)*\s*([^<]{2,60})/gi,
+      ];
+
+      // JSON blobs in page
+      const jsonRe = /"runners"\s*:\s*\[([\s\S]*?)\]/g;
+      let jm;
+      while ((jm = jsonRe.exec(html)) !== null) {
+        try {
+          const arr = JSON.parse('[' + jm[1].replace(/,\s*$/, '') + ']');
+          if (Array.isArray(arr)) {
+            for (let i = 0; i < arr.length; i++) {
+              const r = arr[i];
+              if (!r) continue;
+              const sid = Number(r.selectionId || r.id || i + 1);
+              const name = r.runnerName || r.name || r.runner || `Runner ${i + 1}`;
+              if (seenSel.has(sid)) continue;
+              seenSel.add(sid);
+              runners.push({
+                selectionId: sid,
+                runnerName: String(name).trim(),
+                handicap: r.handicap || 0,
+                sortPriority: r.sortPriority || i + 1,
+                status: r.status || 'ACTIVE',
+                metadata: r.metadata || {},
+              });
+            }
+          }
+        } catch (_) { /* ignore broken json */ }
+      }
+
+      if (!runners.length) {
+        for (const re of nameRes) {
+          re.lastIndex = 0;
+          let nm;
+          let idx = 0;
+          while ((nm = re.exec(html)) !== null && runners.length < 40) {
+            let sid, name;
+            if (nm.length >= 3 && /^\d+$/.test(nm[1])) {
+              sid = Number(nm[1]);
+              name = nm[2];
+            } else {
+              sid = ++idx;
+              name = nm[1];
+            }
+            name = String(name || '').replace(/\s+/g, ' ').trim();
+            if (!name || name.length < 2 || seenSel.has(sid)) continue;
+            if (/^(back|lay|odds|price|size)$/i.test(name)) continue;
+            seenSel.add(sid);
+            runners.push({
+              selectionId: sid,
+              runnerName: name,
+              handicap: 0,
+              sortPriority: runners.length + 1,
+              status: 'ACTIVE',
+              metadata: {},
+            });
+          }
+        }
+      }
+
+      // Also try catalog2 while we're here
+      let cat = null;
+      try { cat = await fetchBpexchCatalog2(id); } catch (_) {}
+
+      if (cat && Array.isArray(cat.runners) && cat.runners.length) {
+        logger.info(`[bpexch] race ${id} catalog2 runners=${cat.runners.length}`);
+        return {
+          ...cat,
+          marketId: cat.marketId || id,
+          eventId: id,
+          eventName: cat.eventName || eventName || cat.marketName,
+          marketStartTime: cat.marketStartTime || startIso,
+          marketStartTimeUtc: cat.marketStartTimeUtc || startIso,
+          runners: cat.runners,
+          subMarkets: [],
+          source: 'bpexch-catalog2',
+        };
+      }
+
+      if (!runners.length) {
+        logger.warn(`[bpexch] race page ${id} no runners parsed`);
+        continue;
+      }
+
+      logger.info(`[bpexch] race page ${id} scraped runners=${runners.length}`);
+      return {
+        marketId: id,
+        marketName: 'Win',
+        marketType: 'WIN',
+        marketStartTime: startIso,
+        marketStartTimeUtc: startIso,
+        eventId: id,
+        eventName: eventName || 'Race',
+        eventTypeId: '7',
+        status: 'OPEN',
+        runners: runners.map(r => ({
+          ...r,
+          back: [],
+          lay: [],
+        })),
+        subMarkets: [],
+        source: 'bpexch-race-html',
+      };
+    } catch (err) {
+      logger.warn(`[bpexch] race page ${id} fetch failed: ${err.message}`);
+    }
+  }
+  return null;
 }
 
 async function getRacingHighlights(eventTypeId) {
@@ -1634,9 +1826,19 @@ function categorizeSubMarket(c) {
 async function getBpexchMarketPage(marketId, pricesToken) {
   const normalizedId = normalizeMarketId(marketId);
 
+  // Composite race ids: 35965023.2207 (not Betfair 1.xxx) — scrape Event page
+  const isRaceComposite = /^\d{6,}\.\d+$/.test(String(normalizedId));
+  if (isRaceComposite) {
+    const racePage = await scrapeBpexchRaceEventPage(normalizedId);
+    if (racePage) return racePage;
+  }
+
   // ── 1) catalog2 structure ──
   const main = await fetchBpexchCatalog2(normalizedId);
-  if (!main) return null;
+  if (!main) {
+    if (isRaceComposite) return null;
+    return null;
+  }
 
   // ── 2) prices7 live books (source of odds + related market ids) ──
   const live = await fetchPrices7MarketData(normalizedId, pricesToken);
