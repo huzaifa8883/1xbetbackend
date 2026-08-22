@@ -1,3 +1,4 @@
+
 'use strict';
 
 const { v4: uuidv4 } = require('uuid');
@@ -317,26 +318,55 @@ async function getLiveTennis(req, res) {
 }
 
 async function getLiveHorse(req, res) {
-  // SuperAdmin sport_configs se CONTROL NAHI — jo bpexch pe races hain waisi hi list
   try {
-    const now = new Date();
-    const from = new Date(now.getTime() - 30 * 60_000).toISOString(); // 30m past (inplay)
-    const to   = new Date(now.getTime() + 48 * 3600_000).toISOString(); // 48h ahead
+    const cfg = await getSportCfg('horse');
+    if (cfg && cfg.is_active === false) return sendSuccess(res, []);
 
-    const events = await listEvents({
+    const maxResults = String(cfg?.max_results ?? 200);
+    const hoursAhead = cfg?.hours_ahead ?? 24;
+
+    const now  = new Date();
+    // ✅ from: 5 min peeche (inplay races cover karne ke liye)
+    const from = new Date(now.getTime() - 5 * 60_000).toISOString();
+    const to   = new Date(now.getTime() + hoursAhead * 3600_000).toISOString();
+
+    const eventFilter = {
       eventTypeIds: ['7'],
       marketStartTime: { from, to },
-    });
+    };
+    if (cfg?.allowed_countries) eventFilter.marketCountries = cfg.allowed_countries.split(',').map(s => s.trim());
+    // ⚠️ allowed_competition_ids field mein TRACK NAAM hote hain (jaise
+    // "Ballarat"), Betfair competition ID nahi — races ki koi "competition"
+    // hoti hi nahi. Isliye ye seedha Betfair filter mein NAHI jaata; niche
+    // events fetch hone ke baad naam se match karke filter hota hai.
+
+    let events = await listEvents(eventFilter);
+    if (!events.length) return sendSuccess(res, []);
+
+    // ✅ FIX: track-naam se filter karo (getBetfairTracks jaisi hi derivation)
+    if (cfg?.allowed_competition_ids) {
+      const allowedTracks = new Set(
+        cfg.allowed_competition_ids.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+      );
+      if (allowedTracks.size > 0) {
+        events = events.filter(e => {
+          const rawName   = e.event?.name || '';
+          const trackName = (rawName.split('(')[0] || rawName).trim().toLowerCase();
+          return allowedTracks.has(trackName);
+        });
+      }
+    }
     if (!events.length) return sendSuccess(res, []);
 
     const catalogues = await listMarketCatalogue(
       { eventIds: events.map(e => e.event.id), marketTypeCodes: ['WIN'] },
-      '200',
+      maxResults,
       ['EVENT', 'RUNNER_METADATA', 'COMPETITION', 'RUNNER_DESCRIPTION', 'MARKET_START_TIME']
     );
     if (!catalogues.length) return sendSuccess(res, []);
 
-    const CHUNK = 50;
+    // Books fetch in chunks
+    const CHUNK = 200;
     const allMarketIds = catalogues.map(m => m.marketId);
     let allBooks = [];
     for (let i = 0; i < allMarketIds.length; i += CHUNK) {
@@ -344,31 +374,49 @@ async function getLiveHorse(req, res) {
       allBooks = allBooks.concat(books);
     }
 
-    const seen = new Set();
-    const data = catalogues.map(market => {
+    // ✅ Map — marketStartTime use karo (race-specific, more accurate than event.openDate)
+    const mapped = catalogues.map(market => {
       const book  = allBooks.find(b => b.marketId === market.marketId);
       const event = events.find(e => e.event.id === market.event?.id);
-      const startTime = market.marketStartTime || event?.event?.openDate || '';
+      const startTime = market.marketStartTime || event?.event.openDate || '';
+
       return {
         marketId:        market.marketId,
-        eventId:         market.event?.id || event?.event?.id || market.marketId,
-        match:           event?.event?.name || market.marketName || 'Unknown',
+        match:           event?.event.name || market.marketName || 'Unknown',
         startTime,
-        marketStatus:    book?.status || 'OPEN',
-        inPlay:          !!(book?.inPlay || book?.status === 'IN_PLAY'),
+        marketStatus:    book?.status || 'UNKNOWN',
+          inPlay:         (() => {
+          if (book?.inPlay === true) return true;
+          if (book?.status === 'IN_PLAY') return true;
+          const st = event?.event?.openDate || market?.marketStartTime;
+          if (st && new Date(st) <= new Date() && book?.status === 'OPEN') return true;
+          return false;
+        })(),
         totalMatched:    book?.totalMatched || 0,
         runners:         buildOddsPayload(market.runners || [], book, 'horse'),
         competitionId:   market.competition?.id   || null,
         competitionName: market.competition?.name || null,
       };
-    }).filter(d => {
-      if (!d.marketId || seen.has(d.marketId)) return false;
-      seen.add(d.marketId);
-      return true;
-    }).sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+    });
 
-    logger.info(`[markets:horse] bpexch raw events=${events.length} markets=${data.length} (no admin filter)`);
-    return sendSuccess(res, data);
+    // ✅ Filter: sirf future + recently started (5 min grace period)
+    const cutoff = new Date(now.getTime() - 5 * 60_000);
+    const filtered = mapped.filter(d => d.startTime && new Date(d.startTime) >= cutoff);
+
+    // ✅ Deduplicate: same track + same minute
+    const seen = new Set();
+    const deduped = filtered.filter(d => {
+      const timeKey = d.startTime ? d.startTime.substring(0, 16) : '';
+      const key = `${d.match}__${timeKey}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    // ✅ Sort ascending — nearest race pehle
+    deduped.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+
+    return sendSuccess(res, deduped);
   } catch (err) {
     logger.error(`getLiveHorse error: ${err.message}`);
     return sendError(res, 'Failed to fetch horse racing data', 500);
@@ -376,26 +424,55 @@ async function getLiveHorse(req, res) {
 }
 
 async function getLiveGreyhound(req, res) {
-  // SuperAdmin sport_configs se CONTROL NAHI — bpexch jaisi list
   try {
-    const now = new Date();
-    const from = new Date(now.getTime() - 30 * 60_000).toISOString();
-    const to   = new Date(now.getTime() + 48 * 3600_000).toISOString();
+    const cfg = await getSportCfg('greyhound');
+    if (cfg && cfg.is_active === false) return sendSuccess(res, []);
 
-    const events = await listEvents({
+    const maxResults = String(cfg?.max_results ?? 200);
+    const hoursAhead = cfg?.hours_ahead ?? 12;
+
+    const now  = new Date();
+    // ✅ from: 5 min peeche (inplay races cover karne ke liye)
+    const from = new Date(now.getTime() - 5 * 60_000).toISOString();
+    const to   = new Date(now.getTime() + hoursAhead * 3600_000).toISOString();
+
+    const eventFilter = {
       eventTypeIds: ['4339'],
       marketStartTime: { from, to },
-    });
+    };
+    if (cfg?.allowed_countries) eventFilter.marketCountries = cfg.allowed_countries.split(',').map(s => s.trim());
+    // ⚠️ allowed_competition_ids field mein TRACK NAAM hote hain, Betfair
+    // competition ID nahi — races ki koi "competition" hoti hi nahi.
+    // Isliye ye seedha Betfair filter mein NAHI jaata; niche events fetch
+    // hone ke baad naam se match karke filter hota hai.
+
+    let events = await listEvents(eventFilter);
+    if (!events.length) return sendSuccess(res, []);
+
+    // ✅ FIX: track-naam se filter karo (getBetfairTracks jaisi hi derivation)
+    if (cfg?.allowed_competition_ids) {
+      const allowedTracks = new Set(
+        cfg.allowed_competition_ids.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+      );
+      if (allowedTracks.size > 0) {
+        events = events.filter(e => {
+          const rawName   = e.event?.name || '';
+          const trackName = (rawName.split('(')[0] || rawName).trim().toLowerCase();
+          return allowedTracks.has(trackName);
+        });
+      }
+    }
     if (!events.length) return sendSuccess(res, []);
 
     const catalogues = await listMarketCatalogue(
       { eventIds: events.map(e => e.event.id), marketTypeCodes: ['WIN'] },
-      '200',
+      maxResults,
       ['EVENT', 'RUNNER_METADATA', 'COMPETITION', 'RUNNER_DESCRIPTION', 'MARKET_START_TIME']
     );
     if (!catalogues.length) return sendSuccess(res, []);
 
-    const CHUNK = 50;
+    // Books fetch in chunks
+    const CHUNK = 200;
     const allMarketIds = catalogues.map(m => m.marketId);
     let allBooks = [];
     for (let i = 0; i < allMarketIds.length; i += CHUNK) {
@@ -403,31 +480,47 @@ async function getLiveGreyhound(req, res) {
       allBooks = allBooks.concat(books);
     }
 
-    const seen = new Set();
-    const data = catalogues.map(market => {
+    // ✅ Map — marketStartTime use karo (race-specific time)
+    const mapped = catalogues.map(market => {
       const book  = allBooks.find(b => b.marketId === market.marketId);
       const event = events.find(e => e.event.id === market.event?.id);
-      const startTime = market.marketStartTime || event?.event?.openDate || '';
+      const startTime = market.marketStartTime || event?.event.openDate || '';
+
       return {
         marketId:        market.marketId,
-        eventId:         market.event?.id || event?.event?.id || market.marketId,
-        match:           event?.event?.name || market.marketName || 'Unknown',
+        match:           event?.event.name || market.marketName || 'Unknown',
         startTime,
-        marketStatus:    book?.status || 'OPEN',
-        inPlay:          !!(book?.inPlay || book?.status === 'IN_PLAY'),
+        marketStatus:    book?.status || 'UNKNOWN',
+          inPlay:         (() => {
+          if (book?.inPlay === true) return true;
+          if (book?.status === 'IN_PLAY') return true;
+          const st = event?.event?.openDate || market?.marketStartTime;
+          if (st && new Date(st) <= new Date() && book?.status === 'OPEN') return true;
+          return false;
+        })(),
         totalMatched:    book?.totalMatched || 0,
         runners:         buildOddsPayload(market.runners || [], book, 'greyhound'),
         competitionId:   market.competition?.id   || null,
         competitionName: market.competition?.name || null,
       };
-    }).filter(d => {
-      if (!d.marketId || seen.has(d.marketId)) return false;
+    });
+
+    // ✅ Filter: sirf future + recently started (5 min grace period)
+    const cutoff = new Date(now.getTime() - 5 * 60_000);
+    const filtered = mapped.filter(d => d.startTime && new Date(d.startTime) >= cutoff);
+
+    // ✅ Deduplicate by marketId
+    const seen = new Set();
+    const deduped = filtered.filter(d => {
+      if (seen.has(d.marketId)) return false;
       seen.add(d.marketId);
       return true;
-    }).sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+    });
 
-    logger.info(`[markets:greyhound] bpexch raw events=${events.length} markets=${data.length} (no admin filter)`);
-    return sendSuccess(res, data);
+    // ✅ Sort ascending — nearest race pehle
+    deduped.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+
+    return sendSuccess(res, deduped);
   } catch (err) {
     logger.error(`getLiveGreyhound error: ${err.message}`);
     return sendError(res, 'Failed to fetch greyhound data', 500);
