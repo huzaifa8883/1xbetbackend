@@ -1,4 +1,3 @@
-
 'use strict';
 
 const { v4: uuidv4 } = require('uuid');
@@ -751,9 +750,11 @@ async function getMarketCatalog2(req, res) {
   const catalog = catalogues?.[0];
   const book    = books?.[0] || null;
 
-  // catalog nahi mila → genuine 404
-  // book null hona normal hai — Betfair closed/removed markets ko hata deta hai
-  if (!catalog) return sendError(res, 'Market not found', 404);
+  // catalog nahi mila → genuine 404 (match khatam / ID purani / highlights cache miss)
+  if (!catalog) {
+    logger.warn(`[catalog2] not in highlights and bpexch failed for ${marketId}`);
+    return sendError(res, 'Market not found', 404);
+  }
 
   const eventTypeId = String(catalog.eventType?.id || '');
   const sportName   = SPORT_MAP[eventTypeId] || catalog.eventType?.name || 'Unknown';
