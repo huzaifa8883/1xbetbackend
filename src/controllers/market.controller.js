@@ -1,3 +1,4 @@
+
 'use strict';
 
 const { v4: uuidv4 } = require('uuid');
@@ -713,7 +714,7 @@ async function getMarketCatalog2(req, res) {
       ? req._bpexchEventPage
       : await getBpexchMarketPage(marketId, pricesToken);
     if (bpx && bpx.marketId) {
-      const eventTypeId = String(bpx.eventTypeId || bpx.sport?.id || '');
+      let eventTypeId = String(bpx.eventTypeId || bpx.sport?.id || '');
       const sportName = bpx.eventType || bpx.sport?.name || SPORT_MAP[eventTypeId] || 'Unknown';
       const iconMap = {
         Cricket: 'cricket.svg', Tennis: 'tennis.svg',
@@ -722,6 +723,7 @@ async function getMarketCatalog2(req, res) {
       };
       logger.info(`[catalog2] bpexch hit marketId=${marketId} subs=${(bpx.subMarkets||[]).length} scoreboard=${!!bpx.scoreboard}`);
 
+      const isRaceId = /^\d{6,}\.\d+$/.test(String(marketId));
       // If catalog2 runners have no prices, fill from highlights listMarketBook
       let runnersOut = (bpx.runners || []).map(r => ({
           selectionId:  r.selectionId,
@@ -738,12 +740,25 @@ async function getMarketCatalog2(req, res) {
           lay2: r.lay2 ?? r.lay?.[1]?.price, ls2: r.ls2 ?? r.lay?.[1]?.size,
           lay3: r.lay3 ?? r.lay?.[2]?.price, ls3: r.ls3 ?? r.lay?.[2]?.size,
           clothNumber:  r.clothNumber || null,
-          clothColor:   r.silkColor || null,
+          clothColor:   r.silkColor || r.clothColor || null,
           silkUrl:      null,
           jockeyName:   r.jockeyName || null,
           trainerName:  r.trainerName || null,
           metadataDict: r.metadata || null,
-        }));
+        })).filter(r => {
+          const n = String(r.runnerName || '');
+          // drop Vue/score template junk that was scraped by mistake
+          if (!n || /\{\{|scores\.|v-if|v-for|^\{\s*gs/i.test(n)) return false;
+          return true;
+        });
+      // Racing composite id: force horse/greyhound eventTypeId so UI uses race template
+      if (isRaceId) {
+        if (['7', '4339'].includes(String(bpx.eventTypeId))) {
+          eventTypeId = String(bpx.eventTypeId);
+        } else if (!['7', '4339'].includes(eventTypeId)) {
+          eventTypeId = '7';
+        }
+      }
       const needOdds = runnersOut.every(r => !(r.back && r.back.length) && !(r.lay && r.lay.length));
       if (needOdds) {
         try {
