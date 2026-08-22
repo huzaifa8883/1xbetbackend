@@ -10,6 +10,7 @@ const {
   listEventTypes,
   getBpexchMarketPage,
   getBpexchEventMarkets,
+  resolveMarketIdFromEventId,
   normalizeMarketId,
 } = require('../services/betfair.service');
 const { sendSuccess, sendError } = require('../utils/response');
@@ -652,9 +653,35 @@ async function getMarketData(req, res) {
 async function getMarketCatalog2(req, res) {
   const { id: rawId } = req.query;
   if (!rawId) return sendError(res, 'marketId query parameter is required', 400);
-  const marketId = normalizeMarketId(rawId); // m_1_261306873 → 1.261306873
+
+  let marketId = normalizeMarketId(rawId); // m_1_261306873 → 1.261306873
   if (String(rawId) !== String(marketId)) {
     logger.info(`[catalog2] normalized ${rawId} → ${marketId}`);
+  }
+
+  // Path-style Event.html: /Common/Event/35945509 → id is eventId (no "1.")
+  // Resolve to Match Odds marketId first
+  const looksLikeEventId = !/^[mM]_/.test(String(rawId)) && !String(rawId).includes('.');
+  if (looksLikeEventId) {
+    try {
+      const pricesToken0 = req.headers['x-prices-token'] || req.query.pricesToken || null;
+      const byEvent = await getBpexchEventMarkets(String(rawId), pricesToken0);
+      if (byEvent && byEvent.marketId) {
+        marketId = String(byEvent.marketId);
+        logger.info(`[catalog2] eventId ${rawId} → marketId ${marketId}`);
+        // If we already have full page payload, return it (with odds fill below path)
+        // Fall through using resolved marketId + reuse byEvent as bpx if present
+        req._bpexchEventPage = byEvent;
+      } else {
+        const resolved = await resolveMarketIdFromEventId(String(rawId));
+        if (resolved) {
+          marketId = resolved;
+          logger.info(`[catalog2] eventId ${rawId} resolved via highlights → ${marketId}`);
+        }
+      }
+    } catch (e) {
+      logger.warn(`[catalog2] eventId resolve failed: ${e.message}`);
+    }
   }
 
   // ✅ Prefer bpexch catalog2 + catalogs + (optional) prices7 scoreboard
@@ -662,7 +689,9 @@ async function getMarketCatalog2(req, res) {
   // Figure + scorecard/commentary laata hai — bilkul bpexch market page jaisa.
   try {
     const pricesToken = req.headers['x-prices-token'] || req.query.pricesToken || null;
-    const bpx = await getBpexchMarketPage(marketId, pricesToken);
+    const bpx = req._bpexchEventPage && String(req._bpexchEventPage.marketId) === String(marketId)
+      ? req._bpexchEventPage
+      : await getBpexchMarketPage(marketId, pricesToken);
     if (bpx && bpx.marketId) {
       const eventTypeId = String(bpx.eventTypeId || bpx.sport?.id || '');
       const sportName = bpx.eventType || bpx.sport?.name || SPORT_MAP[eventTypeId] || 'Unknown';
