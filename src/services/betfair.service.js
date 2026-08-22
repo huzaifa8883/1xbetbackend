@@ -56,164 +56,6 @@ const TIMEOUT_MS = 15000;
 
 const BPEXCH_BASE_URL = process.env.BPEXCH_BASE_URL || 'https://bpexch.live';
 
-/* ═══════════════════════════════════════════════════════════════════
-   ✅ bpexch.live — AUTO-LOGIN SESSION (catalog2 / catalogs ke liye)
-   ═══════════════════════════════════════════════════════════════════
-   catalog2/catalogs APIs bina logged-in session cookie ke INVALID_SESSION
-   dete hain (confirm ho chuka hai — curl test: {"error":"INVALID_SESSION"}).
-   Login flow (Network tab se capture kiya gaya, verbatim):
-
-     1. GET  <BPEXCH_LOGIN_PAGE_URL>
-        → HTML mein hidden input <input name="__RequestVerificationToken"
-          value="...">, aur Set-Cookie mein AntiForgery.WebExchange cookie
-          milta hai. Ye dono ek session-bound PAIR hain — token sirf usi
-          cookie ke saath valid hota hai jis GET request se mila.
-
-     2. POST https://bpexch.live/Users/Login   (form-urlencoded body):
-          user.Username, user.Password, Device, UtcOffset,
-          __RequestVerificationToken
-        → Success par 302 Found, aur Set-Cookie mein real session cookies
-          (wex3authtoken JWT, wex3reftoken, wexscktoken, etc.) milte hain.
-
-   wex3authtoken JWT decode karne par mila: exp - iat = 3600s (1 ghanta).
-   Is liye session ko HAR ~50 MINUTE mein proactively refresh karte hain
-   (real expiry se 10 min pehle) — + reactively bhi jab beech mein kabhi
-   INVALID_SESSION mil jaaye.
-
-   ⚠️ Credentials .env se aate hain (BPEXCH_USERNAME / BPEXCH_PASSWORD) —
-   code mein kahin hardcode nahi hain.
-   ═══════════════════════════════════════════════════════════════════ */
-const BPEXCH_LOGIN_PAGE_URL = process.env.BPEXCH_LOGIN_PAGE_URL || `${BPEXCH_BASE_URL}/Common/Dashboard`;
-const BPEXCH_LOGIN_URL = process.env.BPEXCH_LOGIN_URL || `${BPEXCH_BASE_URL}/Users/Login`;
-const BPEXCH_USERNAME = process.env.BPEXCH_USERNAME;
-const BPEXCH_PASSWORD = process.env.BPEXCH_PASSWORD;
-// Real cookie 60 min mein expire hoti hai — 50 min par proactively refresh
-// karte hain taake kabhi bhi live request INVALID_SESSION na dekhe.
-const BPEXCH_SESSION_TTL_MS = parseInt(process.env.BPEXCH_SESSION_TTL_MINUTES || '50', 10) * 60 * 1000;
-
-const BPEXCH_COMMON_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Accept': 'application/json, text/plain, */*',
-  'Referer': `${BPEXCH_BASE_URL}/Common/Dashboard`,
-  'Origin': BPEXCH_BASE_URL,
-};
-
-let bpexchCookieJar = null;     // "k1=v1; k2=v2; ..." string, saari cookies combined
-let bpexchCookieExpiry = null;
-let bpexchLoginPromise = null;  // login-in-progress dedup (Betfair session pattern jaisa)
-
-// Set-Cookie header array (jaisa axios deta hai: ["name=value; Path=/; ...", ...])
-// ko ek existing cookie-jar string ke saath merge karta hai (naye keys
-// purano ko overwrite karte hain — jaisa asal browser cookie jar karta hai).
-function mergeSetCookies(setCookieHeaders, existingJarString) {
-  const jar = {};
-  (existingJarString || '').split(';').forEach(pair => {
-    const idx = pair.indexOf('=');
-    if (idx === -1) return;
-    const k = pair.slice(0, idx).trim();
-    const v = pair.slice(idx + 1).trim();
-    if (k) jar[k] = v;
-  });
-  (setCookieHeaders || []).forEach(raw => {
-    const first = raw.split(';')[0]; // "name=value" hissa, attributes (Path/Expires/etc.) chhod do
-    const idx = first.indexOf('=');
-    if (idx === -1) return;
-    const k = first.slice(0, idx).trim();
-    const v = first.slice(idx + 1).trim();
-    if (k) jar[k] = v;
-  });
-  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
-}
-
-async function bpexchLogin() {
-  if (!BPEXCH_USERNAME || !BPEXCH_PASSWORD) {
-    throw new Error('[bpexch] BPEXCH_USERNAME / BPEXCH_PASSWORD env vars missing hain — auto-login nahi ho sakta');
-  }
-
-  // Step 1: login page hit karke fresh antiforgery token + uski matching
-  // cookie nikalo (dono session-bound pair hain, purana/hardcoded token
-  // reuse nahi ho sakta).
-  const pageRes = await axios.get(BPEXCH_LOGIN_PAGE_URL, {
-    headers: BPEXCH_COMMON_HEADERS,
-    timeout: TIMEOUT_MS,
-    validateStatus: () => true,
-  });
-
-  const pageCookies = mergeSetCookies(pageRes.headers['set-cookie'], null);
-  const tokenMatch = /name="__RequestVerificationToken"[^>]*value="([^"]+)"/i.exec(pageRes.data || '');
-  const csrfToken = tokenMatch?.[1];
-
-  if (!csrfToken) {
-    logger.error('[bpexch] Login page se __RequestVerificationToken nahi mila — page HTML structure badal gaya ho sakta hai ya BPEXCH_LOGIN_PAGE_URL galat hai');
-    throw new Error('[bpexch] antiforgery token extraction failed');
-  }
-
-  // Step 2: actual login POST — exact field names jo Network tab se capture
-  // hue the (user.Username, user.Password, Device, UtcOffset).
-  const body = new URLSearchParams({
-    'user.Username': BPEXCH_USERNAME,
-    'user.Password': BPEXCH_PASSWORD,
-    'Device': 'Google Chrome',
-    'UtcOffset': '300',
-    '__RequestVerificationToken': csrfToken,
-  });
-
-  const loginRes = await axios.post(BPEXCH_LOGIN_URL, body, {
-    headers: {
-      ...BPEXCH_COMMON_HEADERS,
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Cookie: pageCookies,
-    },
-    timeout: TIMEOUT_MS,
-    maxRedirects: 0,       // 302 khud capture karna hai (Set-Cookie usi response par hoti hai)
-    validateStatus: () => true,
-  });
-
-  if (loginRes.status !== 302 && loginRes.status !== 200) {
-    logger.error(`[bpexch] Login failed — HTTP ${loginRes.status}: ${JSON.stringify(loginRes.data).slice(0, 200)}`);
-    throw new Error(`[bpexch] login failed with status ${loginRes.status}`);
-  }
-
-  const finalCookies = mergeSetCookies(loginRes.headers['set-cookie'], pageCookies);
-
-  if (!finalCookies.includes('wex3authtoken')) {
-    logger.error('[bpexch] Login response aaya lekin wex3authtoken cookie nahi mila — credentials galat ho sakte hain ya login flow site par badal gaya hai');
-    throw new Error('[bpexch] login "succeeded" but session cookie missing');
-  }
-
-  logger.info('[bpexch] Naya session mil gaya (auto-login successful)');
-  return finalCookies;
-}
-
-async function getBpexchSession() {
-  if (bpexchCookieJar && bpexchCookieExpiry && Date.now() < bpexchCookieExpiry) {
-    return bpexchCookieJar;
-  }
-  if (bpexchLoginPromise) return bpexchLoginPromise;
-
-  bpexchLoginPromise = (async () => {
-    try {
-      const cookies = await bpexchLogin();
-      bpexchCookieJar = cookies;
-      bpexchCookieExpiry = Date.now() + BPEXCH_SESSION_TTL_MS;
-      return cookies;
-    } catch (err) {
-      bpexchCookieJar = null;
-      bpexchCookieExpiry = null;
-      throw err;
-    } finally {
-      bpexchLoginPromise = null;
-    }
-  })();
-
-  return bpexchLoginPromise;
-}
-
-function invalidateBpexchSession() {
-  bpexchCookieJar = null;
-  bpexchCookieExpiry = null;
-}
-
 /**
  * bpexch highlights row id "m_1_261306873" → real Betfair marketId "1.261306873"
  * "m_2_123" → "1.123" still uses 1. prefix (Betfair market ids always 1.xxx)
@@ -1096,34 +938,7 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
   const sliced = items.slice(0, parseInt(maxResults, 10) || 20);
   if (!sliced.length) return [];
 
-  // ✅ Racing (Horse/Greyhound) highlights feed runners KABHI nahi deta
-  // (sirf venue/time listing hai) — is liye jin racing markets ke runners
-  // khaali hain, unke liye bpexch catalog2 (jo composite racing IDs jaise
-  // "35962147.1828" bhi accept karta hai) se enrich karte hain. Cricket/
-  // Tennis/Football ke liye ye zaroori nahi (highlights mein already
-  // runners aate hain), is liye sirf horse/greyhound + empty-runners
-  // condition mein hi extra HTTP call lagti hai.
-  const enrichedSliced = await Promise.all(sliced.map(async (m) => {
-    const mEventTypeId = String(m.eventTypeId || eventTypeId || '');
-    if ((m.runners || []).length || !(isHorseRacingEventType(mEventTypeId) || isGreyhoundEventType(mEventTypeId))) {
-      return m;
-    }
-    try {
-      const cat2 = await fetchBpexchCatalog2(m.id);
-      if (cat2 && Array.isArray(cat2.runners) && cat2.runners.length) {
-        logger.info(`[listMarketCatalogue] racing runners enriched via bpexch catalog2 for ${m.id}: ${cat2.runners.length} runners`);
-        return { ...m, runners: cat2.runners };
-      }
-    } catch (err) {
-      logger.warn(`[listMarketCatalogue] catalog2 runner-enrich failed for ${m.id}: ${err.message}`);
-    }
-    // catalog2 se bhi kuch nahi mila — page chrome (title/timer/OPEN status)
-    // todna nahi hai, is liye khaali runners ke saath aage badho (jaisa
-    // pehle bhi tha), crash nahi hona chahiye.
-    return m;
-  }));
-
-  return enrichedSliced.map(m => {
+  return sliced.map(m => {
     const startMs = m.start != null ? new Date(m.start).getTime() : NaN;
     const eid = String(m.eventTypeId || eventTypeId || '');
 
@@ -1248,42 +1063,143 @@ async function getRunnerBook(marketId, selectionId) {
 
 /* ═══════════════════════════════════════════════════════════════════
    bpexch catalog2 / catalogs / live Data — market page ke liye
-   (Bookmaker, Fancy, Figure, scoreboard, commentary)
+   (Bookmaker, Fancy, Figure, Over/Under, scoreboard, commentary)
+   Auth: optional BPEXCH_USERNAME / BPEXCH_PASSWORD login → cookies
    ═══════════════════════════════════════════════════════════════════ */
 
 const PRICES7_BASE = process.env.PRICES7_BASE_URL || 'https://prices7.mgs11.com';
 
-async function fetchBpexchCatalog2(marketId, isRetry = false) {
+const BPEXCH_USER = process.env.BPEXCH_USERNAME || process.env.BPEXCH_USER || '';
+const BPEXCH_PASS = process.env.BPEXCH_PASSWORD || process.env.BPEXCH_PASS || '';
+
+let _bpexchCookie = '';
+let _bpexchCookieExpiry = 0;
+let _bpexchLoginPromise = null;
+
+function mergeSetCookie(existing, setCookieHeader) {
+  const jar = {};
+  String(existing || '')
+    .split(';')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .forEach(pair => {
+      const i = pair.indexOf('=');
+      if (i > 0) jar[pair.slice(0, i)] = pair.slice(i + 1);
+    });
+  const list = Array.isArray(setCookieHeader) ? setCookieHeader : (setCookieHeader ? [setCookieHeader] : []);
+  for (const line of list) {
+    const first = String(line).split(';')[0];
+    const i = first.indexOf('=');
+    if (i > 0) jar[first.slice(0, i).trim()] = first.slice(i + 1).trim();
+  }
+  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+function bpexchHeaders(extra = {}) {
+  return {
+    Accept: 'application/json, text/html, */*',
+    'X-Requested-With': 'XMLHttpRequest',
+    Referer: `${BPEXCH_BASE_URL}/Common/Dashboard`,
+    Origin: BPEXCH_BASE_URL,
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    ...(_bpexchCookie ? { Cookie: _bpexchCookie } : {}),
+    ...extra,
+  };
+}
+
+/**
+ * Login to bpexch.live so catalog2/catalogs return full market data.
+ * Env: BPEXCH_USERNAME / BPEXCH_PASSWORD
+ */
+async function ensureBpexchSession() {
+  if (_bpexchCookie && Date.now() < _bpexchCookieExpiry) return _bpexchCookie;
+  if (!BPEXCH_USER || !BPEXCH_PASS) {
+    logger.warn('[bpexch] no BPEXCH_USERNAME/PASSWORD — catalog2 may be limited');
+    return _bpexchCookie || '';
+  }
+  if (_bpexchLoginPromise) return _bpexchLoginPromise;
+
+  _bpexchLoginPromise = (async () => {
+    try {
+      // 1) GET login page for antiforgery token
+      const loginPageUrl = `${BPEXCH_BASE_URL}/Users/Login`;
+      const pageRes = await axios.get(loginPageUrl, {
+        timeout: TIMEOUT_MS,
+        headers: bpexchHeaders({ Accept: 'text/html' }),
+        maxRedirects: 5,
+        validateStatus: s => s < 500,
+      });
+      _bpexchCookie = mergeSetCookie(_bpexchCookie, pageRes.headers['set-cookie']);
+
+      const html = typeof pageRes.data === 'string' ? pageRes.data : '';
+      const tokenMatch = html.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/i)
+        || html.match(/value="([^"]+)"[^>]*name="__RequestVerificationToken"/i);
+      const antiForgery = tokenMatch ? tokenMatch[1] : '';
+
+      // 2) POST credentials
+      const body = new URLSearchParams();
+      body.set('user.Username', BPEXCH_USER);
+      body.set('user.Password', BPEXCH_PASS);
+      body.set('Device', 'Google Chrome');
+      body.set('UtcOffset', '300');
+      if (antiForgery) body.set('__RequestVerificationToken', antiForgery);
+
+      const postRes = await axios.post(loginPageUrl, body.toString(), {
+        timeout: TIMEOUT_MS,
+        headers: bpexchHeaders({
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Referer: loginPageUrl,
+        }),
+        maxRedirects: 0,
+        validateStatus: s => s < 500,
+      });
+      _bpexchCookie = mergeSetCookie(_bpexchCookie, postRes.headers['set-cookie']);
+
+      // follow redirect manually if 302
+      if (postRes.status >= 300 && postRes.status < 400 && postRes.headers.location) {
+        const loc = postRes.headers.location.startsWith('http')
+          ? postRes.headers.location
+          : `${BPEXCH_BASE_URL}${postRes.headers.location}`;
+        const follow = await axios.get(loc, {
+          timeout: TIMEOUT_MS,
+          headers: bpexchHeaders(),
+          maxRedirects: 5,
+          validateStatus: s => s < 500,
+        });
+        _bpexchCookie = mergeSetCookie(_bpexchCookie, follow.headers['set-cookie']);
+      }
+
+      _bpexchCookieExpiry = Date.now() + 30 * 60_000; // 30 min
+      logger.info(`[bpexch] login OK cookieLen=${_bpexchCookie.length}`);
+      return _bpexchCookie;
+    } catch (err) {
+      logger.warn(`[bpexch] login failed: ${err.message}`);
+      return _bpexchCookie || '';
+    } finally {
+      _bpexchLoginPromise = null;
+    }
+  })();
+
+  return _bpexchLoginPromise;
+}
+
+async function fetchBpexchCatalog2(marketId) {
   const id = normalizeMarketId(marketId);
-  const cookie = await getBpexchSession().catch(err => {
-    logger.error(`[bpexch] session fetch failed before catalog2(${id}): ${err.message}`);
-    return null;
-  });
-  // try a few URL shapes (trailing slash / no slash) — CF/proxy sometimes picky
+  await ensureBpexchSession();
   const urls = [
     `${BPEXCH_BASE_URL}/api/markets/catalog2/?id=${encodeURIComponent(id)}`,
     `${BPEXCH_BASE_URL}/api/markets/catalog2?id=${encodeURIComponent(id)}`,
   ];
   let lastErr = null;
-  let sawInvalidSession = false;
   for (const url of urls) {
     try {
       const res = await axios.get(url, {
         timeout: TIMEOUT_MS,
-        headers: {
-          Accept: 'application/json, text/plain, */*',
-          'X-Requested-With': 'XMLHttpRequest',
-          Referer: `${BPEXCH_BASE_URL}/Common/Dashboard`,
-          Origin: BPEXCH_BASE_URL,
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          ...(cookie ? { Cookie: cookie } : {}),
-        },
+        headers: bpexchHeaders(),
         validateStatus: s => s < 500,
       });
-      if (res.data?.error === 'INVALID_SESSION') {
-        sawInvalidSession = true;
-        lastErr = 'INVALID_SESSION';
-        continue;
+      if (res.headers['set-cookie']) {
+        _bpexchCookie = mergeSetCookie(_bpexchCookie, res.headers['set-cookie']);
       }
       if (res.status !== 200 || !res.data) {
         lastErr = `status=${res.status}`;
@@ -1299,60 +1215,66 @@ async function fetchBpexchCatalog2(marketId, isRetry = false) {
       lastErr = err.message;
     }
   }
-
-  // Session expire ho chuki ho sakti hai (upstream ne humare 50-min proactive
-  // refresh se pehle hi invalidate kar diya) — ek baar fresh login karke retry.
-  if (sawInvalidSession && !isRetry) {
-    logger.warn(`[bpexch] catalog2(${id}) — INVALID_SESSION, session refresh karke ek baar retry ho raha hai`);
-    invalidateBpexchSession();
-    return fetchBpexchCatalog2(marketId, true);
-  }
-
-  logger.warn(`[bpexch] catalog2 all attempts failed for ${id}: ${lastErr}`);
+  logger.warn(`[bpexch] catalog2 failed for ${id}: ${lastErr}`);
   return null;
 }
 
-async function fetchBpexchCatalogs(marketIds = [], isRetry = false) {
+async function fetchBpexchCatalogs(marketIds = []) {
   if (!marketIds.length) return [];
-  const cookie = await getBpexchSession().catch(err => {
-    logger.error(`[bpexch] session fetch failed before catalogs(${marketIds.length} ids): ${err.message}`);
-    return null;
-  });
+  await ensureBpexchSession();
   const url = `${BPEXCH_BASE_URL}/api/markets/catalogs/`;
-  const res = await axios.get(url, {
-    params: { ids: marketIds.join(',') },
-    timeout: TIMEOUT_MS,
-    headers: {
-      Accept: 'application/json',
-      'X-Requested-With': 'XMLHttpRequest',
-      Referer: `${BPEXCH_BASE_URL}/`,
-      ...(cookie ? { Cookie: cookie } : {}),
-    },
-    validateStatus: s => s < 500,
-  });
-
-  if (res.data?.error === 'INVALID_SESSION') {
-    if (!isRetry) {
-      logger.warn(`[bpexch] catalogs(${marketIds.length} ids) — INVALID_SESSION, session refresh karke ek baar retry ho raha hai`);
-      invalidateBpexchSession();
-      return fetchBpexchCatalogs(marketIds, true);
-    }
-    logger.warn(`[bpexch] catalogs still INVALID_SESSION after refresh retry`);
+  try {
+    const res = await axios.get(url, {
+      params: { ids: marketIds.join(',') },
+      timeout: TIMEOUT_MS,
+      headers: bpexchHeaders(),
+      validateStatus: s => s < 500,
+    });
+    if (res.status !== 200) return [];
+    const raw = res.data;
+    if (Array.isArray(raw)) return raw;
+    if (Array.isArray(raw?.data)) return raw.data;
+    return [];
+  } catch (err) {
+    logger.warn(`[bpexch] catalogs failed: ${err.message}`);
     return [];
   }
-
-  if (res.status !== 200) return [];
-  const raw = res.data;
-  if (Array.isArray(raw)) return raw;
-  if (Array.isArray(raw?.data)) return raw.data;
-  return [];
 }
 
 /**
- * Live prices + scoreboard + commentary.
- * prices7 JWT user-session token maangta hai — agar env PRICES7_TOKEN
- * set ho to use hoga, warna null (scoreboard optional).
+ * Scrape Event page HTML for market ids (1.xxx / 9.xxx) when catalogs
+ * discovery has no prices7 token.
  */
+async function discoverMarketIdsFromEventPage(eventId) {
+  if (!eventId) return [];
+  await ensureBpexchSession();
+  try {
+    const url = `${BPEXCH_BASE_URL}/Common/Event/${encodeURIComponent(eventId)}`;
+    const res = await axios.get(url, {
+      timeout: TIMEOUT_MS,
+      headers: bpexchHeaders({ Accept: 'text/html' }),
+      validateStatus: s => s < 500,
+    });
+    const html = typeof res.data === 'string' ? res.data : '';
+    const ids = new Set();
+    // market id patterns in page scripts / data attributes
+    const re = /(?:marketId|MarketId|id)["'\s:=]+([19]\.\d{6,})/g;
+    let m;
+    while ((m = re.exec(html)) !== null) ids.add(m[1]);
+    // also href ?id=1.xxx
+    const re2 = /[?&]id=([19]\.\d{6,})/g;
+    while ((m = re2.exec(html)) !== null) ids.add(m[1]);
+    // raw "1.123456789" occurrences
+    const re3 = /\b([19]\.\d{8,})\b/g;
+    while ((m = re3.exec(html)) !== null) ids.add(m[1]);
+    logger.info(`[bpexch] event page ${eventId} discovered ${ids.size} market ids`);
+    return [...ids];
+  } catch (err) {
+    logger.warn(`[bpexch] event page scrape failed: ${err.message}`);
+    return [];
+  }
+}
+
 async function fetchPrices7MarketData(marketId, token) {
   const tok = token || process.env.PRICES7_TOKEN || '';
   if (!tok) return null;
@@ -1372,26 +1294,33 @@ async function fetchPrices7MarketData(marketId, token) {
   }
 }
 
+function categorizeSubMarket(c) {
+  const t = String(c.marketType || '').toUpperCase();
+  const n = String(c.marketName || '').toLowerCase();
+  if (t === 'BOOKMAKER' || t === 'BOOKMAKER2' || n.includes('bookmaker') || c.isBmMarket) return 'bookmaker';
+  if (t === 'TOSS' || n.includes('toss')) return 'toss';
+  if (t === 'FANCY2' || t === 'LOCAL_FANCY' || n.includes('fancy 2') || n.includes('fancy-2')) return 'fancy2';
+  if (t === 'FIGURE' || n.includes('figure')) return 'figure';
+  if (t === 'ODD_FIGURE' || t === 'EVEN_ODD' || n.includes('odd figure')) return 'oddFigure';
+  if (t.includes('FANCY') || n.includes('fancy') || n.includes('session') || n.includes('innings')) return 'fancy';
+  if (n.includes('over') || n.includes('under') || t.includes('OVER') || t.includes('UNDER') || t.includes('TOTAL')) return 'other';
+  if (t === 'MATCH_ODDS' || t === 'WINNER' || t === 'WIN') return 'matchOdds';
+  return 'other';
+}
+
 /**
- * Full market page payload: main catalog + subMarkets + optional scoreboard.
- * Prefer bpexch APIs (real 1.xxx / 9.xxx IDs). Fallback null → controller
- * purane listMarketCatalogue path pe chala jayega.
+ * Full market page payload for Match Odds market id (1.xxx / m_1_xxx).
  */
 async function getBpexchMarketPage(marketId, pricesToken) {
   const normalizedId = normalizeMarketId(marketId);
-  const main = await fetchBpexchCatalog2(normalizedId).catch(err => {
-    logger.warn(`[bpexch] catalog2 failed for ${normalizedId}: ${err.message}`);
-    return null;
-  });
+  const main = await fetchBpexchCatalog2(normalizedId);
   if (!main) return null;
 
-  // Related sub-market IDs from catalog2 fields if present
   let subIds = [];
   if (Array.isArray(main.relatedMarketIds)) subIds = main.relatedMarketIds.map(String);
   if (Array.isArray(main.subMarketIds)) subIds = subIds.concat(main.subMarketIds.map(String));
-  // common bpexch shape: hasBookmakerMarkets / linked ids in externalId patterns — ignore
 
-  // ✅ Scorecard/prices7 SKIP by default (JWT required). Only if explicit token.
+  // prices7 optional
   const live = pricesToken
     ? await fetchPrices7MarketData(normalizedId, pricesToken).catch(() => null)
     : null;
@@ -1400,17 +1329,28 @@ async function getBpexchMarketPage(marketId, pricesToken) {
       if (mb.id && String(mb.id) !== String(normalizedId)) subIds.push(String(mb.id));
     }
   }
+
+  // Event page scrape for remaining markets (O/U, Bookmaker, Fancy…)
+  const eventId = main.eventId || main.event?.id;
+  if (eventId && subIds.length < 2) {
+    const scraped = await discoverMarketIdsFromEventPage(eventId);
+    for (const id of scraped) {
+      if (id !== String(normalizedId)) subIds.push(id);
+    }
+  }
+
   subIds = [...new Set(subIds.filter(id => id && id !== String(normalizedId)))];
 
   let subCatalogs = [];
   if (subIds.length) {
-    subCatalogs = await fetchBpexchCatalogs(subIds).catch(err => {
-      logger.warn(`[bpexch] catalogs failed: ${err.message}`);
-      return [];
-    });
+    // catalogs API often caps — chunk
+    for (let i = 0; i < subIds.length; i += 40) {
+      const chunk = subIds.slice(i, i + 40);
+      const part = await fetchBpexchCatalogs(chunk);
+      subCatalogs = subCatalogs.concat(part);
+    }
   }
 
-  // Map live prices onto main + subs when available
   const bookById = new Map();
   if (live?.marketBooks) {
     for (const mb of live.marketBooks) bookById.set(String(mb.id), mb);
@@ -1425,7 +1365,6 @@ async function getBpexchMarketPage(marketId, pricesToken) {
       return {
         ...r,
         status: lr.status || r.status,
-        // price ladder (back/lay) for UI
         back: [
           lr.price1 != null ? { price: lr.price1, size: lr.size1 || 0 } : null,
           lr.price2 != null ? { price: lr.price2, size: lr.size2 || 0 } : null,
@@ -1448,23 +1387,18 @@ async function getBpexchMarketPage(marketId, pricesToken) {
   }
 
   const mainEnriched = attachLive(main);
-  const subMarkets = subCatalogs.map(c => {
-    const enriched = attachLive(c);
-    const t = String(enriched.marketType || '').toUpperCase();
-    const n = String(enriched.marketName || '').toLowerCase();
-    let category = 'other';
-    if (t === 'BOOKMAKER' || n.includes('bookmaker') || enriched.isBmMarket) category = 'bookmaker';
-    else if (t === 'TOSS' || n.includes('toss')) category = 'toss';
-    else if (t === 'FANCY2' || t === 'LOCAL_FANCY' || n.includes('fancy')) category = 'fancy2';
-    else if (t === 'FIGURE' || n.includes('figure')) category = 'figure';
-    else if (t === 'ODD_FIGURE' || n.includes('odd')) category = 'oddFigure';
-    else if (t.includes('FANCY') || n.includes('session') || n.includes('over')) category = 'fancy';
-    return { ...enriched, category };
-  });
+  const subMarkets = subCatalogs
+    .filter(c => String(c.marketId) !== String(normalizedId))
+    .map(c => {
+      const enriched = attachLive(c);
+      return { ...enriched, category: categorizeSubMarket(enriched) };
+    });
+
+  logger.info(`[bpexch] marketPage ${normalizedId} subs=${subMarkets.length} scoreboard=${!!live?.scoreboard}`);
 
   return {
     ...mainEnriched,
-    eventId: main.eventId || main.event?.id,
+    eventId,
     eventName: main.eventName || main.event?.name,
     eventTypeId: String(main.eventTypeId || main.sport?.id || ''),
     eventType: main.eventType || main.sport?.name,
@@ -1472,6 +1406,47 @@ async function getBpexchMarketPage(marketId, pricesToken) {
     scoreboard: live?.scoreboard || null,
     scores: live?.scores || null,
     news: live?.news || main.news || '',
+    source: 'bpexch',
+  };
+}
+
+/**
+ * Event-level markets (for Event.html path /Common/Event/<eventId>).
+ * Discovers market ids from event page, loads catalogs, categorizes.
+ */
+async function getBpexchEventMarkets(eventId, pricesToken) {
+  if (!eventId) return null;
+  const ids = await discoverMarketIdsFromEventPage(eventId);
+  if (!ids.length) return null;
+
+  // Prefer a Match Odds / WIN root if present
+  const rootId = ids.find(id => id.startsWith('1.')) || ids[0];
+  const page = await getBpexchMarketPage(rootId, pricesToken);
+  if (page) return page;
+
+  // Fallback: only catalogs
+  let cats = [];
+  for (let i = 0; i < ids.length; i += 40) {
+    cats = cats.concat(await fetchBpexchCatalogs(ids.slice(i, i + 40)));
+  }
+  if (!cats.length) return null;
+  const main = cats.find(c => {
+    const t = String(c.marketType || '').toUpperCase();
+    return t === 'MATCH_ODDS' || t === 'WINNER' || t === 'WIN';
+  }) || cats[0];
+  const subMarkets = cats
+    .filter(c => c.marketId !== main.marketId)
+    .map(c => ({ ...c, category: categorizeSubMarket(c) }));
+  return {
+    ...main,
+    eventId,
+    eventName: main.eventName || main.event?.name,
+    eventTypeId: String(main.eventTypeId || main.sport?.id || ''),
+    eventType: main.eventType || main.sport?.name,
+    subMarkets,
+    scoreboard: null,
+    scores: null,
+    news: main.news || '',
     source: 'bpexch',
   };
 }
@@ -1493,7 +1468,6 @@ module.exports = {
   fetchBpexchCatalogs,
   fetchPrices7MarketData,
   getBpexchMarketPage,
-  // ✅ bpexch.live auto-login session — diagnostics/health-check ke liye
-  getBpexchSession,
-  invalidateBpexchSession,
+  getBpexchEventMarkets,
+  ensureBpexchSession,
 };
