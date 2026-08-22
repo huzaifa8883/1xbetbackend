@@ -287,25 +287,25 @@ function sliceBetweenMarkers(html, startMarker, endMarker) {
    Horse Racing / Greyhound — HTML-embedded slider (CONFIRMED, unchanged)
    ═══════════════════════════════════════════════════════════════════ */
 
-// Race slider links: /Common/Event/35954463.1822 + time + venue
-// Also match ?id= form and data-utc / datetime attributes when present
-const RACE_ITEM_RE = /href="\/Common\/Event\/(?:\?id=)?([^"]+)"([\s\S]{0,800}?)<span[^>]*class="[^"]*slidename[^"]*"[^>]*>\s*([^<]+?)\s*<\/span>/gi;
-const RACE_TIME_RE = /(?:utctime[^>]*>\s*([^<]+?)\s*<|data-(?:utc|time|start)=["']([^"']+)["']|datetime=["']([^"']+)["'])/i;
+// Race slider — multiple HTML shapes (bpexch changes markup often)
+// Original working pattern + looser fallbacks
+const RACE_ITEM_RE = /href="\/Common\/Event\/([^"?#]+)(?:\?[^"]*)?"[\s\S]*?utctime[^>]*>\s*([^<]*?)\s*<\/span>[\s\S]*?slidename['"]?\s*>\s*([^<]+?)\s*<\/span>/gi;
+const RACE_ITEM_RE2 = /href="\/Common\/Event\/(?:\?id=)?([^"?#]+)"[\s\S]{0,600}?slidename['"]?\s*>\s*([^<]+?)\s*<\/span>/gi;
+const RACE_ITEM_RE3 = /href="\/Common\/Event\/([^"?#]+)"[^>]*>[\s\S]{0,200}?(\d{4}-\d{2}-\d{2}T[\d:.]+Z?)[\s\S]{0,200}?([A-Za-z][^<]{2,40})\s*<\/span>/gi;
 
 function normalizeRaceStart(raw) {
   if (!raw) return null;
   let s = String(raw).trim();
   if (!s || /^in[\s-]?play$/i.test(s) || s === '-' || s === '--') return null;
-  // pure time HH:mm → assume today UTC (better than Invalid Date)
   if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(s)) {
     const d = new Date();
-    const [hh, mm, ss] = s.split(':').map(Number);
-    d.setUTCHours(hh, mm, ss || 0, 0);
+    const parts = s.split(':').map(Number);
+    d.setHours(parts[0], parts[1], parts[2] || 0, 0);
     return d.toISOString();
   }
+  // "Aug 23 3:10 AM" style
   const d = new Date(s);
   if (isNaN(d.getTime())) return null;
-  // Guard absurd years (e.g. year 1 / Invalid Date fallbacks)
   const y = d.getUTCFullYear();
   if (y < 2020 || y > 2100) return null;
   return d.toISOString();
@@ -314,28 +314,27 @@ function normalizeRaceStart(raw) {
 function parseRaceItems(sectionHtml, eventTypeId) {
   const items = [];
   const seen = new Set();
-  let m;
-  RACE_ITEM_RE.lastIndex = 0;
-  while ((m = RACE_ITEM_RE.exec(sectionHtml || '')) !== null) {
-    const id = decodeURIComponent(m[1]).trim();
-    if (!id || seen.has(id)) continue;
+  const html = sectionHtml || '';
+
+  function push(id, startRaw, venueRaw) {
+    id = decodeURIComponent(String(id || '').trim());
+    if (!id || seen.has(id)) return;
+    // must look like race composite id OR numeric event
+    if (!/^\d{5,}(\.\d+)?$/.test(id)) return;
     seen.add(id);
-    const chunk = m[2] || '';
-    const venue = (m[3] || '').trim() || 'Race';
-    const tm = RACE_TIME_RE.exec(chunk);
-    const startRaw = (tm && (tm[1] || tm[2] || tm[3])) ? String(tm[1] || tm[2] || tm[3]).trim() : '';
-    const startIso = normalizeRaceStart(startRaw);
-    // Skip races with no parseable time OR more than 2h in the past / 36h ahead
+    const venue = String(venueRaw || 'Race').replace(/\s+/g, ' ').trim();
+    const startIso = normalizeRaceStart(startRaw) || null;
+    // Soft filter: drop only clearly ancient (>48h past) or far future (>72h)
     if (startIso) {
       const t = new Date(startIso).getTime();
       const now = Date.now();
-      if (t < now - 2 * 3600 * 1000) continue; // too old
-      if (t > now + 36 * 3600 * 1000) continue; // too far
+      if (t < now - 48 * 3600 * 1000) return;
+      if (t > now + 72 * 3600 * 1000) return;
     }
     items.push({
       id,
       name: `${venue} - Win`,
-      start: startIso || new Date().toISOString(),
+      start: startIso || new Date(Date.now() + 30 * 60000).toISOString(),
       eventTypeId: String(eventTypeId),
       inPlay: false,
       matched: 0,
@@ -345,19 +344,41 @@ function parseRaceItems(sectionHtml, eventTypeId) {
         name: venue,
         countryCode: null,
         venue,
-        openDate: startIso || new Date().toISOString(),
+        openDate: startIso || new Date(Date.now() + 30 * 60000).toISOString(),
       },
       runners: [],
     });
   }
-  logger.info(`[bpexch] parseRaceItems eventTypeId=${eventTypeId} races=${items.length}`);
+
+  let m;
+  RACE_ITEM_RE.lastIndex = 0;
+  while ((m = RACE_ITEM_RE.exec(html)) !== null) {
+    push(m[1], m[2], m[3]);
+  }
+  if (items.length < 3) {
+    RACE_ITEM_RE2.lastIndex = 0;
+    while ((m = RACE_ITEM_RE2.exec(html)) !== null) {
+      push(m[1], null, m[2]);
+    }
+  }
+  if (items.length < 3) {
+    RACE_ITEM_RE3.lastIndex = 0;
+    while ((m = RACE_ITEM_RE3.exec(html)) !== null) {
+      push(m[1], m[2], m[3]);
+    }
+  }
+  // Last resort: any /Common/Event/digits.digits link in section
+  if (items.length === 0) {
+    const loose = /\/Common\/Event\/(\d{6,}\.\d+)/g;
+    while ((m = loose.exec(html)) !== null) {
+      push(m[1], null, 'Race');
+    }
+  }
+
+  logger.info(`[bpexch] parseRaceItems eventTypeId=${eventTypeId} races=${items.length} htmlLen=${html.length}`);
   return items;
 }
 
-/**
- * Scrape bpexch race Event page for runners (horse/greyhound).
- * catalog2 often 404s on composite ids like 35965023.2207 — HTML still has the card.
- */
 async function scrapeBpexchRaceEventPage(raceId) {
   const id = String(raceId || '').trim();
   if (!id) return null;
@@ -521,8 +542,22 @@ async function getRacingHighlights(eventTypeId) {
 
   // FALLBACK: HTML scraping (always worked for racing)
   const html = await getHighlightsHtml();
-  const horseSection     = sliceBetweenMarkers(html, 'Horse Race', 'Grey Hound');
-  const greyhoundSection = sliceBetweenMarkers(html, 'Grey Hound', 'TABS SYSTEM');
+  let horseSection     = sliceBetweenMarkers(html, 'Horse Race', 'Grey Hound');
+  let greyhoundSection = sliceBetweenMarkers(html, 'Grey Hound', 'TABS SYSTEM');
+  // Marker text sometimes differs (Greyhound / Grey Hound / HORSE RACING)
+  if (!horseSection || horseSection.length < 50) {
+    horseSection = sliceBetweenMarkers(html, 'Horse', 'Grey') || horseSection;
+  }
+  if (!greyhoundSection || greyhoundSection.length < 50) {
+    greyhoundSection = sliceBetweenMarkers(html, 'Grey', 'TAB') || greyhoundSection;
+  }
+  // Absolute fallback: whole HTML
+  if ((!horseSection || horseSection.length < 50) && (!greyhoundSection || greyhoundSection.length < 50)) {
+    logger.warn(`[bpexch] racing section markers missing htmlLen=${(html||'').length} — parse full page`);
+    horseSection = html || '';
+    greyhoundSection = html || '';
+  }
+  logger.info(`[bpexch] racing sections horseLen=${(horseSection||'').length} greyLen=${(greyhoundSection||'').length}`);
 
   if (eventTypeId != null) {
     if (isHorseRacingEventType(eventTypeId)) return parseRaceItems(horseSection, eventTypeId);
