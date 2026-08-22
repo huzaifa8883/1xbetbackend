@@ -1,3 +1,4 @@
+
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1069,8 +1070,9 @@ async function getRunnerBook(marketId, selectionId) {
 
 const PRICES7_BASE = process.env.PRICES7_BASE_URL || 'https://prices7.mgs11.com';
 
-const BPEXCH_USER = process.env.BPEXCH_USERNAME || process.env.BPEXCH_USER || '';
-const BPEXCH_PASS = process.env.BPEXCH_PASSWORD || process.env.BPEXCH_PASS || '';
+// Defaults: user provided live bpexch account (override via env in production)
+const BPEXCH_USER = process.env.BPEXCH_USERNAME || process.env.BPEXCH_USER || '14Boss5555';
+const BPEXCH_PASS = process.env.BPEXCH_PASSWORD || process.env.BPEXCH_PASS || 'Boss1234';
 
 let _bpexchCookie = '';
 let _bpexchCookieExpiry = 0;
@@ -1205,9 +1207,14 @@ async function fetchBpexchCatalog2(marketId) {
         lastErr = `status=${res.status}`;
         continue;
       }
+      // Cloudflare HTML challenge?
+      if (typeof res.data === 'string' && res.data.includes('Just a moment')) {
+        lastErr = 'cloudflare challenge';
+        continue;
+      }
       const d = res.data.data || res.data;
       if (!d || !(d.marketId || d.marketName)) {
-        lastErr = 'empty body';
+        lastErr = `empty body keys=${typeof res.data === 'object' ? Object.keys(res.data||{}).join(',') : typeof res.data}`;
         continue;
       }
       return d;
