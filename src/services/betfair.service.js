@@ -1,4 +1,3 @@
-
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -594,19 +593,40 @@ async function getSportsHighlightsFromJson(eventTypeId) {
   }
 }
 
+function dedupeMarketsById(items) {
+  const seen = new Set();
+  const out = [];
+  for (const m of items) {
+    const id = String(m.id || m.marketId || '');
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(m);
+  }
+  return out;
+}
+
 async function getSportsHighlights(eventTypeId) {
   // PRIMARY: markethighlights JSON API
   const jsonItems = await getSportsHighlightsFromJson(eventTypeId);
-  if (jsonItems !== null) return jsonItems;
+  if (jsonItems !== null) return dedupeMarketsById(jsonItems);
 
   // FALLBACK: HTML scraping (original)
+  // Multiple high_lights blocks can repeat the same match (InPlay + Today)
+  // → dedupe by market id so dashboard / live APIs don't show duplicates.
   const html = await getHighlightsHtml();
   const sections = parseMatchOddsSections(html);
+  let items;
   if (eventTypeId != null) {
     const wanted = String(eventTypeId);
-    return sections.filter(s => String(s.eventTypeId) === wanted).flatMap(s => s.items);
+    items = sections.filter(s => String(s.eventTypeId) === wanted).flatMap(s => s.items);
+  } else {
+    items = sections.flatMap(s => s.items);
   }
-  return sections.flatMap(s => s.items);
+  const deduped = dedupeMarketsById(items);
+  if (deduped.length !== items.length) {
+    logger.info(`[bpexch] deduped highlights ${items.length} → ${deduped.length} (eventTypeId=${eventTypeId ?? 'all'})`);
+  }
+  return deduped;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -936,8 +956,29 @@ async function listMarketCatalogue(filter = {}, maxResults = '20', marketProject
     items = items.filter(m => ids.has(String(m.id)) || ids.has(normalizeMarketId(m.id)));
   }
 
-  const sliced = items.slice(0, parseInt(maxResults, 10) || 20);
+  let sliced = items.slice(0, parseInt(maxResults, 10) || 20);
   if (!sliced.length) return [];
+
+  // Racing / empty runners: fill names from bpexch catalog2
+  for (let i = 0; i < sliced.length; i++) {
+    if ((sliced[i].runners || []).length) continue;
+    try {
+      const cat = await fetchBpexchCatalog2(sliced[i].id);
+      if (cat?.runners?.length) {
+        sliced[i] = {
+          ...sliced[i],
+          name: cat.marketName || sliced[i].name,
+          runners: cat.runners.map((r, idx) => ({
+            selectionId: Number(r.selectionId ?? r.id ?? idx + 1),
+            runnerName: r.runnerName || r.name || `Runner ${idx + 1}`,
+            sortPriority: r.sortPriority || idx + 1,
+            handicap: r.handicap || 0,
+            metadata: r.metadata || {},
+          })),
+        };
+      }
+    } catch (_) { /* ignore */ }
+  }
 
   return sliced.map(m => {
     const startMs = m.start != null ? new Date(m.start).getTime() : NaN;
@@ -1011,10 +1052,12 @@ async function listMarketBook(marketIds = [], priceProjection) {
 
   const lookup = await getMatchOddsLookup();
 
-  return marketIds.map((id) => {
-    const item = lookup.get(String(id));
-    if (item) {
-      return {
+  const results = [];
+  for (const id of marketIds) {
+    const key = String(id);
+    const item = lookup.get(key);
+    if (item && (item.runners || []).length) {
+      results.push({
         marketId: id,
         status: 'OPEN',
         inplay: !!item.inPlay,
@@ -1027,12 +1070,57 @@ async function listMarketBook(marketIds = [], priceProjection) {
           ex: r.ex,
         })),
         scoreboard: null,
-      };
+      });
+      continue;
     }
-    // Horse racing/greyhound ya unrecognized market — koi live price
-    // source abhi available nahi, safe default
-    return { marketId: id, status: 'OPEN', inplay: false, betDelay: 0, totalMatched: 0, runners: [] };
-  });
+
+    // Horse / Greyhound / missing odds — try bpexch catalog2 for runners
+    let runners = [];
+    let inplay = false;
+    let matched = 0;
+    try {
+      const cat = await fetchBpexchCatalog2(key);
+      if (cat && Array.isArray(cat.runners) && cat.runners.length) {
+        runners = cat.runners.map((r, i) => ({
+          selectionId: Number(r.selectionId ?? r.id ?? i + 1),
+          status: r.status || 'ACTIVE',
+          lastPriceTraded: null,
+          ex: {
+            availableToBack: (r.back || []).slice(0, 3).map(b => ({
+              price: b.price ?? b, size: b.size || 0,
+            })),
+            availableToLay: (r.lay || []).slice(0, 3).map(l => ({
+              price: l.price ?? l, size: l.size || 0,
+            })),
+          },
+        }));
+        // catalog2 rarely has ladder — still expose runner names for UI
+        if (!runners.some(r => (r.ex.availableToBack || []).length)) {
+          runners = cat.runners.map((r, i) => ({
+            selectionId: Number(r.selectionId ?? r.id ?? i + 1),
+            status: r.status || 'ACTIVE',
+            lastPriceTraded: null,
+            ex: { availableToBack: [], availableToLay: [] },
+          }));
+        }
+        matched = cat.totalMatched || 0;
+        logger.info(`[listMarketBook] catalog2 runners=${runners.length} for ${key}`);
+      }
+    } catch (e) {
+      logger.warn(`[listMarketBook] catalog2 for ${key}: ${e.message}`);
+    }
+
+    results.push({
+      marketId: id,
+      status: 'OPEN',
+      inplay,
+      betDelay: 0,
+      totalMatched: matched,
+      runners,
+      scoreboard: null,
+    });
+  }
+  return results;
 }
 
 /* ── getEventDetails (orders.js compatible) ─────────────── */
