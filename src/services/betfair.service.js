@@ -383,6 +383,37 @@ async function scrapeBpexchRaceEventPage(raceId) {
   const id = String(raceId || '').trim();
   if (!id) return null;
   await ensureBpexchSession();
+
+  // 1) Prefer catalog2 (real runner names + cloth/jockey when available)
+  try {
+    const cat = await fetchBpexchCatalog2(id);
+    if (cat && Array.isArray(cat.runners) && cat.runners.length) {
+      const clean = cat.runners
+        .map((r, i) => sanitizeRaceRunner(r, i))
+        .filter(Boolean);
+      if (clean.length) {
+        logger.info(`[bpexch] race ${id} catalog2 runners=${clean.length}`);
+        return {
+          ...cat,
+          marketId: cat.marketId || id,
+          marketName: cat.marketName || 'Win',
+          marketType: cat.marketType || 'WIN',
+          eventId: id,
+          eventName: cat.eventName || cat.event?.name || cat.marketName,
+          eventTypeId: String(cat.eventTypeId || cat.sport?.id || '7'),
+          eventType: cat.eventType || cat.sport?.name || 'Horse Racing',
+          marketStartTime: cat.marketStartTime || cat.marketStartTimeUtc,
+          runners: clean,
+          subMarkets: [],
+          source: 'bpexch-catalog2',
+        };
+      }
+    }
+  } catch (e) {
+    logger.warn(`[bpexch] race catalog2 ${id}: ${e.message}`);
+  }
+
+  // 2) Scrape Event HTML for runner list (strict name filter — no Vue/score junk)
   const urls = [
     `${BPEXCH_BASE_URL}/Common/Event/${encodeURIComponent(id)}`,
     `${BPEXCH_BASE_URL}/Common/Event?id=${encodeURIComponent(id)}`,
@@ -401,113 +432,84 @@ async function scrapeBpexchRaceEventPage(raceId) {
         _bpexchCookie = mergeSetCookie(_bpexchCookie, res.headers['set-cookie']);
       }
 
-      // Venue / race title
       let eventName = null;
-      const titleM = html.match(/<h[12][^>]*>([^<]{2,80})<\/h[12]>/i)
-        || html.match(/class="[^"]*event-name[^"]*"[^>]*>([^<]+)/i)
-        || html.match(/<title>([^|<]+)/i);
+      const titleM = html.match(/<h[12][^>]*>\s*([^<]{3,100})\s*<\/h[12]>/i)
+        || html.match(/class="[^"]*(?:event-name|race-name|market-title)[^"]*"[^>]*>\s*([^<]{3,100})/i);
       if (titleM) eventName = titleM[1].replace(/\s+/g, ' ').trim();
 
-      // Start time
       let startIso = null;
       const timeM = html.match(/utctime[^>]*>\s*([^<]+)/i)
         || html.match(/data-(?:utc|start)=["']([^"']+)["']/i);
       if (timeM) startIso = normalizeRaceStart(timeM[1]);
 
-      // Runners: cloth number + name patterns common on exchange race cards
       const runners = [];
-      const seenSel = new Set();
-      // Table rows with runner names
-      const rowRe = /<(?:tr|div)[^>]*(?:runner|selection|horse|grey)[^>]*>[\s\S]{0,500}?<\/(?:tr|div)>/gi;
-      // Fallback: numbered runners "1. Horse Name" or silk + name
-      const nameRes = [
-        /(?:selectionId|selection_id|data-selection)["'=\s:]+(\d+)[\s\S]{0,120}?(?:runnerName|runner-name|name)["'=\s:]+([^"'<\n]{2,60})/gi,
-        /class="[^"]*runner-name[^"]*"[^>]*>\s*([^<]{2,60})/gi,
-        /<td[^>]*class="[^"]*(?:runner|name)[^"]*"[^>]*>\s*(?:<[^>]+>)*\s*([^<]{2,60})/gi,
-      ];
+      const seen = new Set();
 
-      // JSON blobs in page
-      const jsonRe = /"runners"\s*:\s*\[([\s\S]*?)\]/g;
-      let jm;
-      while ((jm = jsonRe.exec(html)) !== null) {
-        try {
-          const arr = JSON.parse('[' + jm[1].replace(/,\s*$/, '') + ']');
-          if (Array.isArray(arr)) {
-            for (let i = 0; i < arr.length; i++) {
-              const r = arr[i];
-              if (!r) continue;
-              const sid = Number(r.selectionId || r.id || i + 1);
-              const name = r.runnerName || r.name || r.runner || `Runner ${i + 1}`;
-              if (seenSel.has(sid)) continue;
-              seenSel.add(sid);
-              runners.push({
-                selectionId: sid,
-                runnerName: String(name).trim(),
-                handicap: r.handicap || 0,
-                sortPriority: r.sortPriority || i + 1,
-                status: r.status || 'ACTIVE',
-                metadata: r.metadata || {},
-              });
-            }
-          }
-        } catch (_) { /* ignore broken json */ }
+      // JSON: "runnerName":"Dog Name" / "selectionId":123
+      const pairRe = /\{\s*"selectionId"\s*:\s*(\d+)[\s\S]{0,400}?"runnerName"\s*:\s*"([^"]{2,80})"/gi;
+      let pm;
+      while ((pm = pairRe.exec(html)) !== null) {
+        const r = sanitizeRaceRunner({
+          selectionId: Number(pm[1]),
+          runnerName: pm[2],
+        }, runners.length);
+        if (!r || seen.has(r.selectionId)) continue;
+        seen.add(r.selectionId);
+        runners.push(r);
       }
-
+      // reverse order fields
       if (!runners.length) {
-        for (const re of nameRes) {
-          re.lastIndex = 0;
-          let nm;
-          let idx = 0;
-          while ((nm = re.exec(html)) !== null && runners.length < 40) {
-            let sid, name;
-            if (nm.length >= 3 && /^\d+$/.test(nm[1])) {
-              sid = Number(nm[1]);
-              name = nm[2];
-            } else {
-              sid = ++idx;
-              name = nm[1];
-            }
-            name = String(name || '').replace(/\s+/g, ' ').trim();
-            if (!name || name.length < 2 || seenSel.has(sid)) continue;
-            if (/^(back|lay|odds|price|size)$/i.test(name)) continue;
-            seenSel.add(sid);
-            runners.push({
-              selectionId: sid,
-              runnerName: name,
-              handicap: 0,
-              sortPriority: runners.length + 1,
-              status: 'ACTIVE',
-              metadata: {},
-            });
-          }
+        const pairRe2 = /\{\s*"runnerName"\s*:\s*"([^"]{2,80})"[\s\S]{0,400}?"selectionId"\s*:\s*(\d+)/gi;
+        while ((pm = pairRe2.exec(html)) !== null) {
+          const r = sanitizeRaceRunner({
+            selectionId: Number(pm[2]),
+            runnerName: pm[1],
+          }, runners.length);
+          if (!r || seen.has(r.selectionId)) continue;
+          seen.add(r.selectionId);
+          runners.push(r);
         }
       }
 
-      // Also try catalog2 while we're here
-      let cat = null;
-      try { cat = await fetchBpexchCatalog2(id); } catch (_) {}
+      // data-runner-name / cloth attributes
+      if (!runners.length) {
+        const attrRe = /data-(?:runner-?name|name)=["']([^"']{2,60})["'][^>]*(?:data-(?:selection|id)=["'](\d+)["'])?/gi;
+        while ((pm = attrRe.exec(html)) !== null) {
+          const r = sanitizeRaceRunner({
+            selectionId: pm[2] ? Number(pm[2]) : runners.length + 1,
+            runnerName: pm[1],
+          }, runners.length);
+          if (!r || seen.has(r.runnerName.toLowerCase())) continue;
+          seen.add(r.runnerName.toLowerCase());
+          runners.push(r);
+        }
+      }
 
-      if (cat && Array.isArray(cat.runners) && cat.runners.length) {
-        logger.info(`[bpexch] race ${id} catalog2 runners=${cat.runners.length}`);
-        return {
-          ...cat,
-          marketId: cat.marketId || id,
-          eventId: id,
-          eventName: cat.eventName || eventName || cat.marketName,
-          marketStartTime: cat.marketStartTime || startIso,
-          marketStartTimeUtc: cat.marketStartTimeUtc || startIso,
-          runners: cat.runners,
-          subMarkets: [],
-          source: 'bpexch-catalog2',
-        };
+      // Trap/cloth number + name: "1. Ringo" or "(1) Ringo"
+      if (!runners.length) {
+        const clothRe = /(?:^|>|\s)(\d{1,2})\s*[.)]\s*([A-Za-z][A-Za-z0-9' .\-]{1,40})(?:\s*<|\s*\(|$)/gm;
+        while ((pm = clothRe.exec(html)) !== null && runners.length < 24) {
+          const r = sanitizeRaceRunner({
+            selectionId: Number(pm[1]),
+            clothNumber: pm[1],
+            runnerName: pm[2].trim(),
+          }, runners.length);
+          if (!r || seen.has(r.runnerName.toLowerCase())) continue;
+          seen.add(r.runnerName.toLowerCase());
+          runners.push(r);
+        }
       }
 
       if (!runners.length) {
-        logger.warn(`[bpexch] race page ${id} no runners parsed`);
+        logger.warn(`[bpexch] race page ${id} no clean runners`);
         continue;
       }
 
-      logger.info(`[bpexch] race page ${id} scraped runners=${runners.length}`);
+      // Detect greyhound vs horse from page text
+      const isGrey = /grey\s*hound|greyhound/i.test(html) || /Healesville|Capalaba|Angle Park/i.test(html + (eventName || ''));
+      const eventTypeId = isGrey ? '4339' : '7';
+
+      logger.info(`[bpexch] race page ${id} scraped runners=${runners.length} type=${eventTypeId}`);
       return {
         marketId: id,
         marketName: 'Win',
@@ -516,22 +518,53 @@ async function scrapeBpexchRaceEventPage(raceId) {
         marketStartTimeUtc: startIso,
         eventId: id,
         eventName: eventName || 'Race',
-        eventTypeId: '7',
+        eventTypeId,
+        eventType: isGrey ? 'Greyhound Racing' : 'Horse Racing',
         status: 'OPEN',
-        runners: runners.map(r => ({
-          ...r,
-          back: [],
-          lay: [],
-        })),
+        runners: runners.map(r => ({ ...r, back: r.back || [], lay: r.lay || [] })),
         subMarkets: [],
         source: 'bpexch-race-html',
       };
     } catch (err) {
-      logger.warn(`[bpexch] race page ${id} fetch failed: ${err.message}`);
+      logger.warn(`[bpexch] race page ${id}: ${err.message}`);
     }
   }
   return null;
 }
+
+/** Reject Vue templates / score fields / junk as runner names */
+function sanitizeRaceRunner(r, index) {
+  if (!r) return null;
+  let name = String(r.runnerName || r.name || '').replace(/\s+/g, ' ').trim();
+  if (!name || name.length < 2 || name.length > 60) return null;
+  if (/\{\{|\}|scores\.|^\{\s*gs|runner-score|v-if|v-for/i.test(name)) return null;
+  if (/^(back|lay|odds|price|size|win|place|market|runner|selection)$/i.test(name)) return null;
+  if (/^[\d.\s]+$/.test(name)) return null;
+  const sid = Number(r.selectionId || r.id || index + 1);
+  let cloth = r.clothNumber || r.trapNumber || null;
+  if (cloth == null && sid >= 1 && sid <= 20) cloth = String(sid);
+  // metadata may hold COLOURS / cloth
+  let meta = r.metadata;
+  if (typeof meta === 'string') {
+    try { meta = JSON.parse(meta); } catch (_) { meta = {}; }
+  }
+  meta = meta || {};
+  return {
+    selectionId: sid,
+    runnerName: name,
+    handicap: Number(r.handicap) || 0,
+    sortPriority: Number(r.sortPriority) || index + 1,
+    status: r.status || 'ACTIVE',
+    clothNumber: cloth || meta.CLOTH_NUMBER || meta.clothNumber || null,
+    silkColor: r.silkColor || r.clothColor || null,
+    jockeyName: r.jockeyName || meta.JOCKEY_NAME || '',
+    trainerName: r.trainerName || meta.TRAINER_NAME || '',
+    metadata: meta,
+    back: Array.isArray(r.back) ? r.back : [],
+    lay: Array.isArray(r.lay) ? r.lay : [],
+  };
+}
+
 
 async function getRacingHighlights(eventTypeId) {
   // PRIMARY: try markethighlights JSON (may include racing sections)
