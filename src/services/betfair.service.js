@@ -1,3 +1,4 @@
+
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1487,15 +1488,49 @@ async function getBpexchMarketPage(marketId, pricesToken) {
  */
 async function getBpexchEventMarkets(eventId, pricesToken) {
   if (!eventId) return null;
-  const ids = await discoverMarketIdsFromEventPage(eventId);
+  const eid = String(eventId);
+
+  // 1) Highlights feed: find Match Odds row whose event.id matches
+  try {
+    const items = await getSportsHighlights(null);
+    const hit = items.find(m => String(m.event?.id) === eid);
+    if (hit) {
+      const page = await getBpexchMarketPage(hit.id, pricesToken);
+      if (page) return page;
+      // build minimal from highlights if catalog2 fails
+      return {
+        marketId: hit.id,
+        marketName: hit.name || 'Match Odds',
+        marketStartTime: hit.start,
+        eventId: eid,
+        eventName: hit.event?.name,
+        eventTypeId: String(hit.eventTypeId || ''),
+        eventType: null,
+        status: 'OPEN',
+        runners: (hit.runners || []).map(r => ({
+          selectionId: r.selectionId,
+          runnerName: r.runnerName,
+          status: 'ACTIVE',
+          back: (r.ex?.availableToBack || []).map(b => ({ price: b.price, size: b.size || 0 })),
+          lay:  (r.ex?.availableToLay  || []).map(l => ({ price: l.price, size: l.size || 0 })),
+        })),
+        subMarkets: [],
+        scoreboard: null,
+        source: 'highlights',
+      };
+    }
+  } catch (e) {
+    logger.warn(`[bpexch] event highlights lookup failed: ${e.message}`);
+  }
+
+  // 2) Scrape event page for market ids
+  const ids = await discoverMarketIdsFromEventPage(eid);
   if (!ids.length) return null;
 
-  // Prefer a Match Odds / WIN root if present
   const rootId = ids.find(id => id.startsWith('1.')) || ids[0];
   const page = await getBpexchMarketPage(rootId, pricesToken);
   if (page) return page;
 
-  // Fallback: only catalogs
   let cats = [];
   for (let i = 0; i < ids.length; i += 40) {
     cats = cats.concat(await fetchBpexchCatalogs(ids.slice(i, i + 40)));
@@ -1506,11 +1541,12 @@ async function getBpexchEventMarkets(eventId, pricesToken) {
     return t === 'MATCH_ODDS' || t === 'WINNER' || t === 'WIN';
   }) || cats[0];
   const subMarkets = cats
-    .filter(c => c.marketId !== main.marketId)
-    .map(c => ({ ...c, category: categorizeSubMarket(c) }));
+    .filter(c => String(c.marketId) !== String(main.marketId) && String(c.eventId || '') === eid)
+    .map(c => ({ ...c, category: categorizeSubMarket(c) }))
+    .filter(c => c.category !== 'matchOdds');
   return {
     ...main,
-    eventId,
+    eventId: eid,
     eventName: main.eventName || main.event?.name,
     eventTypeId: String(main.eventTypeId || main.sport?.id || ''),
     eventType: main.eventType || main.sport?.name,
@@ -1521,6 +1557,20 @@ async function getBpexchEventMarkets(eventId, pricesToken) {
     source: 'bpexch',
   };
 }
+
+/** Resolve pure eventId (e.g. 35945509) → Match Odds marketId (1.xxx) */
+async function resolveMarketIdFromEventId(eventId) {
+  if (!eventId) return null;
+  const eid = String(eventId);
+  try {
+    const items = await getSportsHighlights(null);
+    const hit = items.find(m => String(m.event?.id) === eid);
+    if (hit?.id) return String(hit.id);
+  } catch (_) {}
+  const ids = await discoverMarketIdsFromEventPage(eid);
+  return ids.find(id => id.startsWith('1.')) || ids[0] || null;
+}
+
 
 
 module.exports = {
@@ -1540,5 +1590,6 @@ module.exports = {
   fetchPrices7MarketData,
   getBpexchMarketPage,
   getBpexchEventMarkets,
+  resolveMarketIdFromEventId,
   ensureBpexchSession,
 };
