@@ -1,3 +1,4 @@
+
 'use strict';
 
 const { v4: uuidv4 } = require('uuid');
@@ -8,6 +9,7 @@ const {
   listCompetitions,
   listEventTypes,
   getBpexchMarketPage,
+  getBpexchEventMarkets,
   normalizeMarketId,
 } = require('../services/betfair.service');
 const { sendSuccess, sendError } = require('../utils/response');
@@ -1108,7 +1110,49 @@ async function getEventMarkets(req, res) {
   if (!eventId) return sendError(res, 'eventId query parameter is required', 400);
 
   try {
-    // ── Step 1: Is event ke SAARE markets lo (koi marketType filter nahi) ──
+    // ── Prefer bpexch (Bookmaker / Fancy / O-U like live site) ──
+    const pricesToken = req.headers['x-prices-token'] || req.query.pricesToken || null;
+    try {
+      const bpx = await getBpexchEventMarkets(String(eventId), pricesToken);
+      if (bpx && (bpx.subMarkets?.length || bpx.marketId)) {
+        const buckets = {
+          matchOdds: [], bookmaker: [], toss: [], fancy: [], fancy2: [],
+          figure: [], oddFigure: [], other: [], all: [],
+        };
+        const pushCat = (m) => {
+          const cat = m.category || 'other';
+          const row = {
+            marketId: m.marketId,
+            marketName: m.marketName,
+            marketType: m.marketType || '',
+            status: m.status || 'OPEN',
+            maxBetSize: m.maxBetSize || 0,
+            runners: (m.runners || []).map(r => ({
+              selectionId: r.selectionId,
+              runnerName: r.runnerName || r.name,
+              status: r.status || 'ACTIVE',
+              back: r.back || [],
+              lay: r.lay || [],
+            })),
+          };
+          buckets.all.push(row);
+          if (buckets[cat]) buckets[cat].push(row);
+          else if (cat === 'matchOdds') buckets.matchOdds.push(row);
+          else buckets.other.push(row);
+        };
+        // main as matchOdds
+        if (bpx.marketId) {
+          pushCat({ ...bpx, category: 'matchOdds' });
+        }
+        for (const sm of (bpx.subMarkets || [])) pushCat(sm);
+        logger.info(`[event-markets] bpexch eventId=${eventId} all=${buckets.all.length}`);
+        return sendSuccess(res, buckets);
+      }
+    } catch (e) {
+      logger.warn(`[event-markets] bpexch path failed: ${e.message}`);
+    }
+
+    // ── Fallback: highlights listMarketCatalogue ──
     const catalogues = await listMarketCatalogue(
       { eventIds: [String(eventId)] },
       '200',  // Betfair max 200
