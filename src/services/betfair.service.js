@@ -1,4 +1,3 @@
-
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1307,14 +1306,16 @@ async function fetchPrices7MarketData(marketId, token) {
 function categorizeSubMarket(c) {
   const t = String(c.marketType || '').toUpperCase();
   const n = String(c.marketName || '').toLowerCase();
-  if (t === 'BOOKMAKER' || t === 'BOOKMAKER2' || n.includes('bookmaker') || c.isBmMarket) return 'bookmaker';
+  // Match Odds / Winner are NEVER bookmaker even if isBmMarket flag is weirdly true
+  if (t === 'MATCH_ODDS' || t === 'WINNER' || t === 'WIN' || n === 'match odds') return 'matchOdds';
+  if (t === 'BOOKMAKER' || t === 'BOOKMAKER2' || n.includes('bookmaker')) return 'bookmaker';
+  if (c.isBmMarket && !t.includes('MATCH') && !n.includes('match odds')) return 'bookmaker';
   if (t === 'TOSS' || n.includes('toss')) return 'toss';
   if (t === 'FANCY2' || t === 'LOCAL_FANCY' || n.includes('fancy 2') || n.includes('fancy-2')) return 'fancy2';
-  if (t === 'FIGURE' || n.includes('figure')) return 'figure';
-  if (t === 'ODD_FIGURE' || t === 'EVEN_ODD' || n.includes('odd figure')) return 'oddFigure';
+  if (t === 'FIGURE' || (n.includes('figure') && !n.includes('odd'))) return 'figure';
+  if (t === 'ODD_FIGURE' || t === 'EVEN_ODD' || n.includes('odd figure') || n.includes('even odd')) return 'oddFigure';
   if (t.includes('FANCY') || n.includes('fancy') || n.includes('session') || n.includes('innings')) return 'fancy';
-  if (n.includes('over') || n.includes('under') || t.includes('OVER') || t.includes('UNDER') || t.includes('TOTAL')) return 'other';
-  if (t === 'MATCH_ODDS' || t === 'WINNER' || t === 'WIN') return 'matchOdds';
+  if (n.includes('over') || n.includes('under') || t.includes('OVER') || t.includes('UNDER') || t.includes('TOTAL') || t.includes('HANDICAP') || t.includes('CORRECT')) return 'other';
   return 'other';
 }
 
@@ -1415,15 +1416,56 @@ async function getBpexchMarketPage(marketId, pricesToken) {
     };
   }
 
-  const mainEnriched = attachLive(main);
+  let mainEnriched = attachLive(main);
+
+  // ✅ Merge odds from highlights feed when catalog2 has empty back/lay
+  try {
+    const lookup = await getMatchOddsLookup();
+    const hi = lookup.get(String(normalizedId)) || lookup.get(String(marketId));
+    if (hi && Array.isArray(hi.runners) && hi.runners.length) {
+      const hasPrices = (mainEnriched.runners || []).some(r =>
+        (r.back && r.back.length) || (r.lay && r.lay.length)
+      );
+      if (!hasPrices) {
+        mainEnriched = {
+          ...mainEnriched,
+          totalMatched: mainEnriched.totalMatched || hi.matched || 0,
+          runners: (mainEnriched.runners || []).map((r, i) => {
+            // match by name or by order
+            const hr = hi.runners.find(x =>
+              String(x.runnerName || '').toLowerCase() === String(r.runnerName || '').toLowerCase()
+            ) || hi.runners[i];
+            if (!hr || !hr.ex) return r;
+            return {
+              ...r,
+              back: (hr.ex.availableToBack || []).map(b => ({ price: b.price, size: b.size || 0 })),
+              lay:  (hr.ex.availableToLay  || []).map(l => ({ price: l.price, size: l.size || 0 })),
+            };
+          }),
+        };
+        logger.info(`[bpexch] merged highlights odds onto ${normalizedId}`);
+      }
+    }
+  } catch (e) {
+    logger.warn(`[bpexch] highlights odds merge failed: ${e.message}`);
+  }
+
+  // ✅ ONLY keep sub-markets for THIS event — scrapes often pick related-events Match Odds
+  const eventIdStr = eventId != null ? String(eventId) : null;
   const subMarkets = subCatalogs
-    .filter(c => String(c.marketId) !== String(normalizedId))
+    .filter(c => {
+      if (String(c.marketId) === String(normalizedId)) return false;
+      if (eventIdStr && c.eventId != null && String(c.eventId) !== eventIdStr) return false;
+      return true;
+    })
     .map(c => {
       const enriched = attachLive(c);
       return { ...enriched, category: categorizeSubMarket(enriched) };
-    });
+    })
+    // drop other Match Odds (not useful as "extra" markets on this page)
+    .filter(c => c.category !== 'matchOdds');
 
-  logger.info(`[bpexch] marketPage ${normalizedId} subs=${subMarkets.length} scoreboard=${!!live?.scoreboard}`);
+  logger.info(`[bpexch] marketPage ${normalizedId} eventId=${eventIdStr} subs=${subMarkets.length} scoreboard=${!!live?.scoreboard}`);
 
   return {
     ...mainEnriched,
