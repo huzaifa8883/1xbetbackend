@@ -1285,23 +1285,56 @@ async function discoverMarketIdsFromEventPage(eventId) {
   }
 }
 
+// Optional default — set PRICES7_TOKEN in env (JWT expires ~1h; refresh from bpexch browser)
+const PRICES7_TOKEN_DEFAULT = process.env.PRICES7_TOKEN || '';
+
 async function fetchPrices7MarketData(marketId, token) {
-  const tok = token || process.env.PRICES7_TOKEN || '';
-  if (!tok) return null;
+  const tok = token || PRICES7_TOKEN_DEFAULT || '';
+  if (!tok) {
+    logger.warn('[prices7] no token — set PRICES7_TOKEN env for live odds + submarkets');
+    return null;
+  }
   try {
+    const id = normalizeMarketId(marketId);
     const url = `${PRICES7_BASE}/api/Markets/Data`;
     const res = await axios.get(url, {
-      params: { id: marketId, token: tok },
+      params: { id, token: tok },
       timeout: TIMEOUT_MS,
-      headers: { Accept: 'application/json' },
+      headers: {
+        Accept: 'application/json, text/plain, */*',
+        Referer: 'https://bpexch.live/',
+        Origin: 'https://bpexch.live',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
       validateStatus: s => s < 500,
     });
-    if (res.status !== 200 || !res.data) return null;
+    if (res.status !== 200 || !res.data) {
+      logger.warn(`[prices7] status=${res.status} for ${id}`);
+      return null;
+    }
+    const books = res.data.marketBooks || [];
+    logger.info(`[prices7] Data OK ${id} books=${books.length}`);
     return res.data;
   } catch (err) {
     logger.warn(`[prices7] Data fetch failed for ${marketId}: ${err.message}`);
     return null;
   }
+}
+
+/** Map prices7 runner → { back, lay } ladder */
+function prices7RunnerToLadder(lr) {
+  if (!lr) return { back: [], lay: [] };
+  const back = [
+    lr.price1 != null ? { price: lr.price1, size: lr.size1 || 0 } : null,
+    lr.price2 != null ? { price: lr.price2, size: lr.size2 || 0 } : null,
+    lr.price3 != null ? { price: lr.price3, size: lr.size3 || 0 } : null,
+  ].filter(Boolean);
+  const lay = [
+    lr.lay1 != null ? { price: lr.lay1, size: lr.ls1 || 0 } : null,
+    lr.lay2 != null ? { price: lr.lay2, size: lr.ls2 || 0 } : null,
+    lr.lay3 != null ? { price: lr.lay3, size: lr.ls3 || 0 } : null,
+  ].filter(Boolean);
+  return { back, lay, status: lr.status || 'ACTIVE' };
 }
 
 function categorizeSubMarket(c) {
@@ -1321,91 +1354,70 @@ function categorizeSubMarket(c) {
 }
 
 /**
- * Full market page payload for Match Odds market id (1.xxx / m_1_xxx).
+ * Full market page — exact bpexch flow:
+ *   1) catalog2(id)           → names, eventId, runner list
+ *   2) prices7 Data(id,token) → live odds + related marketBooks ids
+ *   3) catalogs(ids)          → Over/Under / Bookmaker / Fancy structure
+ * Merge (2) prices onto (1)/(3) runners by selectionId.
  */
 async function getBpexchMarketPage(marketId, pricesToken) {
   const normalizedId = normalizeMarketId(marketId);
+
+  // ── 1) catalog2 structure ──
   const main = await fetchBpexchCatalog2(normalizedId);
   if (!main) return null;
 
-  let subIds = [];
-  if (Array.isArray(main.relatedMarketIds)) subIds = main.relatedMarketIds.map(String);
-  if (Array.isArray(main.subMarketIds)) subIds = subIds.concat(main.subMarketIds.map(String));
-  // catalog2 sometimes embeds linked markets
-  if (Array.isArray(main.markets)) {
-    for (const m of main.markets) {
-      const mid = m.marketId || m.id;
-      if (mid) subIds.push(String(mid));
-    }
+  // ── 2) prices7 live books (source of odds + related market ids) ──
+  const live = await fetchPrices7MarketData(normalizedId, pricesToken);
+  const books = Array.isArray(live?.marketBooks) ? live.marketBooks : [];
+  const bookById = new Map(books.map(b => [String(b.id), b]));
+
+  // Related market ids = every book except root Match Odds
+  let subIds = books
+    .map(b => String(b.id))
+    .filter(id => id && id !== String(normalizedId));
+
+  // Also keep any explicit related ids from catalog2
+  if (Array.isArray(main.relatedMarketIds)) {
+    for (const id of main.relatedMarketIds) if (id) subIds.push(String(id));
   }
+  subIds = [...new Set(subIds)];
 
-  // prices7 optional — best source of 9.xxx fancy/bookmaker ids
-  const live = pricesToken
-    ? await fetchPrices7MarketData(normalizedId, pricesToken).catch(() => null)
-    : await fetchPrices7MarketData(normalizedId, null).catch(() => null);
-  if (live?.marketBooks?.length) {
-    for (const mb of live.marketBooks) {
-      if (mb.id && String(mb.id) !== String(normalizedId)) subIds.push(String(mb.id));
-    }
-  }
-
-  // ALWAYS scrape event page for O/U, Bookmaker, Fancy ids
-  const eventId = main.eventId || main.event?.id;
-  if (eventId) {
-    const scraped = await discoverMarketIdsFromEventPage(eventId);
-    for (const id of scraped) {
-      if (id !== String(normalizedId)) subIds.push(id);
-    }
-  }
-
-  subIds = [...new Set(subIds.filter(id => id && id !== String(normalizedId)))];
-  logger.info(`[bpexch] marketPage ${normalizedId} eventId=${eventId || '-'} candidateSubs=${subIds.length}`);
-
-  // 1) bulk catalogs
+  // ── 3) catalogs for related markets ──
   let subCatalogs = [];
   if (subIds.length) {
     for (let i = 0; i < subIds.length; i += 40) {
       const part = await fetchBpexchCatalogs(subIds.slice(i, i + 40));
       subCatalogs = subCatalogs.concat(part || []);
     }
-  }
-
-  // 2) if bulk empty/partial — fetch each id via catalog2 (more reliable)
-  const got = new Set(subCatalogs.map(x => String(x.marketId)));
-  const missing = subIds.filter(id => !got.has(String(id)));
-  if (missing.length) {
-    logger.info(`[bpexch] catalogs miss ${missing.length}/${subIds.length} — per-id catalog2`);
-    const limited = missing.slice(0, 25); // cap parallel load
-    const results = await Promise.all(limited.map(id => fetchBpexchCatalog2(id).catch(() => null)));
-    for (const cat of results) {
-      if (cat && cat.marketId) subCatalogs.push(cat);
+    // per-id fallback if bulk empty
+    if (!subCatalogs.length) {
+      const results = await Promise.all(subIds.slice(0, 20).map(id => fetchBpexchCatalog2(id).catch(() => null)));
+      subCatalogs = results.filter(Boolean);
     }
   }
 
-  const bookById = new Map();
-  if (live?.marketBooks) {
-    for (const mb of live.marketBooks) bookById.set(String(mb.id), mb);
-  }
+  const eventId = main.eventId || main.event?.id;
 
-  function attachLive(cat) {
+  function mergeBookOntoCatalog(cat) {
     const mb = bookById.get(String(cat.marketId));
     if (!mb) return cat;
     const runners = (cat.runners || []).map(r => {
-      const lr = (mb.runners || []).find(x => String(x.id) === String(r.selectionId));
-      if (!lr) return r;
+      const sid = String(r.selectionId ?? r.id ?? '');
+      const lr = (mb.runners || []).find(x => String(x.id) === sid);
+      const ladder = prices7RunnerToLadder(lr);
       return {
         ...r,
-        status: lr.status || r.status,
-        back: [
-          lr.price1 != null ? { price: lr.price1, size: lr.size1 || 0 } : null,
-          lr.price2 != null ? { price: lr.price2, size: lr.size2 || 0 } : null,
-          lr.price3 != null ? { price: lr.price3, size: lr.size3 || 0 } : null,
-        ].filter(Boolean),
-        lay: [
-          lr.lay1 != null ? { price: lr.lay1, size: lr.ls1 || 0 } : null,
-          lr.lay2 != null ? { price: lr.lay2, size: lr.ls2 || 0 } : null,
-          lr.lay3 != null ? { price: lr.lay3, size: lr.ls3 || 0 } : null,
-        ].filter(Boolean),
+        status: ladder.status || r.status || 'ACTIVE',
+        back: ladder.back,
+        lay: ladder.lay,
+        // Vue templates also read price1/lay1 directly
+        price1: ladder.back[0]?.price, size1: ladder.back[0]?.size,
+        price2: ladder.back[1]?.price, size2: ladder.back[1]?.size,
+        price3: ladder.back[2]?.price, size3: ladder.back[2]?.size,
+        lay1: ladder.lay[0]?.price, ls1: ladder.lay[0]?.size,
+        lay2: ladder.lay[1]?.price, ls2: ladder.lay[1]?.size,
+        lay3: ladder.lay[2]?.price, ls3: ladder.lay[2]?.size,
       };
     });
     return {
@@ -1417,56 +1429,91 @@ async function getBpexchMarketPage(marketId, pricesToken) {
     };
   }
 
-  let mainEnriched = attachLive(main);
+  let mainEnriched = mergeBookOntoCatalog(main);
 
-  // ✅ Merge odds from highlights feed when catalog2 has empty back/lay
-  try {
-    const lookup = await getMatchOddsLookup();
-    const hi = lookup.get(String(normalizedId)) || lookup.get(String(marketId));
-    if (hi && Array.isArray(hi.runners) && hi.runners.length) {
-      const hasPrices = (mainEnriched.runners || []).some(r =>
-        (r.back && r.back.length) || (r.lay && r.lay.length)
-      );
-      if (!hasPrices) {
+  // If prices7 had no book for root, try highlights odds
+  const rootHasOdds = (mainEnriched.runners || []).some(r => (r.back && r.back.length) || (r.lay && r.lay.length));
+  if (!rootHasOdds) {
+    try {
+      const lookup = await getMatchOddsLookup();
+      const hi = lookup.get(String(normalizedId));
+      if (hi?.runners?.length) {
         mainEnriched = {
           ...mainEnriched,
           totalMatched: mainEnriched.totalMatched || hi.matched || 0,
           runners: (mainEnriched.runners || []).map((r, i) => {
-            // match by name or by order
             const hr = hi.runners.find(x =>
               String(x.runnerName || '').toLowerCase() === String(r.runnerName || '').toLowerCase()
             ) || hi.runners[i];
-            if (!hr || !hr.ex) return r;
+            if (!hr?.ex) return r;
+            const back = (hr.ex.availableToBack || []).map(b => ({ price: b.price, size: b.size || 0 }));
+            const lay  = (hr.ex.availableToLay  || []).map(l => ({ price: l.price, size: l.size || 0 }));
             return {
-              ...r,
-              back: (hr.ex.availableToBack || []).map(b => ({ price: b.price, size: b.size || 0 })),
-              lay:  (hr.ex.availableToLay  || []).map(l => ({ price: l.price, size: l.size || 0 })),
+              ...r, back, lay,
+              price1: back[0]?.price, size1: back[0]?.size,
+              price2: back[1]?.price, size2: back[1]?.size,
+              price3: back[2]?.price, size3: back[2]?.size,
+              lay1: lay[0]?.price, ls1: lay[0]?.size,
+              lay2: lay[1]?.price, ls2: lay[1]?.size,
+              lay3: lay[2]?.price, ls3: lay[2]?.size,
             };
           }),
         };
-        logger.info(`[bpexch] merged highlights odds onto ${normalizedId}`);
       }
+    } catch (e) {
+      logger.warn(`[bpexch] highlights merge: ${e.message}`);
     }
-  } catch (e) {
-    logger.warn(`[bpexch] highlights odds merge failed: ${e.message}`);
   }
 
-  // ✅ ONLY keep sub-markets for THIS event — scrapes often pick related-events Match Odds
+  // Build subMarkets: catalogs structure + prices7 odds; same event only
   const eventIdStr = eventId != null ? String(eventId) : null;
-  const subMarkets = subCatalogs
-    .filter(c => {
-      if (String(c.marketId) === String(normalizedId)) return false;
-      if (eventIdStr && c.eventId != null && String(c.eventId) !== eventIdStr) return false;
-      return true;
-    })
-    .map(c => {
-      const enriched = attachLive(c);
-      return { ...enriched, category: categorizeSubMarket(enriched) };
-    })
-    // drop other Match Odds (not useful as "extra" markets on this page)
-    .filter(c => c.category !== 'matchOdds');
+  const subMarkets = [];
+  const seen = new Set();
 
-  logger.info(`[bpexch] marketPage ${normalizedId} eventId=${eventIdStr} subs=${subMarkets.length} scoreboard=${!!live?.scoreboard}`);
+  for (const cat of subCatalogs) {
+    const mid = String(cat.marketId);
+    if (mid === String(normalizedId) || seen.has(mid)) continue;
+    if (eventIdStr && cat.eventId != null && String(cat.eventId) !== eventIdStr) continue;
+    seen.add(mid);
+    const enriched = mergeBookOntoCatalog(cat);
+    const category = categorizeSubMarket(enriched);
+    if (category === 'matchOdds') continue;
+    subMarkets.push({ ...enriched, category });
+  }
+
+  // markets that appear only in prices7 books (no catalog yet) — still expose with synthetic names
+  for (const mb of books) {
+    const mid = String(mb.id);
+    if (mid === String(normalizedId) || seen.has(mid)) continue;
+    seen.add(mid);
+    const runners = (mb.runners || []).map((lr, i) => {
+      const ladder = prices7RunnerToLadder(lr);
+      return {
+        selectionId: Number(lr.id) || i + 1,
+        runnerName: `Runner ${i + 1}`,
+        status: ladder.status,
+        back: ladder.back,
+        lay: ladder.lay,
+        price1: ladder.back[0]?.price, size1: ladder.back[0]?.size,
+        price2: ladder.back[1]?.price, size2: ladder.back[1]?.size,
+        price3: ladder.back[2]?.price, size3: ladder.back[2]?.size,
+        lay1: ladder.lay[0]?.price, ls1: ladder.lay[0]?.size,
+        lay2: ladder.lay[1]?.price, ls2: ladder.lay[1]?.size,
+        lay3: ladder.lay[2]?.price, ls3: ladder.lay[2]?.size,
+      };
+    });
+    subMarkets.push({
+      marketId: mid,
+      marketName: `Market ${mid}`,
+      marketType: 'UNKNOWN',
+      status: mb.marketStatus || 'OPEN',
+      totalMatched: mb.totalMatched || 0,
+      runners,
+      category: 'other',
+    });
+  }
+
+  logger.info(`[bpexch] marketPage ${normalizedId} books=${books.length} subs=${subMarkets.length} scoreboard=${!!live?.scoreboard}`);
 
   return {
     ...mainEnriched,
