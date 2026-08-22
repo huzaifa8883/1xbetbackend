@@ -1264,16 +1264,19 @@ async function discoverMarketIdsFromEventPage(eventId) {
     });
     const html = typeof res.data === 'string' ? res.data : '';
     const ids = new Set();
-    // market id patterns in page scripts / data attributes
-    const re = /(?:marketId|MarketId|id)["'\s:=]+([19]\.\d{6,})/g;
     let m;
+    // marketId / MarketId / data-market-id
+    const re = /(?:marketId|MarketId|data-market(?:-id)?|market_id)["'\s:=]+([19]\.\d{5,})/gi;
     while ((m = re.exec(html)) !== null) ids.add(m[1]);
-    // also href ?id=1.xxx
-    const re2 = /[?&]id=([19]\.\d{6,})/g;
+    // query string
+    const re2 = /[?&]id=([19]\.\d{5,})/g;
     while ((m = re2.exec(html)) !== null) ids.add(m[1]);
-    // raw "1.123456789" occurrences
-    const re3 = /\b([19]\.\d{8,})\b/g;
+    // bare 1.xxx / 9.xxx (Betfair + bookmaker/fancy)
+    const re3 = /\b([19]\.\d{6,})\b/g;
     while ((m = re3.exec(html)) !== null) ids.add(m[1]);
+    // Vue/JSON blobs: "marketId":"9.123"
+    const re4 = /"marketId"\s*:\s*"([19]\.[0-9]+)"/g;
+    while ((m = re4.exec(html)) !== null) ids.add(m[1]);
     logger.info(`[bpexch] event page ${eventId} discovered ${ids.size} market ids`);
     return [...ids];
   } catch (err) {
@@ -1326,20 +1329,27 @@ async function getBpexchMarketPage(marketId, pricesToken) {
   let subIds = [];
   if (Array.isArray(main.relatedMarketIds)) subIds = main.relatedMarketIds.map(String);
   if (Array.isArray(main.subMarketIds)) subIds = subIds.concat(main.subMarketIds.map(String));
+  // catalog2 sometimes embeds linked markets
+  if (Array.isArray(main.markets)) {
+    for (const m of main.markets) {
+      const mid = m.marketId || m.id;
+      if (mid) subIds.push(String(mid));
+    }
+  }
 
-  // prices7 optional
+  // prices7 optional — best source of 9.xxx fancy/bookmaker ids
   const live = pricesToken
     ? await fetchPrices7MarketData(normalizedId, pricesToken).catch(() => null)
-    : null;
+    : await fetchPrices7MarketData(normalizedId, null).catch(() => null);
   if (live?.marketBooks?.length) {
     for (const mb of live.marketBooks) {
       if (mb.id && String(mb.id) !== String(normalizedId)) subIds.push(String(mb.id));
     }
   }
 
-  // Event page scrape for remaining markets (O/U, Bookmaker, Fancy…)
+  // ALWAYS scrape event page for O/U, Bookmaker, Fancy ids
   const eventId = main.eventId || main.event?.id;
-  if (eventId && subIds.length < 2) {
+  if (eventId) {
     const scraped = await discoverMarketIdsFromEventPage(eventId);
     for (const id of scraped) {
       if (id !== String(normalizedId)) subIds.push(id);
@@ -1347,14 +1357,26 @@ async function getBpexchMarketPage(marketId, pricesToken) {
   }
 
   subIds = [...new Set(subIds.filter(id => id && id !== String(normalizedId)))];
+  logger.info(`[bpexch] marketPage ${normalizedId} eventId=${eventId || '-'} candidateSubs=${subIds.length}`);
 
+  // 1) bulk catalogs
   let subCatalogs = [];
   if (subIds.length) {
-    // catalogs API often caps — chunk
     for (let i = 0; i < subIds.length; i += 40) {
-      const chunk = subIds.slice(i, i + 40);
-      const part = await fetchBpexchCatalogs(chunk);
-      subCatalogs = subCatalogs.concat(part);
+      const part = await fetchBpexchCatalogs(subIds.slice(i, i + 40));
+      subCatalogs = subCatalogs.concat(part || []);
+    }
+  }
+
+  // 2) if bulk empty/partial — fetch each id via catalog2 (more reliable)
+  const got = new Set(subCatalogs.map(x => String(x.marketId)));
+  const missing = subIds.filter(id => !got.has(String(id)));
+  if (missing.length) {
+    logger.info(`[bpexch] catalogs miss ${missing.length}/${subIds.length} — per-id catalog2`);
+    const limited = missing.slice(0, 25); // cap parallel load
+    const results = await Promise.all(limited.map(id => fetchBpexchCatalog2(id).catch(() => null)));
+    for (const cat of results) {
+      if (cat && cat.marketId) subCatalogs.push(cat);
     }
   }
 
