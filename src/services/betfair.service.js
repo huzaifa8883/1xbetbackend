@@ -1261,6 +1261,10 @@ async function ensureBpexchSession() {
 
       _bpexchCookieExpiry = Date.now() + 30 * 60_000; // 30 min
       logger.info(`[bpexch] login OK cookieLen=${_bpexchCookie.length}`);
+      // After login, try to obtain prices7 JWT (async, non-blocking for cookie return)
+      refreshPrices7TokenFromSession().catch(e =>
+        logger.warn(`[prices7] post-login token fetch: ${e.message}`)
+      );
       return _bpexchCookie;
     } catch (err) {
       logger.warn(`[bpexch] login failed: ${err.message}`);
@@ -1271,6 +1275,164 @@ async function ensureBpexchSession() {
   })();
 
   return _bpexchLoginPromise;
+}
+
+/**
+ * Obtain / refresh prices7 JWT using bpexch session.
+ * Strategies (in order):
+ *  1) valid in-memory / env token
+ *  2) scrape Dashboard HTML/JS for eyJ... JWT
+ *  3) common token API endpoints
+ *  4) cookie jar JWT fields
+ */
+
+// ── prices7 JWT cache + helpers ──
+let _prices7Token = process.env.PRICES7_TOKEN || '';
+let _prices7TokenExp = 0;
+let _prices7RefreshPromise = null;
+// seed exp from env token at boot
+(function seedPrices7FromEnv() {
+  if (!_prices7Token) return;
+  try {
+    const parts = String(_prices7Token).split('.');
+    if (parts.length < 2) return;
+    const json = Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    const payload = JSON.parse(json);
+    if (payload.exp) _prices7TokenExp = Number(payload.exp) * 1000;
+  } catch (_) {}
+})();
+
+function parseJwtExpMs(token) {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length < 2) return 0;
+    const json = Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    const payload = JSON.parse(json);
+    if (payload.exp) return Number(payload.exp) * 1000;
+  } catch (_) {}
+  return 0;
+}
+
+function isPrices7TokenValid(token) {
+  const t = token || _prices7Token;
+  if (!t) return false;
+  const exp = (token ? parseJwtExpMs(token) : (_prices7TokenExp || parseJwtExpMs(t)));
+  return exp > Date.now() + 120000; // 2 min buffer
+}
+
+function setPrices7Token(token, source) {
+  if (!token || String(token).length < 40) return false;
+  _prices7Token = String(token).trim();
+  _prices7TokenExp = parseJwtExpMs(_prices7Token) || (Date.now() + 50 * 60 * 1000);
+  logger.info(`[prices7] token cached source=${source || 'unknown'} exp=${new Date(_prices7TokenExp).toISOString()}`);
+  return true;
+}
+
+function extractJwtFromText(text) {
+  if (!text) return null;
+  const s = String(text);
+  const patterns = [
+    /(?:prices?7?|market)?token["'\s:=]+(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/i,
+    /["']token["']\s*:\s*["'](eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)["']/,
+    /(?:accessToken|access_token|jwt|authToken)["'\s:=]+(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/i,
+    /(eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/,
+  ];
+  for (const re of patterns) {
+    const m = s.match(re);
+    if (m && m[1] && m[1].startsWith('eyJ')) return m[1];
+  }
+  return null;
+}
+
+async function refreshPrices7TokenFromSession(force = false) {
+  if (!force && isPrices7TokenValid()) return _prices7Token;
+  if (_prices7RefreshPromise) return _prices7RefreshPromise;
+
+  _prices7RefreshPromise = (async () => {
+    try {
+      await ensureBpexchSession();
+
+      // Cookie jar may already hold a JWT
+      const fromCookie = extractJwtFromText(_bpexchCookie);
+      if (fromCookie && setPrices7Token(fromCookie, 'cookie')) return _prices7Token;
+
+      // Common API endpoints used by exchange frontends
+      const apiCandidates = [
+        `${BPEXCH_BASE_URL}/api/Users/GetToken`,
+        `${BPEXCH_BASE_URL}/api/User/GetToken`,
+        `${BPEXCH_BASE_URL}/api/Account/Token`,
+        `${BPEXCH_BASE_URL}/api/Account/GetToken`,
+        `${BPEXCH_BASE_URL}/api/Auth/Token`,
+        `${BPEXCH_BASE_URL}/api/markets/token`,
+        `${BPEXCH_BASE_URL}/Users/GetToken`,
+      ];
+      for (const url of apiCandidates) {
+        try {
+          const res = await axios.get(url, {
+            timeout: 10000,
+            headers: bpexchHeaders({ Accept: 'application/json, text/plain, */*' }),
+            validateStatus: s => s < 500,
+          });
+          if (res.headers['set-cookie']) {
+            _bpexchCookie = mergeSetCookie(_bpexchCookie, res.headers['set-cookie']);
+          }
+          const body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data || {});
+          const jwt = extractJwtFromText(body) || extractJwtFromText(JSON.stringify(res.headers || {}));
+          if (jwt && setPrices7Token(jwt, `api:${url.split('/').slice(-2).join('/')}`)) return _prices7Token;
+        } catch (_) { /* try next */ }
+      }
+
+      // Dashboard / market page HTML often embeds token for prices7
+      const pageUrls = [
+        `${BPEXCH_BASE_URL}/Common/Dashboard`,
+        `${BPEXCH_BASE_URL}/`,
+        `${BPEXCH_BASE_URL}/Common/Home`,
+      ];
+      for (const url of pageUrls) {
+        try {
+          const res = await axios.get(url, {
+            timeout: 15000,
+            headers: bpexchHeaders({ Accept: 'text/html,application/xhtml+xml' }),
+            validateStatus: s => s < 500,
+            maxRedirects: 5,
+          });
+          if (res.headers['set-cookie']) {
+            _bpexchCookie = mergeSetCookie(_bpexchCookie, res.headers['set-cookie']);
+          }
+          const html = typeof res.data === 'string' ? res.data : '';
+          const jwt = extractJwtFromText(html);
+          if (jwt && setPrices7Token(jwt, `page:${url.split('/').pop() || 'root'}`)) return _prices7Token;
+        } catch (_) { /* try next */ }
+      }
+
+      // Cookie again after page hits
+      const fromCookie2 = extractJwtFromText(_bpexchCookie);
+      if (fromCookie2 && setPrices7Token(fromCookie2, 'cookie-after-page')) return _prices7Token;
+
+      if (_prices7Token && isPrices7TokenValid()) return _prices7Token;
+      logger.warn('[prices7] could not auto-extract JWT after bpexch login — set PRICES7_TOKEN or check login');
+      return _prices7Token || '';
+    } finally {
+      _prices7RefreshPromise = null;
+    }
+  })();
+
+  return _prices7RefreshPromise;
+}
+
+/** Public: always returns a usable token if login works */
+async function getPrices7Token(explicitToken) {
+  if (explicitToken && isPrices7TokenValid(explicitToken)) {
+    setPrices7Token(explicitToken, 'explicit');
+    return explicitToken;
+  }
+  if (isPrices7TokenValid()) return _prices7Token;
+  // seed from env once
+  if (process.env.PRICES7_TOKEN && !isPrices7TokenValid()) {
+    setPrices7Token(process.env.PRICES7_TOKEN, 'env');
+    if (isPrices7TokenValid()) return _prices7Token;
+  }
+  return refreshPrices7TokenFromSession(true);
 }
 
 async function fetchBpexchCatalog2(marketId) {
@@ -1373,20 +1535,17 @@ async function discoverMarketIdsFromEventPage(eventId) {
   }
 }
 
-// Optional default — set PRICES7_TOKEN in env (JWT expires ~1h; refresh from bpexch browser)
-const PRICES7_TOKEN_DEFAULT = process.env.PRICES7_TOKEN || '';
-
 async function fetchPrices7MarketData(marketId, token) {
-  const tok = token || PRICES7_TOKEN_DEFAULT || '';
+  let tok = await getPrices7Token(token || null);
   if (!tok) {
-    logger.warn('[prices7] no token — set PRICES7_TOKEN env for live odds + submarkets');
+    logger.warn('[prices7] no token after auto-refresh — login may have failed');
     return null;
   }
   try {
     const id = normalizeMarketId(marketId);
     const url = `${PRICES7_BASE}/api/Markets/Data`;
-    const res = await axios.get(url, {
-      params: { id, token: tok },
+    const doFetch = async (t) => axios.get(url, {
+      params: { id, token: t },
       timeout: TIMEOUT_MS,
       headers: {
         Accept: 'application/json, text/plain, */*',
@@ -1396,11 +1555,35 @@ async function fetchPrices7MarketData(marketId, token) {
       },
       validateStatus: s => s < 500,
     });
+
+    let res = await doFetch(tok);
+    // Expired / unauthorized → force re-login + new JWT once
+    if (res.status === 401 || res.status === 403 ||
+        (res.status === 200 && res.data && res.data.error && /token|auth|expir/i.test(String(res.data.error)))) {
+      logger.warn(`[prices7] auth fail status=${res.status} — forcing token refresh`);
+      _prices7Token = '';
+      _prices7TokenExp = 0;
+      _bpexchCookieExpiry = 0; // force session refresh too
+      tok = await refreshPrices7TokenFromSession(true);
+      if (!tok) return null;
+      res = await doFetch(tok);
+    }
     if (res.status !== 200 || !res.data) {
       logger.warn(`[prices7] status=${res.status} for ${id}`);
       return null;
     }
+    // Some APIs return 200 with empty body on bad token
     const books = res.data.marketBooks || [];
+    if (!books.length && res.data.message && /token|unauthorized/i.test(String(res.data.message))) {
+      logger.warn('[prices7] empty books + token error — refresh retry');
+      _prices7Token = '';
+      _prices7TokenExp = 0;
+      tok = await refreshPrices7TokenFromSession(true);
+      if (tok) {
+        res = await doFetch(tok);
+        return res.data || null;
+      }
+    }
     logger.info(`[prices7] Data OK ${id} books=${books.length}`);
     return res.data;
   } catch (err) {
@@ -1727,4 +1910,7 @@ module.exports = {
   getBpexchEventMarkets,
   resolveMarketIdFromEventId,
   ensureBpexchSession,
+  getPrices7Token,
+  refreshPrices7TokenFromSession,
+  fetchPrices7MarketData,
 };
