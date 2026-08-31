@@ -55,7 +55,10 @@ router.get('/live/sports/:id', ctrl.getLiveSport);
  * @desc    Formatted market book (odds ladder for frontend)
  */
 router.get('/Data', ctrl.getMarketData);
-
+router.get('/admin/visibility/tree', authMiddleware, marketController.getVisibilityTree);
+router.get('/admin/visibility/markets', authMiddleware, marketController.getVisibilityMarkets);
+router.post('/admin/visibility/match', authMiddleware, marketController.setMatchVisibility);
+router.post('/admin/visibility/market', authMiddleware, marketController.setMarketVisibility);
 /**
  * @route   GET /api/v1/markets/catalog2?id=<marketId>
  * @desc    Full market catalogue details (used by market.html)
