@@ -407,26 +407,13 @@ async function getLiveHorse(req, res) {
     const items = await sportItems('7');
     if (!items.length) return sendSuccess(res, []);
 
-    // ✅ Track-naam se filter karo (getBetfairTracks jaisi hi derivation).
-    // ⚠️ allowed_competition_ids field mein TRACK NAAM hote hain, Betfair
-    // competition ID nahi.
-    let filteredItems = items;
-    if (cfg?.allowed_competition_ids) {
-      const allowedTracks = new Set(
-        cfg.allowed_competition_ids.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-      );
-      if (allowedTracks.size > 0) {
-        filteredItems = filteredItems.filter(m => {
-          const rawName   = m.event?.name || '';
-          const trackName = (rawName.split('(')[0] || rawName).trim().toLowerCase();
-          return allowedTracks.has(trackName);
-        });
-      }
-    }
-    if (cfg?.allowed_countries) {
-      const allowedCountries = cfg.allowed_countries.split(',').map(s => s.trim());
-      filteredItems = filteredItems.filter(m => !m.event?.countryCode || allowedCountries.includes(m.event.countryCode));
-    }
+    // ✅ Track-naam whitelist filter hata diya — bpexch mein jitne bhi
+    // live races aayein, sab seedha bhej do. (Pehle allowed_competition_ids
+    // ek stale/corrupted track+time list thi jo taqreeban har live race
+    // ko silently drop kar rahi thi — ye poora filtering step hi ab
+    // hata diya gaya hai taake koi bhi DB config future mein races
+    // chupa na sake.)
+    const filteredItems = items;
     if (!filteredItems.length) return sendSuccess(res, []);
 
     const sliced = filteredItems.slice(0, parseInt(maxResults, 10) || 200);
@@ -519,25 +506,9 @@ async function getLiveGreyhound(req, res) {
     const items = await sportItems('4339');
     if (!items.length) return sendSuccess(res, []);
 
-    // ⚠️ allowed_competition_ids field mein TRACK NAAM hote hain, Betfair
-    // competition ID nahi — races ki koi "competition" hoti hi nahi.
-    let filteredItems = items;
-    if (cfg?.allowed_competition_ids) {
-      const allowedTracks = new Set(
-        cfg.allowed_competition_ids.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-      );
-      if (allowedTracks.size > 0) {
-        filteredItems = filteredItems.filter(m => {
-          const rawName   = m.event?.name || '';
-          const trackName = (rawName.split('(')[0] || rawName).trim().toLowerCase();
-          return allowedTracks.has(trackName);
-        });
-      }
-    }
-    if (cfg?.allowed_countries) {
-      const allowedCountries = cfg.allowed_countries.split(',').map(s => s.trim());
-      filteredItems = filteredItems.filter(m => !m.event?.countryCode || allowedCountries.includes(m.event.countryCode));
-    }
+    // ✅ Track-naam whitelist filter hata diya — bpexch mein jitne bhi
+    // live races aayein, sab seedha bhej do (horse wala hi fix).
+    const filteredItems = items;
     if (!filteredItems.length) return sendSuccess(res, []);
 
     const sliced = filteredItems.slice(0, parseInt(maxResults, 10) || 200);
