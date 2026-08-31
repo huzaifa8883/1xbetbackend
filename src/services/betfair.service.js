@@ -133,6 +133,12 @@ function resolveFootballId() {
    sports dono isi ek response se aate hain) ───────────────────────── */
 let _highlightsHtmlCache = null;
 let _highlightsHtmlExpiry = 0;
+// ✅ isi tarah HTML fallback ke liye bhi last-known-good rakho (JSON wale
+// jaisa) — dono primary aur fallback source ka apna stale-cache hai taake
+// dono ek saath fail hue tabhi races poori tarah gayab hongi, sirf ek ke
+// hiccup hone se nahi.
+let _lastGoodHighlightsHtml   = null;
+let _lastGoodHighlightsHtmlAt = 0;
 // Chhota TTL rakha hai taake "time ke sath data update" ho — har naya
 // request (cache expire hone ke baad) fresh HTML khींchta hai.
 const HIGHLIGHTS_CACHE_TTL_MS = parseInt(process.env.BPEXCH_HIGHLIGHTS_CACHE_TTL_MS || '4000', 10);
@@ -144,10 +150,20 @@ const HIGHLIGHTS_JSON_TTL_MS = parseInt(process.env.BETWAY_HIGHLIGHTS_CACHE_TTL_
 let _highlightsJsonCache  = null;
 let _highlightsJsonExpiry = 0;
 let _highlightsJsonPromise = null;  // in-flight dedup
+// ✅ "Last known good" — agar fresh fetch fail ho jaye (bpexch ka koi bhi
+// timeout/5xx/network blip), to seedha khaali data dikhane ke bajaye
+// pichli successful response serve karo. Isi ki wajah se pehle races
+// "achanak gayab" ho jaati thi ek hi failed poll pe, phir agli poll pe
+// wapas aa jaati thi — flapping. STALE_MAX_AGE se zyada purana ho to
+// stale bhi discard kar do (galat/purani races dikhane se behtar hai
+// khaali dikhana).
+let _lastGoodHighlightsJson   = null;
+let _lastGoodHighlightsJsonAt = 0;
+const STALE_MAX_AGE_MS = 3 * 60_000; // 3 minute tak stale data chalega
 
 async function fetchMarkethighlightsJson() {
   const url = `${BPEXCH_BASE_URL}/api1/markethighlights`;
-  const res = await axios.get(url, {
+  const doFetch = () => axios.get(url, {
     timeout: TIMEOUT_MS,
     headers: {
       Accept: 'application/json, text/plain, */*',
@@ -158,6 +174,18 @@ async function fetchMarkethighlightsJson() {
     },
     validateStatus: s => s < 500,
   });
+
+  let res;
+  try {
+    res = await doFetch();
+  } catch (err) {
+    // ✅ Ek transient network blip (timeout/ECONNRESET/etc) pe turant fail
+    // mat ho — 300ms baad ek retry try karo. Zyada baar poll cycles mein
+    // ye akela hi kaafi races ko "gayab" hone se bacha deta hai.
+    logger.warn(`[bpexch] markethighlights JSON fetch failed once, retrying: ${err.message}`);
+    await new Promise(r => setTimeout(r, 300));
+    res = await doFetch();
+  }
   if (res.status !== 200 || !res.data) throw new Error(`markethighlights HTTP ${res.status}`);
   return res.data;
 }
@@ -170,11 +198,24 @@ async function getMarkethighlightsJson() {
       _highlightsJsonCache  = data;
       _highlightsJsonExpiry = Date.now() + HIGHLIGHTS_JSON_TTL_MS;
       _highlightsJsonPromise = null;
+      // ✅ successful fetch — ye ab "last known good" ban jaata hai
+      _lastGoodHighlightsJson   = data;
+      _lastGoodHighlightsJsonAt = Date.now();
       logger.info('[bpexch] markethighlights JSON fetched successfully');
       return data;
     })
     .catch(err => {
       _highlightsJsonPromise = null;
+      // ✅ FIX: pehle yahan seedha throw hota tha → getRacingHighlights
+      // khaali [] return kar deta tha → races DOM se poori tarah gayab
+      // ho jaati thi ek hi failed poll pe. Ab agar 3 min ke andar ka
+      // last-known-good data mojood hai, wahi serve karo (stale lekin
+      // sahi) — flapping/blackout dono ruk jayenge, sirf temporarily
+      // thoda purana data dikhega jab tak bpexch recover na ho jaye.
+      if (_lastGoodHighlightsJson && (Date.now() - _lastGoodHighlightsJsonAt) < STALE_MAX_AGE_MS) {
+        logger.warn(`[bpexch] markethighlights JSON fetch failed (${err.message}) — serving stale cache (${Math.round((Date.now() - _lastGoodHighlightsJsonAt)/1000)}s old)`);
+        return _lastGoodHighlightsJson;
+      }
       throw err;
     });
   return _highlightsJsonPromise;
@@ -255,7 +296,7 @@ function normalizeHighlightItem(item) {
 
 async function fetchHighlightsHtml() {
   const url = `${BPEXCH_BASE_URL}/Common/MarketHighlights`;
-  const res = await axios.get(url, {
+  const doFetch = () => axios.get(url, {
     params: { _: Date.now() }, // site khud bhi cache-buster query bhejta hai
     timeout: TIMEOUT_MS,
     headers: {
@@ -263,15 +304,37 @@ async function fetchHighlightsHtml() {
       Accept: 'text/html, */*',
     },
   });
-  return typeof res.data === 'string' ? res.data : String(res.data);
+  try {
+    const res = await doFetch();
+    return typeof res.data === 'string' ? res.data : String(res.data);
+  } catch (err) {
+    // ✅ ek quick retry, JSON path jaisa hi — transient blips ko yahin sok lo
+    logger.warn(`[bpexch] MarketHighlights HTML fetch failed once, retrying: ${err.message}`);
+    await new Promise(r => setTimeout(r, 300));
+    const res = await doFetch();
+    return typeof res.data === 'string' ? res.data : String(res.data);
+  }
 }
 
 async function getHighlightsHtml() {
   if (_highlightsHtmlCache && Date.now() < _highlightsHtmlExpiry) return _highlightsHtmlCache;
-  const html = await fetchHighlightsHtml();
-  _highlightsHtmlCache = html;
-  _highlightsHtmlExpiry = Date.now() + HIGHLIGHTS_CACHE_TTL_MS;
-  return html;
+  try {
+    const html = await fetchHighlightsHtml();
+    _highlightsHtmlCache = html;
+    _highlightsHtmlExpiry = Date.now() + HIGHLIGHTS_CACHE_TTL_MS;
+    _lastGoodHighlightsHtml   = html;
+    _lastGoodHighlightsHtmlAt = Date.now();
+    return html;
+  } catch (err) {
+    // ✅ FIX: pehle yahan seedha error propagate ho jata tha → parseRaceItems
+    // ko khaali section milta → races poori tarah gayab. Ab stale (max 3
+    // min purani) HTML se hi parse kar lo jab tak fresh fetch recover na ho.
+    if (_lastGoodHighlightsHtml && (Date.now() - _lastGoodHighlightsHtmlAt) < STALE_MAX_AGE_MS) {
+      logger.warn(`[bpexch] MarketHighlights HTML fetch failed (${err.message}) — serving stale cache (${Math.round((Date.now() - _lastGoodHighlightsHtmlAt)/1000)}s old)`);
+      return _lastGoodHighlightsHtml;
+    }
+    throw err;
+  }
 }
 
 function sliceBetweenMarkers(html, startMarker, endMarker) {
