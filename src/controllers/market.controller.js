@@ -13,6 +13,7 @@ const {
   resolveRealRaceMarketId,
   fetchPrices7MarketData,
   normalizeMarketId,
+  sportItems,
 } = require('../services/betfair.service');
 const { sendSuccess, sendError } = require('../utils/response');
 const { SPORT_MAP } = require('../config/constants');
@@ -392,85 +393,88 @@ async function getLiveHorse(req, res) {
     const from = new Date(now.getTime() - 5 * 60_000).toISOString();
     const to   = new Date(now.getTime() + hoursAhead * 3600_000).toISOString();
 
-    const eventFilter = {
-      eventTypeIds: ['7'],
-      marketStartTime: { from, to },
-    };
-    if (cfg?.allowed_countries) eventFilter.marketCountries = cfg.allowed_countries.split(',').map(s => s.trim());
-    // ⚠️ allowed_competition_ids field mein TRACK NAAM hote hain (jaise
-    // "Ballarat"), Betfair competition ID nahi — races ki koi "competition"
-    // hoti hi nahi. Isliye ye seedha Betfair filter mein NAHI jaata; niche
-    // events fetch hone ke baad naam se match karke filter hota hai.
+    // ✅ FIX: pehle listEvents() aur listMarketCatalogue() DO ALAG,
+    // independent bpexch scrapes karte the aur phir eventId se match karke
+    // combine karte the. bpexch ka page live badalta rehta hai, is liye
+    // jab dono fetch 4-second highlights-cache window se bahar gir jate
+    // the (jo cron/parallel-request overlap ki wajah se aksar hota tha),
+    // dono scrapes ke IDs match nahi karte the — data silently gir jata
+    // (kabhi 15 races milte, kabhi sirf 6, kabhi 0). Ab sirf EK scrape
+    // hoti hai aur wahi seedha events + catalogues dono ke liye use hoti
+    // hai, isliye IDs hamesha guaranteed match karengi — jitna data
+    // scrape mein milta hai, utna hi seedha bhej diya jata hai.
+    const items = await sportItems('7');
+    if (!items.length) return sendSuccess(res, []);
 
-    let events = await listEvents(eventFilter);
-    if (!events.length) return sendSuccess(res, []);
-
-    // ✅ FIX: track-naam se filter karo (getBetfairTracks jaisi hi derivation)
+    // ✅ Track-naam se filter karo (getBetfairTracks jaisi hi derivation).
+    // ⚠️ allowed_competition_ids field mein TRACK NAAM hote hain, Betfair
+    // competition ID nahi.
+    let filteredItems = items;
     if (cfg?.allowed_competition_ids) {
       const allowedTracks = new Set(
         cfg.allowed_competition_ids.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
       );
       if (allowedTracks.size > 0) {
-        events = events.filter(e => {
-          const rawName   = e.event?.name || '';
+        filteredItems = filteredItems.filter(m => {
+          const rawName   = m.event?.name || '';
           const trackName = (rawName.split('(')[0] || rawName).trim().toLowerCase();
           return allowedTracks.has(trackName);
         });
       }
     }
-    if (!events.length) return sendSuccess(res, []);
+    if (cfg?.allowed_countries) {
+      const allowedCountries = cfg.allowed_countries.split(',').map(s => s.trim());
+      filteredItems = filteredItems.filter(m => !m.event?.countryCode || allowedCountries.includes(m.event.countryCode));
+    }
+    if (!filteredItems.length) return sendSuccess(res, []);
 
-    const catalogues = await listMarketCatalogue(
-      { eventIds: events.map(e => e.event.id), marketTypeCodes: ['WIN'] },
-      maxResults,
-      ['EVENT', 'RUNNER_METADATA', 'COMPETITION', 'RUNNER_DESCRIPTION', 'MARKET_START_TIME']
-    );
-    logger.info(`[getLiveHorse] events=${events.length} catalogues=${catalogues.length}`);
-    if (!catalogues.length) return sendSuccess(res, []);
+    const sliced = filteredItems.slice(0, parseInt(maxResults, 10) || 200);
+    logger.info(`[getLiveHorse] items=${items.length} filtered=${filteredItems.length} sliced=${sliced.length}`);
 
     // Books fetch in chunks
     const CHUNK = 200;
-    const allMarketIds = catalogues.map(m => m.marketId);
+    const allMarketIds = sliced.map(m => m.id);
     let allBooks = [];
     for (let i = 0; i < allMarketIds.length; i += CHUNK) {
       const books = await listMarketBook(allMarketIds.slice(i, i + CHUNK)).catch(() => []);
       allBooks = allBooks.concat(books);
     }
 
-    // ✅ Map — marketStartTime use karo (race-specific, more accurate than event.openDate)
-    const mapped = catalogues.map(market => {
-      const book  = allBooks.find(b => b.marketId === market.marketId);
-      const event = events.find(e => e.event.id === market.event?.id);
-      const startTime = market.marketStartTime || event?.event.openDate || '';
+    // ✅ Map — market.start use karo (ab ek hi scrape se aata hai, event
+    // se dobara match karne ki zaroorat nahi — id aur event.id already
+    // isi item mein consistent hain)
+    const mapped = sliced.map(m => {
+      const book = allBooks.find(b => b.marketId === m.id);
+      const startTime = m.start || m.event?.openDate || '';
 
       return {
-        marketId:        market.marketId,
-        // ✅ FIX: eventId add kiya — pehle ye field hi nahi bheja jaata tha,
-        // is liye dashboard click pe evtMap bridge kabhi nahi banta tha aur
-        // Event page marketId ki jagah eventId use kar leta tha → "UNABLE
-        // TO LOAD". Ab bridge seedha yahin se ban jayega, extra round-trip
-        // ki zaroorat nahi.
-        eventId:         market.event?.id || event?.event.id || null,
-        match:           event?.event.name || market.marketName || 'Unknown',
+        marketId:        m.id,
+        eventId:         m.event?.id || null,
+        match:           m.event?.name || m.name || 'Unknown',
         startTime,
         marketStatus:    book?.status || 'UNKNOWN',
-          inPlay:         (() => {
+        inPlay:          (() => {
           if (book?.inPlay === true) return true;
           if (book?.status === 'IN_PLAY') return true;
-          const st = event?.event?.openDate || market?.marketStartTime;
+          const st = m.event?.openDate || startTime;
           if (st && new Date(st) <= new Date() && book?.status === 'OPEN') return true;
           return false;
         })(),
         totalMatched:    book?.totalMatched || 0,
-        runners:         buildOddsPayload(market.runners || [], book, 'horse'),
-        competitionId:   market.competition?.id   || null,
-        competitionName: market.competition?.name || null,
+        runners:         buildOddsPayload(m.runners || [], book, 'horse'),
+        competitionId:   m.competition?.id   || null,
+        competitionName: m.competition?.name || null,
       };
     });
 
-    // ✅ Filter: sirf future + recently started (5 min grace period)
+    // ✅ Filter: sirf window ke andar (future + recently started, 5 min grace)
     const cutoff = new Date(now.getTime() - 5 * 60_000);
-    const filtered = mapped.filter(d => d.startTime && new Date(d.startTime) >= cutoff);
+    const windowEnd = new Date(to);
+    const filtered = mapped.filter(d => {
+      if (!d.startTime) return false;
+      const t = new Date(d.startTime);
+      return t >= cutoff && t <= windowEnd;
+    });
 
     // ✅ Deduplicate: same track + same minute
     const seen = new Set();
@@ -506,82 +510,80 @@ async function getLiveGreyhound(req, res) {
     const from = new Date(now.getTime() - 5 * 60_000).toISOString();
     const to   = new Date(now.getTime() + hoursAhead * 3600_000).toISOString();
 
-    const eventFilter = {
-      eventTypeIds: ['4339'],
-      marketStartTime: { from, to },
-    };
-    if (cfg?.allowed_countries) eventFilter.marketCountries = cfg.allowed_countries.split(',').map(s => s.trim());
+    // ✅ FIX: horse wala hi fix — pehle listEvents() aur
+    // listMarketCatalogue() do alag independent scrapes karte the, jinke
+    // beech bpexch ka page badal jaata to IDs match nahi karte the aur
+    // races silently gir jaati (kabhi 15, kabhi sirf 6). Ab sirf EK scrape.
+    const items = await sportItems('4339');
+    if (!items.length) return sendSuccess(res, []);
+
     // ⚠️ allowed_competition_ids field mein TRACK NAAM hote hain, Betfair
     // competition ID nahi — races ki koi "competition" hoti hi nahi.
-    // Isliye ye seedha Betfair filter mein NAHI jaata; niche events fetch
-    // hone ke baad naam se match karke filter hota hai.
-
-    let events = await listEvents(eventFilter);
-    if (!events.length) return sendSuccess(res, []);
-
-    // ✅ FIX: track-naam se filter karo (getBetfairTracks jaisi hi derivation)
+    let filteredItems = items;
     if (cfg?.allowed_competition_ids) {
       const allowedTracks = new Set(
         cfg.allowed_competition_ids.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
       );
       if (allowedTracks.size > 0) {
-        events = events.filter(e => {
-          const rawName   = e.event?.name || '';
+        filteredItems = filteredItems.filter(m => {
+          const rawName   = m.event?.name || '';
           const trackName = (rawName.split('(')[0] || rawName).trim().toLowerCase();
           return allowedTracks.has(trackName);
         });
       }
     }
-    if (!events.length) return sendSuccess(res, []);
+    if (cfg?.allowed_countries) {
+      const allowedCountries = cfg.allowed_countries.split(',').map(s => s.trim());
+      filteredItems = filteredItems.filter(m => !m.event?.countryCode || allowedCountries.includes(m.event.countryCode));
+    }
+    if (!filteredItems.length) return sendSuccess(res, []);
 
-    const catalogues = await listMarketCatalogue(
-      { eventIds: events.map(e => e.event.id), marketTypeCodes: ['WIN'] },
-      maxResults,
-      ['EVENT', 'RUNNER_METADATA', 'COMPETITION', 'RUNNER_DESCRIPTION', 'MARKET_START_TIME']
-    );
-    logger.info(`[getLiveGreyhound] events=${events.length} catalogues=${catalogues.length}`);
-    if (!catalogues.length) return sendSuccess(res, []);
+    const sliced = filteredItems.slice(0, parseInt(maxResults, 10) || 200);
+    logger.info(`[getLiveGreyhound] items=${items.length} filtered=${filteredItems.length} sliced=${sliced.length}`);
 
     // Books fetch in chunks
     const CHUNK = 200;
-    const allMarketIds = catalogues.map(m => m.marketId);
+    const allMarketIds = sliced.map(m => m.id);
     let allBooks = [];
     for (let i = 0; i < allMarketIds.length; i += CHUNK) {
       const books = await listMarketBook(allMarketIds.slice(i, i + CHUNK)).catch(() => []);
       allBooks = allBooks.concat(books);
     }
 
-    // ✅ Map — marketStartTime use karo (race-specific time)
-    const mapped = catalogues.map(market => {
-      const book  = allBooks.find(b => b.marketId === market.marketId);
-      const event = events.find(e => e.event.id === market.event?.id);
-      const startTime = market.marketStartTime || event?.event.openDate || '';
+    // ✅ Map — market.start use karo (ek hi scrape se aata hai, dobara
+    // event match karne ki zaroorat nahi)
+    const mapped = sliced.map(m => {
+      const book = allBooks.find(b => b.marketId === m.id);
+      const startTime = m.start || m.event?.openDate || '';
 
       return {
-        marketId:        market.marketId,
-        // ✅ FIX: horse wala hi fix — eventId add kiya taake dashboard click
-        // pe seedha evtMap bridge ban jaye, resolve round-trip zaroori na ho.
-        eventId:         market.event?.id || event?.event.id || null,
-        match:           event?.event.name || market.marketName || 'Unknown',
+        marketId:        m.id,
+        eventId:         m.event?.id || null,
+        match:           m.event?.name || m.name || 'Unknown',
         startTime,
         marketStatus:    book?.status || 'UNKNOWN',
-          inPlay:         (() => {
+        inPlay:          (() => {
           if (book?.inPlay === true) return true;
           if (book?.status === 'IN_PLAY') return true;
-          const st = event?.event?.openDate || market?.marketStartTime;
+          const st = m.event?.openDate || startTime;
           if (st && new Date(st) <= new Date() && book?.status === 'OPEN') return true;
           return false;
         })(),
         totalMatched:    book?.totalMatched || 0,
-        runners:         buildOddsPayload(market.runners || [], book, 'greyhound'),
-        competitionId:   market.competition?.id   || null,
-        competitionName: market.competition?.name || null,
+        runners:         buildOddsPayload(m.runners || [], book, 'greyhound'),
+        competitionId:   m.competition?.id   || null,
+        competitionName: m.competition?.name || null,
       };
     });
 
-    // ✅ Filter: sirf future + recently started (5 min grace period)
+    // ✅ Filter: sirf window ke andar (future + recently started, 5 min grace)
     const cutoff = new Date(now.getTime() - 5 * 60_000);
-    const filtered = mapped.filter(d => d.startTime && new Date(d.startTime) >= cutoff);
+    const windowEnd = new Date(to);
+    const filtered = mapped.filter(d => {
+      if (!d.startTime) return false;
+      const t = new Date(d.startTime);
+      return t >= cutoff && t <= windowEnd;
+    });
 
     // ✅ Deduplicate by marketId
     const seen = new Set();
