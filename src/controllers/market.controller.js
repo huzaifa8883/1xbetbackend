@@ -84,6 +84,39 @@ function applyVisibilityFilter(data, sportKey) {
 
 /* ── Helpers ────────────────────────────────────────────── */
 
+/* ── Shared cloth-color helper ──────────────────────────────
+   ✅ BUG FIX: horse race runners pehle sirf ek hi hardcoded red
+   (#E63946) dikhate the aur silk image kabhi nahi aati thi, jabke
+   greyhound trap-colors sahi aate the. Wajah: getMarketCatalog2 (bpexch
+   catalog2 path) mein silkUrl hardcoded null tha aur clothColor sirf
+   raw scraped field pe depend karta tha (horse ke liye wo field khaali
+   hoti hai — real silk sirf photo hoti hai, hex color nahi). Ab
+   position-based fallback color yahan se dono paths (Betfair-metadata
+   wala buildOddsPayload() aur bpexch-scrape wala getMarketCatalog2())
+   use karte hain, taake horse race mein bhi bpexch jaisi alag-alag
+   cloth colors dikhein jab tak real silk image na mil jaye. */
+const RACE_COLORS = [
+  '#E63946','#FFFFFF','#1D3557','#F4D03F','#2ECC71','#111111','#F39C12','#8E44AD',
+  '#16A085','#E74C3C','#3498DB','#F1C40F','#E67E22','#1ABC9C','#95A5A6','#2C3E50',
+  '#C0392B','#7F8C8D','#27AE60','#D35400',
+];
+
+// Standard greyhound trap colors — fixed worldwide (Australia/AU 8-trap format):
+// 1 Red, 2 Blue, 3 White, 4 Black, 5 Orange, 6 Black & White stripes, 7 Green, 8 Pink
+const GREYHOUND_COLORS = [
+  '#E63946', '#1D3557', '#FFFFFF', '#111111', '#F39C12', '#111111', '#2ECC71', '#FF8FB1',
+];
+const GREYHOUND_STRIPED_TRAPS = [6]; // trap number(s) that render as black/white stripes
+
+function resolveClothColor(posNum, isGreyhound) {
+  const n = parseInt(posNum, 10) || 1;
+  const clothColor = isGreyhound
+    ? GREYHOUND_COLORS[(n - 1) % GREYHOUND_COLORS.length]
+    : RACE_COLORS[(n - 1) % RACE_COLORS.length];
+  const isStriped = isGreyhound && GREYHOUND_STRIPED_TRAPS.includes(n);
+  return { clothColor, isStriped };
+}
+
 function buildOddsPayload(runners, books, sportKey = 'horse') {
   return runners.map((runner) => {
     const rb = books?.runners?.find((r) => r.selectionId === runner.selectionId);
@@ -96,33 +129,8 @@ function buildOddsPayload(runners, books, sportKey = 'horse') {
     const sortPriority = runner.sortPriority || null;
     const posNum = parseInt(clothNumber) || parseInt(sortPriority) || 1;
 
-    // Standard racing cloth colors (horse race position-based fallback)
-    const RACE_COLORS = [
-      '#E63946','#FFFFFF','#1D3557','#F4D03F','#2ECC71','#111111','#F39C12','#8E44AD',
-      '#16A085','#E74C3C','#3498DB','#F1C40F','#E67E22','#1ABC9C','#95A5A6','#2C3E50',
-      '#C0392B','#7F8C8D','#27AE60','#D35400',
-    ];
-
-    // Standard greyhound trap colors — fixed worldwide (Australia/AU 8-trap format):
-    // 1 Red, 2 Blue, 3 White, 4 Black, 5 Orange, 6 Black & White stripes, 7 Green, 8 Pink
-    // (greyhounds don't get individual silk images — colors are trap-fixed, not horse-specific)
-    const GREYHOUND_COLORS = [
-      '#E63946', // 1 Red
-      '#1D3557', // 2 Blue
-      '#FFFFFF', // 3 White
-      '#111111', // 4 Black
-      '#F39C12', // 5 Orange
-      '#111111', // 6 Black & White stripes (pattern flag below overrides display)
-      '#2ECC71', // 7 Green
-      '#FF8FB1', // 8 Pink
-    ];
-    const GREYHOUND_STRIPED_TRAPS = [6]; // trap number(s) that render as black/white stripes, not solid
-
     const isGreyhound = sportKey === 'greyhound';
-    const clothColor = isGreyhound
-      ? GREYHOUND_COLORS[(posNum - 1) % GREYHOUND_COLORS.length]
-      : RACE_COLORS[(posNum - 1) % RACE_COLORS.length];
-    const isStriped = isGreyhound && GREYHOUND_STRIPED_TRAPS.includes(posNum);
+    const { clothColor, isStriped } = resolveClothColor(posNum, isGreyhound);
 
     // Silk image URL — Betfair RUNNER_METADATA mein asal field COLOURS_FILENAME_URL hai
     // (SILK_URL naam ki field exist nahi karti — wo purana/galat assumption tha)
@@ -796,8 +804,21 @@ async function getMarketCatalog2(req, res) {
       logger.info(`[catalog2] bpexch hit marketId=${marketId} subs=${(bpx.subMarkets||[]).length} scoreboard=${!!bpx.scoreboard}`);
 
       const isRaceId = /^\d{6,}\.\d+$/.test(String(marketId));
+      const isGreyForColors = ['4339'].includes(String(bpx.eventTypeId)) ||
+        /grey\s*hound/i.test(String(bpx.eventType || ''));
       // If catalog2 runners have no prices, fill from highlights listMarketBook
-      let runnersOut = (bpx.runners || []).map(r => ({
+      let runnersOut = (bpx.runners || []).map((r, idx) => {
+          const posNum = parseInt(r.clothNumber, 10) || parseInt(r.sortPriority, 10) || idx + 1;
+          const { clothColor: fallbackColor, isStriped } = resolveClothColor(posNum, isGreyForColors);
+          // ✅ BUG FIX: silkUrl pehle hardcoded null tha, is liye horse race mein
+          // kabhi bhi asli silk image nahi aati thi (bpexch is field ko 'silk' ya
+          // 'silkUrl' ke naam se bhejta hai — humne padhna hi nahi tha). Greyhound
+          // ke liye silk image nahi hoti (trap color hi hota hai), horse ke liye
+          // real image ho to wahi use karo, warna position-based color fallback.
+          const silkUrl = isGreyForColors
+            ? null
+            : (r.silk || r.silkUrl || r.metadata?.COLOURS_FILENAME_URL || r.coloursFilenameUrl || null);
+          return {
           selectionId:  r.selectionId,
           runnerName:   r.runnerName,
           handicap:     r.handicap || 0,
@@ -811,13 +832,15 @@ async function getMarketCatalog2(req, res) {
           lay1: r.lay1 ?? r.lay?.[0]?.price, ls1: r.ls1 ?? r.lay?.[0]?.size,
           lay2: r.lay2 ?? r.lay?.[1]?.price, ls2: r.ls2 ?? r.lay?.[1]?.size,
           lay3: r.lay3 ?? r.lay?.[2]?.price, ls3: r.ls3 ?? r.lay?.[2]?.size,
-          clothNumber:  r.clothNumber || null,
-          clothColor:   r.silkColor || r.clothColor || null,
-          silkUrl:      null,
+          clothNumber:  r.clothNumber || posNum || null,
+          clothColor:   r.silkColor || r.clothColor || fallbackColor,
+          clothStriped: isStriped,
+          silkUrl,
           jockeyName:   r.jockeyName || null,
           trainerName:  r.trainerName || null,
           metadataDict: r.metadata || null,
-        })).filter(r => {
+        };
+        }).filter(r => {
           const n = String(r.runnerName || '');
           // drop Vue/score template junk that was scraped by mistake
           if (!n || /\{\{|scores\.|v-if|v-for|^\{\s*gs/i.test(n)) return false;
