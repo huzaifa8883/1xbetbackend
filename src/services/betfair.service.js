@@ -1323,7 +1323,8 @@ async function listMarketBook(marketIds = [], priceProjection) {
   const results = [];
   for (const id of marketIds) {
     const key = String(id);
-    const item = lookup.get(key);
+    const norm = (typeof normalizeMarketId === 'function' ? normalizeMarketId(key) : key) || key;
+    const item = lookup.get(key) || lookup.get(norm) || lookup.get(String(norm).replace(/^1\./, 'm_1_'));
     if (item && (item.runners || []).length) {
       results.push({
         marketId: id,
@@ -1404,16 +1405,105 @@ async function getEventDetails(marketId) {
   }
 }
 
-/* ── getRunnerBook (orders.js compatible) ───────────────── */
+/* ── getRunnerBook (orders.js compatible) ─────────────────
+   Order matching needs a live ladder. Prefer listMarketBook, then
+   catalog2, then prices7. Always return a runner shell if selection
+   is known so evaluateMatch can auto-match when ladder is empty.
+──────────────────────────────────────────────────────────── */
 async function getRunnerBook(marketId, selectionId) {
+  const sel = Number(selectionId);
+  const key = String(marketId);
+
+  const pickRunner = (runners) => {
+    if (!Array.isArray(runners)) return null;
+    return runners.find(r => Number(r.selectionId) === sel || String(r.selectionId) === String(selectionId)) || null;
+  };
+
   try {
-    const books = await listMarketBook([marketId]);
-    if (!books?.length) return null;
-    const runner = books[0].runners?.find(r => r.selectionId === Number(selectionId));
-    return runner || null;
+    // 1) listMarketBook (highlights / catalog2)
+    const books = await listMarketBook([key]);
+    if (books?.length) {
+      const r = pickRunner(books[0].runners);
+      if (r) {
+        const backs = r.ex?.availableToBack || [];
+        const lays  = r.ex?.availableToLay  || [];
+        if (backs.length || lays.length) return r;
+        // keep as fallback if nothing better
+      }
+    }
+
+    // 2) catalog2 direct
+    try {
+      const cat = await fetchBpexchCatalog2(key);
+      if (cat && Array.isArray(cat.runners)) {
+        const raw = cat.runners.find(r =>
+          Number(r.selectionId ?? r.id) === sel || String(r.selectionId ?? r.id) === String(selectionId)
+        );
+        if (raw) {
+          const back = (raw.back || []).map(b => ({ price: Number(b.price ?? b), size: Number(b.size) || 0 }));
+          const lay  = (raw.lay  || []).map(l => ({ price: Number(l.price ?? l), size: Number(l.size) || 0 }));
+          // price1 style
+          if (!back.length && (raw.price1 || raw.price2 || raw.price3)) {
+            if (raw.price1) back.push({ price: Number(raw.price1), size: Number(raw.size1) || 0 });
+            if (raw.price2) back.push({ price: Number(raw.price2), size: Number(raw.size2) || 0 });
+            if (raw.price3) back.push({ price: Number(raw.price3), size: Number(raw.size3) || 0 });
+          }
+          if (!lay.length && (raw.lay1 || raw.lay2 || raw.lay3)) {
+            if (raw.lay1) lay.push({ price: Number(raw.lay1), size: Number(raw.ls1) || 0 });
+            if (raw.lay2) lay.push({ price: Number(raw.lay2), size: Number(raw.ls2) || 0 });
+            if (raw.lay3) lay.push({ price: Number(raw.lay3), size: Number(raw.ls3) || 0 });
+          }
+          return {
+            selectionId: sel,
+            status: raw.status || 'ACTIVE',
+            ex: { availableToBack: back, availableToLay: lay },
+          };
+        }
+      }
+    } catch (e) {
+      logger.warn(`[getRunnerBook] catalog2 ${key}: ${e.message}`);
+    }
+
+    // 3) prices7 live book (if token available)
+    try {
+      const token = process.env.PRICES7_TOKEN || '';
+      if (token) {
+        const live = await fetchPrices7MarketData(key, token);
+        const book = live?.marketBooks?.[0];
+        if (book && Array.isArray(book.runners)) {
+          const lr = book.runners.find(r => Number(r.id) === sel || String(r.id) === String(selectionId));
+          if (lr) {
+            const ladder = prices7RunnerToLadder(lr);
+            return {
+              selectionId: sel,
+              status: lr.status || 'ACTIVE',
+              ex: {
+                availableToBack: ladder.back || [],
+                availableToLay:  ladder.lay  || [],
+              },
+            };
+          }
+        }
+      }
+    } catch (e) {
+      logger.warn(`[getRunnerBook] prices7 ${key}: ${e.message}`);
+    }
+
+    // 4) Runner shell — lets evaluateMatch auto-match at taken price
+    logger.info(`[getRunnerBook] shell runner for ${key}/${selectionId}`);
+    return {
+      selectionId: sel,
+      status: 'ACTIVE',
+      ex: { availableToBack: [], availableToLay: [] },
+    };
   } catch (err) {
     logger.warn(`getRunnerBook failed for ${marketId}/${selectionId}: ${err.message}`);
-    return null;
+    // still return shell so bets can match
+    return {
+      selectionId: sel || 0,
+      status: 'ACTIVE',
+      ex: { availableToBack: [], availableToLay: [] },
+    };
   }
 }
 
