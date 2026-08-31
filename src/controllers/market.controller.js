@@ -10,6 +10,7 @@ const {
   getBpexchMarketPage,
   getBpexchEventMarkets,
   resolveMarketIdFromEventId,
+  resolveRealRaceMarketId,
   fetchPrices7MarketData,
   normalizeMarketId,
 } = require('../services/betfair.service');
@@ -652,6 +653,28 @@ async function getMarketData(req, res) {
   if (!String(rawId).includes('.') && !/^[mM]_/.test(String(rawId))) {
     const resolved = await resolveMarketIdFromEventId(String(rawId)).catch(() => null);
     if (resolved) marketId = resolved;
+  }
+
+  // ✅ FIX: composite race id (jaise "36002580.0805") mein bhi ek dot
+  // hota hai, is liye upar wala check ise "already a real marketId"
+  // maan leta tha aur seedha prices7 ko bhej deta tha — jo hamesha
+  // marketBooks: [{ runners: [] }] khaali de deta tha (real Betfair
+  // format "1.xxx" nahi hai). Ab isko bhi verified real marketId mein
+  // resolve karte hain (wahi shared helper jo catalog2 endpoint bhi
+  // use karta hai) — runners/odds ab yahan bhi aayenge.
+  const isRaceComposite = /^\d{6,}\.\d+$/.test(String(marketId));
+  if (isRaceComposite) {
+    try {
+      const { realId } = await resolveRealRaceMarketId(marketId);
+      if (realId) {
+        logger.info(`[marketData] race composite ${marketId} → verified real marketId ${realId}`);
+        marketId = realId;
+      } else {
+        logger.warn(`[marketData] race composite ${marketId} — no verified racing marketId found`);
+      }
+    } catch (e) {
+      logger.warn(`[marketData] race composite resolve failed: ${e.message}`);
+    }
   }
 
   const pricesToken = req.headers['x-prices-token'] || req.query.pricesToken || null;
