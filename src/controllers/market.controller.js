@@ -89,6 +89,20 @@ function applyVisibilityFilter(data, sportKey) {
 
 /* ── Helpers ────────────────────────────────────────────── */
 
+function ensureUtcIso(v) {
+  if (v == null || v === '') return null;
+  if (v instanceof Date) return v.toISOString();
+  const s = String(v).trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
+    if (/[zZ]$/.test(s) || /[+-]\d{2}:?\d{2}$/.test(s)) return s;
+    // strip long fractional then Z
+    return s.replace(/(\.\d{3})\d+/, '$1').replace(/\s/, 'T') + (s.endsWith('Z') ? '' : 'Z');
+  }
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? s : d.toISOString();
+}
+
 function buildOddsPayload(runners, books, sportKey = 'horse') {
   return runners.map((runner) => {
     const rb = books?.runners?.find((r) => r.selectionId === runner.selectionId);
@@ -877,8 +891,8 @@ async function getMarketCatalog2(req, res) {
       return sendSuccess(res, {
         marketId:            bpx.marketId,
         marketName:          bpx.marketName || 'Match Odds',
-        marketStartTime:     bpx.marketStartTime || bpx.marketStartTimeUtc || null,
-        marketStartTimeUtc:  bpx.marketStartTimeUtc || bpx.marketStartTime || null,
+        marketStartTime:     ensureUtcIso(bpx.marketStartTime || bpx.marketStartTimeUtc),
+        marketStartTimeUtc:  ensureUtcIso(bpx.marketStartTimeUtc || bpx.marketStartTime),
         eventTypeId,
         eventType:           sportName,
         eventId:             bpx.eventId,
