@@ -492,11 +492,7 @@ async function getLiveGreyhound(req, res) {
     if (cfg && cfg.is_active === false) return sendSuccess(res, []);
 
     const maxResults = String(cfg?.max_results ?? 200);
-    // ✅ FIX: pehle default 12h tha (horse ka 24h se aadha) — koi khaas
-    // wajah nahi thi is asymmetry ki, sirf inconsistent default. Ab horse
-    // jaisa hi 24h — DB mein cfg.hours_ahead set ho to wahi hamesha priority
-    // lega, ye sirf fallback hai jab row hi na mile.
-    const hoursAhead = cfg?.hours_ahead ?? 24;
+    const hoursAhead = cfg?.hours_ahead ?? 12;
 
     const now  = new Date();
     // ✅ from: 5 min peeche (inplay races cover karne ke liye)
@@ -747,18 +743,6 @@ async function getMarketData(req, res) {
   return sendSuccess(res, { requestId: uuidv4(), marketBooks, news: '' });
 }
 
-// Ek event ke subMarkets list se admin-hidden markets nikaal do — Event.html
-// aur market.html dono isi catalog2 response se subMarkets padhte hain, is
-// liye ye ek jagah filter lagana kaafi hai dono pages ke liye.
-function filterHiddenSubMarkets(list, eventId, eventTypeId) {
-  if (!Array.isArray(list) || !list.length || !eventId) return list || [];
-  const sportKey = sportKeyForEventTypeId(eventTypeId);
-  if (!sportKey) return list;
-  const { markets: hiddenMarkets } = getHiddenSets(sportKey);
-  if (!hiddenMarkets.size) return list;
-  return list.filter(m => !hiddenMarkets.has(`${eventId}:${m.marketId}`));
-}
-
 async function getMarketCatalog2(req, res) {
   const { id: rawId } = req.query;
   if (!rawId) return sendError(res, 'marketId query parameter is required', 400);
@@ -901,7 +885,7 @@ async function getMarketCatalog2(req, res) {
         sport: { name: sportName, image: iconMap[sportName] || 'default.svg', active: true },
         winners:             bpx.winners ?? 1,
         runners: runnersOut,
-        subMarkets: filterHiddenSubMarkets(bpx.subMarkets || [], bpx.eventId, eventTypeId),
+        subMarkets: bpx.subMarkets || [],
         // scoreboard — Vue score prop se directly bind hota hai market.html mein
         // fields: team1, t1_runs, t1_wickets, t1_overs, t1_crr,
         //         team2, t2_runs, t2_wickets, t2_overs, t2_crr,
@@ -1070,8 +1054,7 @@ async function getMarketCatalog2(req, res) {
     }),
     // ✅ subMarkets — mv2.min.js isko read karta hai BookmakerMarkets,
     //    TossMarkets, FancyMarkets etc. populate karne ke liye
-    // ✅ admin panel se jo markets uncheck/hide kiye gaye hain wo yahan se nikal do
-    subMarkets: filterHiddenSubMarkets(subMarkets, eventId, eventTypeId),
+    subMarkets,
     updatedAt: new Date().toISOString(),
   });
 }
