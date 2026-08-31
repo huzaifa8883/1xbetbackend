@@ -2278,4 +2278,9 @@ module.exports = {
   getPrices7Token,
   refreshPrices7TokenFromSession,
   fetchPrices7MarketData,
+  // ✅ Single-scrape entry point — getLiveHorse/getLiveGreyhound ab isi ek
+  // fetch se events + catalogues dono derive karte hain, taake do alag
+  // independent bpexch fetches se IDs mismatch na ho (races silently
+  // gayab hone ka asli bug).
+  sportItems,
 };
