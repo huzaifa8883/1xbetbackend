@@ -76,8 +76,13 @@ function applyVisibilityFilter(data, sportKey) {
   const { events: hiddenEvents, markets: hiddenMarkets } = getHiddenSets(sportKey);
   if (!hiddenEvents.size && !hiddenMarkets.size) return data;
   return data.filter(item => {
-    if (item.eventId && hiddenEvents.has(String(item.eventId))) return false;
-    if (item.eventId && item.marketId && hiddenMarkets.has(`${item.eventId}:${item.marketId}`)) return false;
+    const eid = item.eventId != null ? String(item.eventId) : '';
+    const mid = item.marketId != null ? String(item.marketId) : '';
+    // Racing: eventId === marketId (composite) — hide by either
+    if (eid && hiddenEvents.has(eid)) return false;
+    if (mid && hiddenEvents.has(mid)) return false;
+    if (eid && mid && hiddenMarkets.has(`${eid}:${mid}`)) return false;
+    if (mid && hiddenMarkets.has(mid)) return false;
     return true;
   });
 }
@@ -383,8 +388,8 @@ async function getLiveTennis(req, res) {
 async function getLiveHorse(req, res) {
   try {
     const cfg = await getSportCfg('horse');
-    logger.info(`[getLiveHorse] cfg is_active=${cfg?.is_active} allowed_competition_ids=${cfg?.allowed_competition_ids || ''} allowed_countries=${cfg?.allowed_countries || ''} max_results=${cfg?.max_results} hours_ahead=${cfg?.hours_ahead}`);
-    if (cfg && cfg.is_active === false) return sendSuccess(res, []);
+    logger.info(`[getLiveHorse] cfg is_active=${cfg?.is_active} max_results=${cfg?.max_results} hours_ahead=${cfg?.hours_ahead}`);
+    // is_active ignore for racing — bpexch feed is source of truth
 
     const maxResults = String(cfg?.max_results ?? 200);
     const hoursAhead = cfg?.hours_ahead ?? 24;
@@ -455,13 +460,14 @@ async function getLiveHorse(req, res) {
       };
     });
 
-    // ✅ Filter: sirf window ke andar (future + recently started, 5 min grace)
-    const cutoff = new Date(now.getTime() - 5 * 60_000);
-    const windowEnd = new Date(to);
+    // Soft window: keep races with missing/invalid start; only drop clearly past/far future
+    const cutoff = new Date(now.getTime() - 30 * 60_000);
+    const windowEnd = new Date(now.getTime() + (hoursAhead || 24) * 3600_000);
     const filtered = mapped.filter(d => {
-      if (!d.startTime) return false;
-      const t = new Date(d.startTime);
-      return t >= cutoff && t <= windowEnd;
+      if (!d.startTime) return true;
+      const t = new Date(d.startTime).getTime();
+      if (isNaN(t)) return true;
+      return t >= cutoff.getTime() && t <= windowEnd.getTime();
     });
 
     // ✅ Deduplicate: same track + same minute
@@ -488,8 +494,8 @@ async function getLiveHorse(req, res) {
 async function getLiveGreyhound(req, res) {
   try {
     const cfg = await getSportCfg('greyhound');
-    logger.info(`[getLiveGreyhound] cfg is_active=${cfg?.is_active} allowed_competition_ids=${cfg?.allowed_competition_ids || ''} allowed_countries=${cfg?.allowed_countries || ''} max_results=${cfg?.max_results} hours_ahead=${cfg?.hours_ahead}`);
-    if (cfg && cfg.is_active === false) return sendSuccess(res, []);
+    logger.info(`[getLiveGreyhound] cfg is_active=${cfg?.is_active} max_results=${cfg?.max_results} hours_ahead=${cfg?.hours_ahead}`);
+    // is_active ignore for racing
 
     const maxResults = String(cfg?.max_results ?? 200);
     const hoursAhead = cfg?.hours_ahead ?? 12;
@@ -549,13 +555,14 @@ async function getLiveGreyhound(req, res) {
       };
     });
 
-    // ✅ Filter: sirf window ke andar (future + recently started, 5 min grace)
-    const cutoff = new Date(now.getTime() - 5 * 60_000);
-    const windowEnd = new Date(to);
+    // Soft window: keep races with missing/invalid start; only drop clearly past/far future
+    const cutoff = new Date(now.getTime() - 30 * 60_000);
+    const windowEnd = new Date(now.getTime() + (hoursAhead || 24) * 3600_000);
     const filtered = mapped.filter(d => {
-      if (!d.startTime) return false;
-      const t = new Date(d.startTime);
-      return t >= cutoff && t <= windowEnd;
+      if (!d.startTime) return true;
+      const t = new Date(d.startTime).getTime();
+      if (isNaN(t)) return true;
+      return t >= cutoff.getTime() && t <= windowEnd.getTime();
     });
 
     // ✅ Deduplicate by marketId
