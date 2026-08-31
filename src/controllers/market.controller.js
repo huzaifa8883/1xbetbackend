@@ -492,7 +492,11 @@ async function getLiveGreyhound(req, res) {
     if (cfg && cfg.is_active === false) return sendSuccess(res, []);
 
     const maxResults = String(cfg?.max_results ?? 200);
-    const hoursAhead = cfg?.hours_ahead ?? 12;
+    // ✅ FIX: pehle default 12h tha (horse ka 24h se aadha) — koi khaas
+    // wajah nahi thi is asymmetry ki, sirf inconsistent default. Ab horse
+    // jaisa hi 24h — DB mein cfg.hours_ahead set ho to wahi hamesha priority
+    // lega, ye sirf fallback hai jab row hi na mile.
+    const hoursAhead = cfg?.hours_ahead ?? 24;
 
     const now  = new Date();
     // ✅ from: 5 min peeche (inplay races cover karne ke liye)
