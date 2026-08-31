@@ -425,6 +425,7 @@ async function getLiveHorse(req, res) {
       maxResults,
       ['EVENT', 'RUNNER_METADATA', 'COMPETITION', 'RUNNER_DESCRIPTION', 'MARKET_START_TIME']
     );
+    logger.info(`[getLiveHorse] events=${events.length} catalogues=${catalogues.length}`);
     if (!catalogues.length) return sendSuccess(res, []);
 
     // Books fetch in chunks
@@ -484,6 +485,7 @@ async function getLiveHorse(req, res) {
     // ✅ Sort ascending — nearest race pehle
     deduped.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
 
+    logger.info(`[getLiveHorse] mapped=${mapped.length} filtered=${filtered.length} deduped=${deduped.length}`);
     return sendSuccess(res, applyVisibilityFilter(deduped, 'horse'));
   } catch (err) {
     logger.error(`getLiveHorse error: ${err.message}`);
@@ -537,6 +539,7 @@ async function getLiveGreyhound(req, res) {
       maxResults,
       ['EVENT', 'RUNNER_METADATA', 'COMPETITION', 'RUNNER_DESCRIPTION', 'MARKET_START_TIME']
     );
+    logger.info(`[getLiveGreyhound] events=${events.length} catalogues=${catalogues.length}`);
     if (!catalogues.length) return sendSuccess(res, []);
 
     // Books fetch in chunks
@@ -591,6 +594,7 @@ async function getLiveGreyhound(req, res) {
     // ✅ Sort ascending — nearest race pehle
     deduped.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
 
+    logger.info(`[getLiveGreyhound] mapped=${mapped.length} filtered=${filtered.length} deduped=${deduped.length}`);
     return sendSuccess(res, applyVisibilityFilter(deduped, 'greyhound'));
   } catch (err) {
     logger.error(`getLiveGreyhound error: ${err.message}`);
