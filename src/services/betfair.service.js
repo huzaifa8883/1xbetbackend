@@ -1,3 +1,4 @@
+
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -133,12 +134,6 @@ function resolveFootballId() {
    sports dono isi ek response se aate hain) ───────────────────────── */
 let _highlightsHtmlCache = null;
 let _highlightsHtmlExpiry = 0;
-// ✅ isi tarah HTML fallback ke liye bhi last-known-good rakho (JSON wale
-// jaisa) — dono primary aur fallback source ka apna stale-cache hai taake
-// dono ek saath fail hue tabhi races poori tarah gayab hongi, sirf ek ke
-// hiccup hone se nahi.
-let _lastGoodHighlightsHtml   = null;
-let _lastGoodHighlightsHtmlAt = 0;
 // Chhota TTL rakha hai taake "time ke sath data update" ho — har naya
 // request (cache expire hone ke baad) fresh HTML khींchta hai.
 const HIGHLIGHTS_CACHE_TTL_MS = parseInt(process.env.BPEXCH_HIGHLIGHTS_CACHE_TTL_MS || '4000', 10);
@@ -150,20 +145,10 @@ const HIGHLIGHTS_JSON_TTL_MS = parseInt(process.env.BETWAY_HIGHLIGHTS_CACHE_TTL_
 let _highlightsJsonCache  = null;
 let _highlightsJsonExpiry = 0;
 let _highlightsJsonPromise = null;  // in-flight dedup
-// ✅ "Last known good" — agar fresh fetch fail ho jaye (bpexch ka koi bhi
-// timeout/5xx/network blip), to seedha khaali data dikhane ke bajaye
-// pichli successful response serve karo. Isi ki wajah se pehle races
-// "achanak gayab" ho jaati thi ek hi failed poll pe, phir agli poll pe
-// wapas aa jaati thi — flapping. STALE_MAX_AGE se zyada purana ho to
-// stale bhi discard kar do (galat/purani races dikhane se behtar hai
-// khaali dikhana).
-let _lastGoodHighlightsJson   = null;
-let _lastGoodHighlightsJsonAt = 0;
-const STALE_MAX_AGE_MS = 3 * 60_000; // 3 minute tak stale data chalega
 
 async function fetchMarkethighlightsJson() {
   const url = `${BPEXCH_BASE_URL}/api1/markethighlights`;
-  const doFetch = () => axios.get(url, {
+  const res = await axios.get(url, {
     timeout: TIMEOUT_MS,
     headers: {
       Accept: 'application/json, text/plain, */*',
@@ -174,18 +159,6 @@ async function fetchMarkethighlightsJson() {
     },
     validateStatus: s => s < 500,
   });
-
-  let res;
-  try {
-    res = await doFetch();
-  } catch (err) {
-    // ✅ Ek transient network blip (timeout/ECONNRESET/etc) pe turant fail
-    // mat ho — 300ms baad ek retry try karo. Zyada baar poll cycles mein
-    // ye akela hi kaafi races ko "gayab" hone se bacha deta hai.
-    logger.warn(`[bpexch] markethighlights JSON fetch failed once, retrying: ${err.message}`);
-    await new Promise(r => setTimeout(r, 300));
-    res = await doFetch();
-  }
   if (res.status !== 200 || !res.data) throw new Error(`markethighlights HTTP ${res.status}`);
   return res.data;
 }
@@ -198,24 +171,11 @@ async function getMarkethighlightsJson() {
       _highlightsJsonCache  = data;
       _highlightsJsonExpiry = Date.now() + HIGHLIGHTS_JSON_TTL_MS;
       _highlightsJsonPromise = null;
-      // ✅ successful fetch — ye ab "last known good" ban jaata hai
-      _lastGoodHighlightsJson   = data;
-      _lastGoodHighlightsJsonAt = Date.now();
       logger.info('[bpexch] markethighlights JSON fetched successfully');
       return data;
     })
     .catch(err => {
       _highlightsJsonPromise = null;
-      // ✅ FIX: pehle yahan seedha throw hota tha → getRacingHighlights
-      // khaali [] return kar deta tha → races DOM se poori tarah gayab
-      // ho jaati thi ek hi failed poll pe. Ab agar 3 min ke andar ka
-      // last-known-good data mojood hai, wahi serve karo (stale lekin
-      // sahi) — flapping/blackout dono ruk jayenge, sirf temporarily
-      // thoda purana data dikhega jab tak bpexch recover na ho jaye.
-      if (_lastGoodHighlightsJson && (Date.now() - _lastGoodHighlightsJsonAt) < STALE_MAX_AGE_MS) {
-        logger.warn(`[bpexch] markethighlights JSON fetch failed (${err.message}) — serving stale cache (${Math.round((Date.now() - _lastGoodHighlightsJsonAt)/1000)}s old)`);
-        return _lastGoodHighlightsJson;
-      }
       throw err;
     });
   return _highlightsJsonPromise;
@@ -296,7 +256,7 @@ function normalizeHighlightItem(item) {
 
 async function fetchHighlightsHtml() {
   const url = `${BPEXCH_BASE_URL}/Common/MarketHighlights`;
-  const doFetch = () => axios.get(url, {
+  const res = await axios.get(url, {
     params: { _: Date.now() }, // site khud bhi cache-buster query bhejta hai
     timeout: TIMEOUT_MS,
     headers: {
@@ -304,37 +264,15 @@ async function fetchHighlightsHtml() {
       Accept: 'text/html, */*',
     },
   });
-  try {
-    const res = await doFetch();
-    return typeof res.data === 'string' ? res.data : String(res.data);
-  } catch (err) {
-    // ✅ ek quick retry, JSON path jaisa hi — transient blips ko yahin sok lo
-    logger.warn(`[bpexch] MarketHighlights HTML fetch failed once, retrying: ${err.message}`);
-    await new Promise(r => setTimeout(r, 300));
-    const res = await doFetch();
-    return typeof res.data === 'string' ? res.data : String(res.data);
-  }
+  return typeof res.data === 'string' ? res.data : String(res.data);
 }
 
 async function getHighlightsHtml() {
   if (_highlightsHtmlCache && Date.now() < _highlightsHtmlExpiry) return _highlightsHtmlCache;
-  try {
-    const html = await fetchHighlightsHtml();
-    _highlightsHtmlCache = html;
-    _highlightsHtmlExpiry = Date.now() + HIGHLIGHTS_CACHE_TTL_MS;
-    _lastGoodHighlightsHtml   = html;
-    _lastGoodHighlightsHtmlAt = Date.now();
-    return html;
-  } catch (err) {
-    // ✅ FIX: pehle yahan seedha error propagate ho jata tha → parseRaceItems
-    // ko khaali section milta → races poori tarah gayab. Ab stale (max 3
-    // min purani) HTML se hi parse kar lo jab tak fresh fetch recover na ho.
-    if (_lastGoodHighlightsHtml && (Date.now() - _lastGoodHighlightsHtmlAt) < STALE_MAX_AGE_MS) {
-      logger.warn(`[bpexch] MarketHighlights HTML fetch failed (${err.message}) — serving stale cache (${Math.round((Date.now() - _lastGoodHighlightsHtmlAt)/1000)}s old)`);
-      return _lastGoodHighlightsHtml;
-    }
-    throw err;
-  }
+  const html = await fetchHighlightsHtml();
+  _highlightsHtmlCache = html;
+  _highlightsHtmlExpiry = Date.now() + HIGHLIGHTS_CACHE_TTL_MS;
+  return html;
 }
 
 function sliceBetweenMarkers(html, startMarker, endMarker) {
@@ -386,12 +324,13 @@ function parseRaceItems(sectionHtml, eventTypeId) {
     seen.add(id);
     const venue = String(venueRaw || 'Race').replace(/\s+/g, ' ').trim();
     const startIso = normalizeRaceStart(startRaw) || null;
-    // Soft filter: drop only clearly ancient (>48h past) or far future (>72h)
     if (startIso) {
       const t = new Date(startIso).getTime();
       const now = Date.now();
-      if (t < now - 48 * 3600 * 1000) return;
-      if (t > now + 72 * 3600 * 1000) return;
+      if (!isNaN(t)) {
+        if (t < now - 72 * 3600 * 1000) return;
+        if (t > now + 96 * 3600 * 1000) return;
+      }
     }
     items.push({
       id,
@@ -629,41 +568,46 @@ function sanitizeRaceRunner(r, index) {
 
 
 async function getRacingHighlights(eventTypeId) {
-  // PRIMARY: try markethighlights JSON (may include racing sections)
-  try {
-    const jsonItems = await getSportsHighlightsFromJson(eventTypeId);
-    if (jsonItems !== null && jsonItems.length > 0) return jsonItems;
-  } catch(e) { /* fall through */ }
-
-  // FALLBACK: HTML scraping (always worked for racing)
   const html = await getHighlightsHtml();
   let horseSection     = sliceBetweenMarkers(html, 'Horse Race', 'Grey Hound');
   let greyhoundSection = sliceBetweenMarkers(html, 'Grey Hound', 'TABS SYSTEM');
-  // Marker text sometimes differs (Greyhound / Grey Hound / HORSE RACING)
-  if (!horseSection || horseSection.length < 50) {
-    horseSection = sliceBetweenMarkers(html, 'Horse', 'Grey') || horseSection;
+  if (!horseSection || horseSection.length < 80) {
+    horseSection = sliceBetweenMarkers(html, 'Horse Racing', 'Grey')
+      || sliceBetweenMarkers(html, 'Horse', 'Grey')
+      || horseSection;
   }
-  if (!greyhoundSection || greyhoundSection.length < 50) {
-    greyhoundSection = sliceBetweenMarkers(html, 'Grey', 'TAB') || greyhoundSection;
+  if (!greyhoundSection || greyhoundSection.length < 80) {
+    greyhoundSection = sliceBetweenMarkers(html, 'Greyhound', 'TAB')
+      || sliceBetweenMarkers(html, 'Grey Hound', 'TAB')
+      || sliceBetweenMarkers(html, 'Grey', 'TAB')
+      || greyhoundSection;
   }
-  // Absolute fallback: whole HTML
-  if ((!horseSection || horseSection.length < 50) && (!greyhoundSection || greyhoundSection.length < 50)) {
-    logger.warn(`[bpexch] racing section markers missing htmlLen=${(html||'').length} — parse full page`);
-    horseSection = html || '';
-    greyhoundSection = html || '';
-  }
-  logger.info(`[bpexch] racing sections horseLen=${(horseSection||'').length} greyLen=${(greyhoundSection||'').length}`);
+  // Always also parse full page for composite race links (section markers often break)
+  const full = html || '';
+  if (!horseSection || horseSection.length < 80) horseSection = full;
+  if (!greyhoundSection || greyhoundSection.length < 80) greyhoundSection = full;
+  logger.info(`[bpexch] racing sections horseLen=${(horseSection||'').length} greyLen=${(greyhoundSection||'').length} htmlLen=${full.length}`);
 
   if (eventTypeId != null) {
-    if (isHorseRacingEventType(eventTypeId)) return parseRaceItems(horseSection, eventTypeId);
-    if (isGreyhoundEventType(eventTypeId))   return parseRaceItems(greyhoundSection, eventTypeId);
+    if (isHorseRacingEventType(eventTypeId)) {
+      const a = parseRaceItems(horseSection, eventTypeId);
+      const b2 = a.length ? a : parseRaceItems(full, eventTypeId);
+      return b2;
+    }
+    if (isGreyhoundEventType(eventTypeId)) {
+      const a = parseRaceItems(greyhoundSection, eventTypeId);
+      const b2 = a.length ? a : parseRaceItems(full, eventTypeId);
+      return b2;
+    }
     return [];
   }
-
-  return [
-    ...parseRaceItems(horseSection,     resolveHorseRacingId()),
-    ...parseRaceItems(greyhoundSection, resolveGreyhoundId()),
-  ];
+  // both sports
+  let horse = parseRaceItems(horseSection, resolveHorseRacingId());
+  let grey = parseRaceItems(greyhoundSection, resolveGreyhoundId());
+  if (!horse.length) horse = parseRaceItems(full, resolveHorseRacingId());
+  if (!grey.length) grey = parseRaceItems(full, resolveGreyhoundId());
+  // If both used full page, ids may overlap — keep assignment by section when possible
+  return [...horse, ...grey];
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1209,9 +1153,11 @@ async function listEvents(filter = {}) {
     const startMs = m.start != null ? new Date(m.start).getTime() : NaN;
 
     if (!isMatchOddsSport) {
-      // Racing: strict window
-      if (fromMs !== null && !isNaN(startMs) && startMs < fromMs) { droppedTime++; return; }
-      if (toMs   !== null && !isNaN(startMs) && startMs > toMs)   { droppedTime++; return; }
+      // Racing: soft window — keep if start missing; widen by 2h/6h
+      if (!isNaN(startMs)) {
+        if (fromMs !== null && startMs < fromMs - 2 * 3600 * 1000) { droppedTime++; return; }
+        if (toMs   !== null && startMs > toMs + 6 * 3600 * 1000)   { droppedTime++; return; }
+      }
     }
     // Match-odds: NO time filter — bpexch highlights already curated.
     // (previous wide-window still dropped some edge cases)
