@@ -1893,29 +1893,48 @@ function categorizeSubMarket(c) {
 async function getBpexchMarketPage(marketId, pricesToken) {
   const normalizedId = normalizeMarketId(marketId);
 
-  // Composite race ids: 35965023.2207 (not Betfair 1.xxx) — scrape Event page
+  // ✅ FIX: Composite race ids (jaise "36002580.0607") bpexch ke apne
+  // eventId.raceNumber navigation-id hain — REAL marketId nahi. Real
+  // Betfair-style marketId ("1.xxxxxxxxx") event page ke andar embedded
+  // hota hai, jaisa browser DevTools se confirm hua (prices7/Data call
+  // asal mein "1.261686353" jaisi ID use kar rahi thi, composite ID
+  // nahi). Pehle discoverMarketIdsFromEventPage() se real ID nikaalte
+  // hain, phir NORMAL catalog2+prices7 flow use karte hain — wahi jo
+  // baaki sports (cricket/tennis/football) ke liye already proven kaam
+  // kar raha hai. Purana scrapeBpexchRaceEventPage() (fragile HTML
+  // guessing) sirf last-resort fallback ke tor pe rakha hai.
   const isRaceComposite = /^\d{6,}\.\d+$/.test(String(normalizedId));
+  let resolvedId = normalizedId;
   if (isRaceComposite) {
-    const racePage = await scrapeBpexchRaceEventPage(normalizedId);
-    if (racePage) return racePage;
+    const compositeEventId = String(normalizedId).split('.')[0];
+    const discovered = await discoverMarketIdsFromEventPage(compositeEventId);
+    const realId = discovered.find(id => id.startsWith('1.')) || discovered[0] || null;
+    if (realId) {
+      logger.info(`[bpexch] race composite ${normalizedId} → real marketId ${realId}`);
+      resolvedId = realId;
+    } else {
+      logger.warn(`[bpexch] race composite ${normalizedId} — no real marketId found on event page, falling back to HTML scrape`);
+      const racePage = await scrapeBpexchRaceEventPage(normalizedId);
+      if (racePage) return racePage;
+      return null;
+    }
   }
 
   // ── 1) catalog2 structure ──
-  const main = await fetchBpexchCatalog2(normalizedId);
+  const main = await fetchBpexchCatalog2(resolvedId);
   if (!main) {
-    if (isRaceComposite) return null;
     return null;
   }
 
   // ── 2) prices7 live books (source of odds + related market ids) ──
-  const live = await fetchPrices7MarketData(normalizedId, pricesToken);
+  const live = await fetchPrices7MarketData(resolvedId, pricesToken);
   const books = Array.isArray(live?.marketBooks) ? live.marketBooks : [];
   const bookById = new Map(books.map(b => [String(b.id), b]));
 
   // Related market ids = every book except root Match Odds
   let subIds = books
     .map(b => String(b.id))
-    .filter(id => id && id !== String(normalizedId));
+    .filter(id => id && id !== String(resolvedId));
 
   // Also keep any explicit related ids from catalog2
   if (Array.isArray(main.relatedMarketIds)) {
@@ -1976,7 +1995,7 @@ async function getBpexchMarketPage(marketId, pricesToken) {
   if (!rootHasOdds) {
     try {
       const lookup = await getMatchOddsLookup();
-      const hi = lookup.get(String(normalizedId));
+      const hi = lookup.get(String(resolvedId));
       if (hi?.runners?.length) {
         mainEnriched = {
           ...mainEnriched,
@@ -2012,7 +2031,7 @@ async function getBpexchMarketPage(marketId, pricesToken) {
 
   for (const cat of subCatalogs) {
     const mid = String(cat.marketId);
-    if (mid === String(normalizedId) || seen.has(mid)) continue;
+    if (mid === String(resolvedId) || seen.has(mid)) continue;
     if (eventIdStr && cat.eventId != null && String(cat.eventId) !== eventIdStr) continue;
     seen.add(mid);
     const enriched = mergeBookOntoCatalog(cat);
@@ -2024,7 +2043,7 @@ async function getBpexchMarketPage(marketId, pricesToken) {
   // markets that appear only in prices7 books (no catalog yet) — still expose with synthetic names
   for (const mb of books) {
     const mid = String(mb.id);
-    if (mid === String(normalizedId) || seen.has(mid)) continue;
+    if (mid === String(resolvedId) || seen.has(mid)) continue;
     seen.add(mid);
     const runners = (mb.runners || []).map((lr, i) => {
       const ladder = prices7RunnerToLadder(lr);
@@ -2053,10 +2072,11 @@ async function getBpexchMarketPage(marketId, pricesToken) {
     });
   }
 
-  logger.info(`[bpexch] marketPage ${normalizedId} books=${books.length} subs=${subMarkets.length} scoreboard=${!!live?.scoreboard}`);
+  logger.info(`[bpexch] marketPage ${normalizedId}${resolvedId !== normalizedId ? ` (resolved→${resolvedId})` : ''} books=${books.length} subs=${subMarkets.length} scoreboard=${!!live?.scoreboard}`);
 
   return {
     ...mainEnriched,
+    marketId: mainEnriched.marketId || resolvedId,
     eventId,
     eventName: main.eventName || main.event?.name,
     eventTypeId: String(main.eventTypeId || main.sport?.id || ''),
