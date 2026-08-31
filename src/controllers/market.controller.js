@@ -383,6 +383,7 @@ async function getLiveTennis(req, res) {
 async function getLiveHorse(req, res) {
   try {
     const cfg = await getSportCfg('horse');
+    logger.info(`[getLiveHorse] cfg is_active=${cfg?.is_active} allowed_competition_ids=${cfg?.allowed_competition_ids || ''} allowed_countries=${cfg?.allowed_countries || ''} max_results=${cfg?.max_results} hours_ahead=${cfg?.hours_ahead}`);
     if (cfg && cfg.is_active === false) return sendSuccess(res, []);
 
     const maxResults = String(cfg?.max_results ?? 200);
@@ -500,6 +501,7 @@ async function getLiveHorse(req, res) {
 async function getLiveGreyhound(req, res) {
   try {
     const cfg = await getSportCfg('greyhound');
+    logger.info(`[getLiveGreyhound] cfg is_active=${cfg?.is_active} allowed_competition_ids=${cfg?.allowed_competition_ids || ''} allowed_countries=${cfg?.allowed_countries || ''} max_results=${cfg?.max_results} hours_ahead=${cfg?.hours_ahead}`);
     if (cfg && cfg.is_active === false) return sendSuccess(res, []);
 
     const maxResults = String(cfg?.max_results ?? 200);
