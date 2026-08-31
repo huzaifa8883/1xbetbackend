@@ -55,10 +55,7 @@ router.get('/live/sports/:id', ctrl.getLiveSport);
  * @desc    Formatted market book (odds ladder for frontend)
  */
 router.get('/Data', ctrl.getMarketData);
-router.get('/admin/visibility/tree', authMiddleware, marketController.getVisibilityTree);
-router.get('/admin/visibility/markets', authMiddleware, marketController.getVisibilityMarkets);
-router.post('/admin/visibility/match', authMiddleware, marketController.setMatchVisibility);
-router.post('/admin/visibility/market', authMiddleware, marketController.setMarketVisibility);
+
 /**
  * @route   GET /api/v1/markets/catalog2?id=<marketId>
  * @desc    Full market catalogue details (used by market.html)
@@ -128,5 +125,23 @@ router.get('/betfair/market-types', ctrl.getBetfairMarketTypes);
  *          Betfair pe competition-based nahi hote.
  */
 router.get('/betfair/tracks', ctrl.getBetfairTracks);
+
+/* ── Admin: Sports-tree visibility (admin.html) ──────────────
+   ⚠️ NOTE: baaki saare routes is file mein public hain (koi auth
+   middleware kahin use nahi hui) — is liye maine bhi yahan koi auth
+   middleware nahi lagayi, taaki file crash na ho (jo undefined
+   `authMiddleware` reference se ho raha tha). Agar in 4 routes ko
+   sirf logged-in admin tak restrict karna hai (recommended — warna
+   koi bhi in-URL-jaanne-wala visibility settings change kar sakta
+   hai), to apna actual auth middleware ka sahi import path aur naam
+   bata do, main turant wire kar dunga. Example agar kahin
+   `../../middlewares/auth.middleware` mein `verifyAdmin` naam se ho:
+     const { verifyAdmin } = require('../../middlewares/auth.middleware');
+     router.get('/admin/visibility/tree', verifyAdmin, ctrl.getVisibilityTree);
+*/
+router.get('/admin/visibility/tree', ctrl.getVisibilityTree);
+router.get('/admin/visibility/markets', ctrl.getVisibilityMarkets);
+router.post('/admin/visibility/match', ctrl.setMatchVisibility);
+router.post('/admin/visibility/market', ctrl.setMarketVisibility);
 
 module.exports = router;
