@@ -1772,22 +1772,33 @@ async function discoverMarketIdsFromEventPage(eventId) {
       validateStatus: s => s < 500,
     });
     const html = typeof res.data === 'string' ? res.data : '';
-    const ids = new Set();
+    // ✅ FIX: pehle sirf CONTEXT-LABELED IDs (marketId=/MarketId:/query
+    // param/JSON key ke sath) — ye pura page ke andar kisi UNRELATED
+    // widget (jaise sidebar "Trending Matches") ke IDs ke sath confuse
+    // hone ka risk kam karta hai. Loose bare "1.xxx kahin bhi" pattern
+    // ab sirf LAST RESORT hai, aur sirf tab try hota hai jab labeled
+    // patterns kuch na dein.
+    const labeled = new Set();
     let m;
-    // marketId / MarketId / data-market-id
     const re = /(?:marketId|MarketId|data-market(?:-id)?|market_id)["'\s:=]+([19]\.\d{5,})/gi;
-    while ((m = re.exec(html)) !== null) ids.add(m[1]);
-    // query string
+    while ((m = re.exec(html)) !== null) labeled.add(m[1]);
     const re2 = /[?&]id=([19]\.\d{5,})/g;
-    while ((m = re2.exec(html)) !== null) ids.add(m[1]);
-    // bare 1.xxx / 9.xxx (Betfair + bookmaker/fancy)
-    const re3 = /\b([19]\.\d{6,})\b/g;
-    while ((m = re3.exec(html)) !== null) ids.add(m[1]);
-    // Vue/JSON blobs: "marketId":"9.123"
+    while ((m = re2.exec(html)) !== null) labeled.add(m[1]);
     const re4 = /"marketId"\s*:\s*"([19]\.[0-9]+)"/g;
-    while ((m = re4.exec(html)) !== null) ids.add(m[1]);
-    logger.info(`[bpexch] event page ${eventId} discovered ${ids.size} market ids`);
-    return [...ids];
+    while ((m = re4.exec(html)) !== null) labeled.add(m[1]);
+
+    if (labeled.size) {
+      logger.info(`[bpexch] event page ${eventId} discovered ${labeled.size} labeled market ids`);
+      return [...labeled];
+    }
+
+    // Last resort — loose, no context. Risky (can pick up unrelated
+    // sidebar/widget ids), so caller MUST validate before trusting this.
+    const loose = new Set();
+    const re3 = /\b([19]\.\d{6,})\b/g;
+    while ((m = re3.exec(html)) !== null) loose.add(m[1]);
+    logger.warn(`[bpexch] event page ${eventId} — no labeled ids, falling back to ${loose.size} loose ids (unverified)`);
+    return [...loose];
   } catch (err) {
     logger.warn(`[bpexch] event page scrape failed: ${err.message}`);
     return [];
@@ -1905,15 +1916,38 @@ async function getBpexchMarketPage(marketId, pricesToken) {
   // guessing) sirf last-resort fallback ke tor pe rakha hai.
   const isRaceComposite = /^\d{6,}\.\d+$/.test(String(normalizedId));
   let resolvedId = normalizedId;
+  let mainFromProbe = null;
   if (isRaceComposite) {
     const compositeEventId = String(normalizedId).split('.')[0];
     const discovered = await discoverMarketIdsFromEventPage(compositeEventId);
-    const realId = discovered.find(id => id.startsWith('1.')) || discovered[0] || null;
+    // ✅ FIX: candidate ID milne ke baad bhi USE se pehle VERIFY karo ke
+    // wo wakai racing (Horse=7 / Greyhound=4339) ka market hai — warna
+    // agar page pe koi unrelated widget ka ID scrape ho gaya ho (jaise
+    // Cricket), to galat sport ka data event page pe dikhne se bachega.
+    const candidates = [
+      ...discovered.filter(id => id.startsWith('1.')),
+      ...discovered.filter(id => !id.startsWith('1.')),
+    ];
+    let realId = null;
+    for (const cand of candidates) {
+      try {
+        const probe = await fetchBpexchCatalog2(cand);
+        const probeType = String(probe?.eventTypeId || probe?.sport?.id || '');
+        if (probe && ['7', '4339'].includes(probeType)) {
+          realId = cand;
+          mainFromProbe = probe;
+          break;
+        }
+        if (probe) {
+          logger.warn(`[bpexch] race composite ${normalizedId} — candidate ${cand} rejected, wrong sport (eventTypeId=${probeType})`);
+        }
+      } catch (_) { /* try next candidate */ }
+    }
     if (realId) {
-      logger.info(`[bpexch] race composite ${normalizedId} → real marketId ${realId}`);
+      logger.info(`[bpexch] race composite ${normalizedId} → verified real marketId ${realId}`);
       resolvedId = realId;
     } else {
-      logger.warn(`[bpexch] race composite ${normalizedId} — no real marketId found on event page, falling back to HTML scrape`);
+      logger.warn(`[bpexch] race composite ${normalizedId} — no verified racing marketId found, falling back to HTML scrape`);
       const racePage = await scrapeBpexchRaceEventPage(normalizedId);
       if (racePage) return racePage;
       return null;
@@ -1921,7 +1955,7 @@ async function getBpexchMarketPage(marketId, pricesToken) {
   }
 
   // ── 1) catalog2 structure ──
-  const main = await fetchBpexchCatalog2(resolvedId);
+  const main = mainFromProbe || await fetchBpexchCatalog2(resolvedId);
   if (!main) {
     return null;
   }
