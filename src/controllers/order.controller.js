@@ -1,3 +1,4 @@
+
 'use strict';
 
 const { sequelize } = require('../config/database');
@@ -158,44 +159,60 @@ async function placeBets(req, res) {
     }
   });
 
-  Promise.all(matchTasks)
-    .then(() => recalculateLiability(userId))
-    .catch(e => logger.error(`Post-bet recalc failed: ${e.message}`));
+  // Wait for immediate match so response has MATCHED status (not stale PENDING)
+  try {
+    await Promise.all(matchTasks);
+  } catch (e) {
+    logger.error(`Post-bet match failed: ${e.message}`);
+  }
 
   const pairs = [...new Map(normalized.map(o => [`${o.market_id}_${o.selection_id}`, o])).values()];
-  pairs.forEach(({ market_id, selection_id }) => {
-    autoMatchPendingBets(market_id, selection_id).catch(() => {});
-  });
+  await Promise.all(pairs.map(({ market_id, selection_id }) =>
+    autoMatchPendingBets(market_id, selection_id).catch(() => {})
+  ));
 
-  const preliminaryWallet = Math.max(0, walletBalance - thisLiability);
-  const preliminaryLiable = (parseFloat(user.liable) || 0) + thisLiability;
+  try { await recalculateLiability(userId); } catch (e) {
+    logger.error(`Post-bet recalc failed: ${e.message}`);
+  }
+
+  // Reload orders from DB so status/matched are fresh after evaluateMatch
+  const freshIds = created.map(o => o.request_id);
+  const freshRows = await Order.findAll({ where: { request_id: freshIds } });
+  const byReq = new Map(freshRows.map(o => [String(o.request_id), o]));
+
+  const userFresh = await User.findByPk(userId);
+  const preliminaryWallet = parseFloat(userFresh?.wallet_balance) || Math.max(0, walletBalance - thisLiability);
+  const preliminaryLiable = parseFloat(userFresh?.liable) || (parseFloat(user.liable) || 0) + thisLiability;
 
   const betsWithPnL = created.map(o => {
-    const price  = parseFloat(o.price);
-    const size   = parseFloat(o.size);
-    const profit = o.side === BET_SIDE.BACK
+    const live = byReq.get(String(o.request_id)) || o;
+    const price  = parseFloat(live.price);
+    const size   = parseFloat(live.matched > 0 ? live.matched : live.size);
+    const profit = live.side === BET_SIDE.BACK
       ? parseFloat(((price - 1) * size).toFixed(2))
       : parseFloat(size.toFixed(2));
-    const liable = o.side === BET_SIDE.BACK
+    const liable = live.side === BET_SIDE.BACK
       ? parseFloat(size.toFixed(2))
       : parseFloat(((price - 1) * size).toFixed(2));
     return {
-      ...o.toJSON(),
+      ...live.toJSON(),
       profit,
       liable,
-      runnerName: o.runner_name || '',
+      runnerName: live.runner_name || '',
     };
   });
 
   if (global.io) {
-    global.io.to(`match_${normalized[0]?.market_id}`).emit('ordersUpdated', {
+    const payload = {
       userId,
       newOrders: betsWithPnL.map(o => ({
         ...o,
         status: o.status || ORDER_STATUS.PENDING,
-        runnerName: o.runner_name || '',
+        runnerName: o.runnerName || o.runner_name || '',
       })),
-    });
+    };
+    global.io.to(`match_${normalized[0]?.market_id}`).emit('ordersUpdated', payload);
+    global.io.to(`user_${userId}`).emit('ordersUpdated', payload);
   }
 
   return sendSuccess(res, {
