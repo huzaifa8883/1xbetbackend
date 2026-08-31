@@ -1,4 +1,3 @@
-
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -324,14 +323,12 @@ function parseRaceItems(sectionHtml, eventTypeId) {
     seen.add(id);
     const venue = String(venueRaw || 'Race').replace(/\s+/g, ' ').trim();
     const startIso = normalizeRaceStart(startRaw) || null;
-    // Soft filter only if we have a valid start — keep missing times
+    // Soft filter: drop only clearly ancient (>48h past) or far future (>72h)
     if (startIso) {
       const t = new Date(startIso).getTime();
       const now = Date.now();
-      if (!isNaN(t)) {
-        if (t < now - 72 * 3600 * 1000) return;
-        if (t > now + 96 * 3600 * 1000) return;
-      }
+      if (t < now - 48 * 3600 * 1000) return;
+      if (t > now + 72 * 3600 * 1000) return;
     }
     items.push({
       id,
@@ -386,13 +383,14 @@ async function scrapeBpexchRaceEventPage(raceId) {
   if (!id) return null;
   await ensureBpexchSession();
 
-  // 1) catalog2
+  // 1) Prefer catalog2 (real runner names + cloth/jockey when available)
   try {
     const cat = await fetchBpexchCatalog2(id);
     if (cat && Array.isArray(cat.runners) && cat.runners.length) {
-      const clean = cat.runners.map((r, i) => sanitizeRaceRunner(r, i)).filter(Boolean);
+      const clean = cat.runners
+        .map((r, i) => sanitizeRaceRunner(r, i))
+        .filter(Boolean);
       if (clean.length) {
-        const et = String(cat.eventTypeId || cat.sport?.id || '7');
         logger.info(`[bpexch] race ${id} catalog2 runners=${clean.length}`);
         return {
           ...cat,
@@ -400,11 +398,10 @@ async function scrapeBpexchRaceEventPage(raceId) {
           marketName: cat.marketName || 'Win',
           marketType: cat.marketType || 'WIN',
           eventId: id,
-          eventName: cat.eventName || cat.event?.name || cat.marketName || 'Race',
-          eventTypeId: et,
-          eventType: cat.eventType || cat.sport?.name || (et === '4339' ? 'Greyhound Racing' : 'Horse Racing'),
+          eventName: cat.eventName || cat.event?.name || cat.marketName,
+          eventTypeId: String(cat.eventTypeId || cat.sport?.id || '7'),
+          eventType: cat.eventType || cat.sport?.name || 'Horse Racing',
           marketStartTime: cat.marketStartTime || cat.marketStartTimeUtc,
-          marketStartTimeUtc: cat.marketStartTimeUtc || cat.marketStartTime,
           runners: clean,
           subMarkets: [],
           source: 'bpexch-catalog2',
@@ -415,45 +412,7 @@ async function scrapeBpexchRaceEventPage(raceId) {
     logger.warn(`[bpexch] race catalog2 ${id}: ${e.message}`);
   }
 
-  // 2) prices7
-  try {
-    const live = await fetchPrices7MarketData(id, null);
-    const book = (live?.marketBooks || []).find(b => String(b.id) === String(id))
-      || (live?.marketBooks || [])[0];
-    if (book && Array.isArray(book.runners) && book.runners.length) {
-      const runners = book.runners.map((lr, i) => {
-        const ladder = prices7RunnerToLadder(lr);
-        return sanitizeRaceRunner({
-          selectionId: Number(lr.id) || i + 1,
-          runnerName: lr.name || lr.runnerName || `Runner ${i + 1}`,
-          status: ladder.status,
-          back: ladder.back,
-          lay: ladder.lay,
-          clothNumber: lr.clothNumber || String(i + 1),
-        }, i);
-      }).filter(Boolean);
-      if (runners.length) {
-        logger.info(`[bpexch] race ${id} prices7 runners=${runners.length}`);
-        return {
-          marketId: id,
-          marketName: 'Win',
-          marketType: 'WIN',
-          eventId: id,
-          eventName: 'Race',
-          eventTypeId: '7',
-          eventType: 'Horse Racing',
-          status: book.marketStatus || 'OPEN',
-          runners,
-          subMarkets: [],
-          source: 'prices7-race',
-        };
-      }
-    }
-  } catch (e) {
-    logger.warn(`[bpexch] race prices7 ${id}: ${e.message}`);
-  }
-
-  // 3) HTML Event page
+  // 2) Scrape Event HTML for runner list (strict name filter — no Vue/score junk)
   const urls = [
     `${BPEXCH_BASE_URL}/Common/Event/${encodeURIComponent(id)}`,
     `${BPEXCH_BASE_URL}/Common/Event?id=${encodeURIComponent(id)}`,
@@ -472,19 +431,9 @@ async function scrapeBpexchRaceEventPage(raceId) {
         _bpexchCookie = mergeSetCookie(_bpexchCookie, res.headers['set-cookie']);
       }
 
-      const scriptJsonChunks = [];
-      const scriptRe = /<script[^>]*>([\s\S]*?)<\/script>/gi;
-      let sm;
-      while ((sm = scriptRe.exec(html)) !== null) {
-        const body = sm[1];
-        if (body.includes('runnerName') || body.includes('selectionId') || body.includes('Runners')) {
-          scriptJsonChunks.push(body);
-        }
-      }
-
       let eventName = null;
-      const titleM = html.match(/<h[12][^>]*>\s*([^<]{3,120})\s*<\/h[12]>/i)
-        || html.match(/class="[^"]*(?:event-name|race-name|market-title|raceName)[^"]*"[^>]*>\s*([^<]{3,120})/i);
+      const titleM = html.match(/<h[12][^>]*>\s*([^<]{3,100})\s*<\/h[12]>/i)
+        || html.match(/class="[^"]*(?:event-name|race-name|market-title)[^"]*"[^>]*>\s*([^<]{3,100})/i);
       if (titleM) eventName = titleM[1].replace(/\s+/g, ' ').trim();
 
       let startIso = null;
@@ -494,71 +443,70 @@ async function scrapeBpexchRaceEventPage(raceId) {
 
       const runners = [];
       const seen = new Set();
-      const pushR = (obj, i) => {
-        const r = sanitizeRaceRunner(obj, i);
-        if (!r) return;
-        const key = String(r.selectionId) + '|' + r.runnerName.toLowerCase();
-        if (seen.has(key)) return;
-        seen.add(key);
+
+      // JSON: "runnerName":"Dog Name" / "selectionId":123
+      const pairRe = /\{\s*"selectionId"\s*:\s*(\d+)[\s\S]{0,400}?"runnerName"\s*:\s*"([^"]{2,80})"/gi;
+      let pm;
+      while ((pm = pairRe.exec(html)) !== null) {
+        const r = sanitizeRaceRunner({
+          selectionId: Number(pm[1]),
+          runnerName: pm[2],
+        }, runners.length);
+        if (!r || seen.has(r.selectionId)) continue;
+        seen.add(r.selectionId);
         runners.push(r);
-      };
-
-      const blobs = [html, ...scriptJsonChunks];
-      for (const blob of blobs) {
-        const pairRe = /"selectionId"\s*:\s*(\d+)[\s\S]{0,500}?"runnerName"\s*:\s*"([^"\\]{2,80})"/gi;
-        let pm;
-        while ((pm = pairRe.exec(blob)) !== null) {
-          pushR({ selectionId: Number(pm[1]), runnerName: pm[2] }, runners.length);
-        }
-        const pairRe2 = /"runnerName"\s*:\s*"([^"\\]{2,80})"[\s\S]{0,500}?"selectionId"\s*:\s*(\d+)/gi;
-        while ((pm = pairRe2.exec(blob)) !== null) {
-          pushR({ selectionId: Number(pm[2]), runnerName: pm[1] }, runners.length);
+      }
+      // reverse order fields
+      if (!runners.length) {
+        const pairRe2 = /\{\s*"runnerName"\s*:\s*"([^"]{2,80})"[\s\S]{0,400}?"selectionId"\s*:\s*(\d+)/gi;
+        while ((pm = pairRe2.exec(html)) !== null) {
+          const r = sanitizeRaceRunner({
+            selectionId: Number(pm[2]),
+            runnerName: pm[1],
+          }, runners.length);
+          if (!r || seen.has(r.selectionId)) continue;
+          seen.add(r.selectionId);
+          runners.push(r);
         }
       }
 
-      if (runners.length < 2) {
-        const nameRe = /class="[^"]*runner-name[^"]*"[^>]*>\s*(?:<[^>]+>\s*)*([^<]{2,50})/gi;
-        let nm, idx = 0;
-        while ((nm = nameRe.exec(html)) !== null && runners.length < 30) {
-          pushR({ selectionId: ++idx, clothNumber: String(idx), runnerName: nm[1] }, runners.length);
+      // data-runner-name / cloth attributes
+      if (!runners.length) {
+        const attrRe = /data-(?:runner-?name|name)=["']([^"']{2,60})["'][^>]*(?:data-(?:selection|id)=["'](\d+)["'])?/gi;
+        while ((pm = attrRe.exec(html)) !== null) {
+          const r = sanitizeRaceRunner({
+            selectionId: pm[2] ? Number(pm[2]) : runners.length + 1,
+            runnerName: pm[1],
+          }, runners.length);
+          if (!r || seen.has(r.runnerName.toLowerCase())) continue;
+          seen.add(r.runnerName.toLowerCase());
+          runners.push(r);
         }
       }
 
-      if (runners.length < 2) {
-        const lineRe = /(?:^|>|\n)\s*(\d{1,2})\s*[.)\-]\s*([A-Za-z][A-Za-z0-9' .\-]{1,45})/g;
-        let lm;
-        while ((lm = lineRe.exec(html)) !== null && runners.length < 24) {
-          const name = lm[2].trim();
-          if (/^(back|lay|odds|price|size|win|open|close)$/i.test(name)) continue;
-          pushR({ selectionId: Number(lm[1]), clothNumber: lm[1], runnerName: name }, runners.length);
+      // Trap/cloth number + name: "1. Ringo" or "(1) Ringo"
+      if (!runners.length) {
+        const clothRe = /(?:^|>|\s)(\d{1,2})\s*[.)]\s*([A-Za-z][A-Za-z0-9' .\-]{1,40})(?:\s*<|\s*\(|$)/gm;
+        while ((pm = clothRe.exec(html)) !== null && runners.length < 24) {
+          const r = sanitizeRaceRunner({
+            selectionId: Number(pm[1]),
+            clothNumber: pm[1],
+            runnerName: pm[2].trim(),
+          }, runners.length);
+          if (!r || seen.has(r.runnerName.toLowerCase())) continue;
+          seen.add(r.runnerName.toLowerCase());
+          runners.push(r);
         }
       }
-
-      const isGrey = /grey\s*hound|greyhound|4339/i.test(html)
-        || /Healesville|Capalaba|Angle Park|Shepparton|Sandown|Romford|Monmore/i.test((eventName || '') + html);
-      const eventTypeId = isGrey ? '4339' : '7';
 
       if (!runners.length) {
-        logger.warn(`[bpexch] race page ${id} htmlLen=${html.length} no runners`);
-        if (eventName || startIso) {
-          return {
-            marketId: id,
-            marketName: 'Win',
-            marketType: 'WIN',
-            marketStartTime: startIso,
-            marketStartTimeUtc: startIso,
-            eventId: id,
-            eventName: eventName || 'Race',
-            eventTypeId,
-            eventType: isGrey ? 'Greyhound Racing' : 'Horse Racing',
-            status: 'OPEN',
-            runners: [],
-            subMarkets: [],
-            source: 'bpexch-race-html-empty',
-          };
-        }
+        logger.warn(`[bpexch] race page ${id} no clean runners`);
         continue;
       }
+
+      // Detect greyhound vs horse from page text
+      const isGrey = /grey\s*hound|greyhound/i.test(html) || /Healesville|Capalaba|Angle Park/i.test(html + (eventName || ''));
+      const eventTypeId = isGrey ? '4339' : '7';
 
       logger.info(`[bpexch] race page ${id} scraped runners=${runners.length} type=${eventTypeId}`);
       return {
@@ -583,7 +531,7 @@ async function scrapeBpexchRaceEventPage(raceId) {
   return null;
 }
 
-
+/** Reject Vue templates / score fields / junk as runner names */
 function sanitizeRaceRunner(r, index) {
   if (!r) return null;
   let name = String(r.runnerName || r.name || '').replace(/\s+/g, ' ').trim();
@@ -628,23 +576,20 @@ async function getRacingHighlights(eventTypeId) {
   const html = await getHighlightsHtml();
   let horseSection     = sliceBetweenMarkers(html, 'Horse Race', 'Grey Hound');
   let greyhoundSection = sliceBetweenMarkers(html, 'Grey Hound', 'TABS SYSTEM');
+  // Marker text sometimes differs (Greyhound / Grey Hound / HORSE RACING)
   if (!horseSection || horseSection.length < 50) {
-    horseSection = sliceBetweenMarkers(html, 'Horse Racing', 'Grey')
-      || sliceBetweenMarkers(html, 'Horse', 'Grey')
-      || horseSection;
+    horseSection = sliceBetweenMarkers(html, 'Horse', 'Grey') || horseSection;
   }
   if (!greyhoundSection || greyhoundSection.length < 50) {
-    greyhoundSection = sliceBetweenMarkers(html, 'Greyhound', 'TAB')
-      || sliceBetweenMarkers(html, 'Grey Hound', 'TAB')
-      || sliceBetweenMarkers(html, 'Grey', 'TAB')
-      || greyhoundSection;
+    greyhoundSection = sliceBetweenMarkers(html, 'Grey', 'TAB') || greyhoundSection;
   }
-  if ((!horseSection || horseSection.length < 80) && (!greyhoundSection || greyhoundSection.length < 80)) {
+  // Absolute fallback: whole HTML
+  if ((!horseSection || horseSection.length < 50) && (!greyhoundSection || greyhoundSection.length < 50)) {
     logger.warn(`[bpexch] racing section markers missing htmlLen=${(html||'').length} — parse full page`);
     horseSection = html || '';
     greyhoundSection = html || '';
   }
-  logger.info(`[bpexch] racing sections horseLen=${(horseSection||'').length} greyLen=${(greyhoundSection||'').length} htmlLen=${(html||'').length}`);
+  logger.info(`[bpexch] racing sections horseLen=${(horseSection||'').length} greyLen=${(greyhoundSection||'').length}`);
 
   if (eventTypeId != null) {
     if (isHorseRacingEventType(eventTypeId)) return parseRaceItems(horseSection, eventTypeId);
@@ -1827,22 +1772,33 @@ async function discoverMarketIdsFromEventPage(eventId) {
       validateStatus: s => s < 500,
     });
     const html = typeof res.data === 'string' ? res.data : '';
-    const ids = new Set();
+    // ✅ FIX: pehle sirf CONTEXT-LABELED IDs (marketId=/MarketId:/query
+    // param/JSON key ke sath) — ye pura page ke andar kisi UNRELATED
+    // widget (jaise sidebar "Trending Matches") ke IDs ke sath confuse
+    // hone ka risk kam karta hai. Loose bare "1.xxx kahin bhi" pattern
+    // ab sirf LAST RESORT hai, aur sirf tab try hota hai jab labeled
+    // patterns kuch na dein.
+    const labeled = new Set();
     let m;
-    // marketId / MarketId / data-market-id
     const re = /(?:marketId|MarketId|data-market(?:-id)?|market_id)["'\s:=]+([19]\.\d{5,})/gi;
-    while ((m = re.exec(html)) !== null) ids.add(m[1]);
-    // query string
+    while ((m = re.exec(html)) !== null) labeled.add(m[1]);
     const re2 = /[?&]id=([19]\.\d{5,})/g;
-    while ((m = re2.exec(html)) !== null) ids.add(m[1]);
-    // bare 1.xxx / 9.xxx (Betfair + bookmaker/fancy)
-    const re3 = /\b([19]\.\d{6,})\b/g;
-    while ((m = re3.exec(html)) !== null) ids.add(m[1]);
-    // Vue/JSON blobs: "marketId":"9.123"
+    while ((m = re2.exec(html)) !== null) labeled.add(m[1]);
     const re4 = /"marketId"\s*:\s*"([19]\.[0-9]+)"/g;
-    while ((m = re4.exec(html)) !== null) ids.add(m[1]);
-    logger.info(`[bpexch] event page ${eventId} discovered ${ids.size} market ids`);
-    return [...ids];
+    while ((m = re4.exec(html)) !== null) labeled.add(m[1]);
+
+    if (labeled.size) {
+      logger.info(`[bpexch] event page ${eventId} discovered ${labeled.size} labeled market ids`);
+      return [...labeled];
+    }
+
+    // Last resort — loose, no context. Risky (can pick up unrelated
+    // sidebar/widget ids), so caller MUST validate before trusting this.
+    const loose = new Set();
+    const re3 = /\b([19]\.\d{6,})\b/g;
+    while ((m = re3.exec(html)) !== null) loose.add(m[1]);
+    logger.warn(`[bpexch] event page ${eventId} — no labeled ids, falling back to ${loose.size} loose ids (unverified)`);
+    return [...loose];
   } catch (err) {
     logger.warn(`[bpexch] event page scrape failed: ${err.message}`);
     return [];
@@ -1945,32 +1901,106 @@ function categorizeSubMarket(c) {
  *   3) catalogs(ids)          → Over/Under / Bookmaker / Fancy structure
  * Merge (2) prices onto (1)/(3) runners by selectionId.
  */
+// ✅ SHARED helper — composite race id (eventId.raceNumber, jaise
+// "36002580.0805") ko VERIFIED real Betfair-style marketId ("1.xxx")
+// mein resolve karta hai. Discover karta hai event page se candidate
+// IDs, phir har candidate ka catalog2 fetch karke uska eventTypeId
+// check karta hai (7=Horse, 4339=Greyhound) — isse galat-sport ka
+// market kabhi accept nahi hota. getBpexchMarketPage() aur controller
+// ke getMarketData() dono isi function ko use karte hain (duplicate
+// logic na ho, aur dono jagah same verification guarantee mile).
+//
+// 🐛 BUG FIX: pehle `.split('.')[0]` se sirf integer hissa (e.g.
+// "36002580") event page ko bheja jaata tha — lekin bpexch ke apne
+// markethighlights se confirm hua ke ye integer sirf ek MEETING-level
+// number hai, poore din ke KAI ALAG races isko share karte hain
+// (e.g. 36002580.0714, 36002580.0729, 36002580.0745, 36002580.0805 —
+// sab alag races, same integer prefix). Sirf ".HHMM" suffix hi race ko
+// uniquely identify karta hai. Integer-only URL ek generic/ambiguous
+// page deta tha jisme kabhi-kabhi bilkul dusre sport ke market-ids mil
+// jaate the (isi liye "wrong sport eventTypeId=4" jaisi rejections aa
+// rahi thi). Fix: FULL composite id (dot ke sath) event page ko bhejo —
+// bpexch ke apne links (/Common/Event/36002580.0805) bhi isi format mein
+// hain, yehi asal race-specific page hai.
+async function resolveRealRaceMarketId(compositeId) {
+  const fullId = String(compositeId);
+  const integerOnlyId = fullId.split('.')[0];
+
+  // Primary: full composite id — race-specific page (matches bpexch's
+  // own /Common/Event/ link format exactly).
+  let discovered = await discoverMarketIdsFromEventPage(fullId);
+
+  // Fallback: integer-only id, sirf tab jab full-id page kuch na de
+  // (defensive — kabhi bpexch redirect kar de to bhi kuch mile).
+  if (!discovered.length && integerOnlyId !== fullId) {
+    logger.warn(`[bpexch] race composite ${fullId} — full-id page empty, trying integer-only ${integerOnlyId} as fallback`);
+    discovered = await discoverMarketIdsFromEventPage(integerOnlyId);
+  }
+
+  const candidates = [
+    ...discovered.filter(id => id.startsWith('1.')),
+    ...discovered.filter(id => !id.startsWith('1.')),
+  ];
+  for (const cand of candidates) {
+    try {
+      const probe = await fetchBpexchCatalog2(cand);
+      const probeType = String(probe?.eventTypeId || probe?.sport?.id || '');
+      if (probe && ['7', '4339'].includes(probeType)) {
+        return { realId: cand, catalog2: probe };
+      }
+      if (probe) {
+        logger.warn(`[bpexch] race composite ${compositeId} — candidate ${cand} rejected, wrong sport (eventTypeId=${probeType})`);
+      }
+    } catch (_) { /* try next candidate */ }
+  }
+  return { realId: null, catalog2: null };
+}
+
 async function getBpexchMarketPage(marketId, pricesToken) {
   const normalizedId = normalizeMarketId(marketId);
 
-  // Composite race ids: 35965023.2207 (not Betfair 1.xxx) — scrape Event page
+  // ✅ FIX: Composite race ids (jaise "36002580.0607") bpexch ke apne
+  // eventId.raceNumber navigation-id hain — REAL marketId nahi. Real
+  // Betfair-style marketId ("1.xxxxxxxxx") event page ke andar embedded
+  // hota hai, jaisa browser DevTools se confirm hua (prices7/Data call
+  // asal mein "1.261686353" jaisi ID use kar rahi thi, composite ID
+  // nahi). Pehle resolveRealRaceMarketId() se real ID nikaalte hain,
+  // phir NORMAL catalog2+prices7 flow use karte hain — wahi jo baaki
+  // sports (cricket/tennis/football) ke liye already proven kaam kar
+  // raha hai. Purana scrapeBpexchRaceEventPage() (fragile HTML
+  // guessing) sirf last-resort fallback ke tor pe rakha hai.
   const isRaceComposite = /^\d{6,}\.\d+$/.test(String(normalizedId));
+  let resolvedId = normalizedId;
+  let mainFromProbe = null;
   if (isRaceComposite) {
-    const racePage = await scrapeBpexchRaceEventPage(normalizedId);
-    if (racePage) return racePage;
+    const { realId, catalog2 } = await resolveRealRaceMarketId(normalizedId);
+    if (realId) {
+      logger.info(`[bpexch] race composite ${normalizedId} → verified real marketId ${realId}`);
+      resolvedId = realId;
+      mainFromProbe = catalog2;
+    } else {
+      logger.warn(`[bpexch] race composite ${normalizedId} — no verified racing marketId found, falling back to HTML scrape`);
+      const racePage = await scrapeBpexchRaceEventPage(normalizedId);
+      if (racePage) return racePage;
+      return null;
+    }
   }
 
   // ── 1) catalog2 structure ──
-  const main = await fetchBpexchCatalog2(normalizedId);
+  const main = mainFromProbe || await fetchBpexchCatalog2(resolvedId);
   if (!main) {
-    if (isRaceComposite) return null;
     return null;
   }
 
   // ── 2) prices7 live books (source of odds + related market ids) ──
-  const live = await fetchPrices7MarketData(normalizedId, pricesToken);
+  const live = await fetchPrices7MarketData(resolvedId, pricesToken);
   const books = Array.isArray(live?.marketBooks) ? live.marketBooks : [];
   const bookById = new Map(books.map(b => [String(b.id), b]));
 
   // Related market ids = every book except root Match Odds
   let subIds = books
     .map(b => String(b.id))
-    .filter(id => id && id !== String(normalizedId));
+    .filter(id => id && id !== String(resolvedId));
 
   // Also keep any explicit related ids from catalog2
   if (Array.isArray(main.relatedMarketIds)) {
@@ -2031,7 +2061,7 @@ async function getBpexchMarketPage(marketId, pricesToken) {
   if (!rootHasOdds) {
     try {
       const lookup = await getMatchOddsLookup();
-      const hi = lookup.get(String(normalizedId));
+      const hi = lookup.get(String(resolvedId));
       if (hi?.runners?.length) {
         mainEnriched = {
           ...mainEnriched,
@@ -2067,7 +2097,7 @@ async function getBpexchMarketPage(marketId, pricesToken) {
 
   for (const cat of subCatalogs) {
     const mid = String(cat.marketId);
-    if (mid === String(normalizedId) || seen.has(mid)) continue;
+    if (mid === String(resolvedId) || seen.has(mid)) continue;
     if (eventIdStr && cat.eventId != null && String(cat.eventId) !== eventIdStr) continue;
     seen.add(mid);
     const enriched = mergeBookOntoCatalog(cat);
@@ -2079,7 +2109,7 @@ async function getBpexchMarketPage(marketId, pricesToken) {
   // markets that appear only in prices7 books (no catalog yet) — still expose with synthetic names
   for (const mb of books) {
     const mid = String(mb.id);
-    if (mid === String(normalizedId) || seen.has(mid)) continue;
+    if (mid === String(resolvedId) || seen.has(mid)) continue;
     seen.add(mid);
     const runners = (mb.runners || []).map((lr, i) => {
       const ladder = prices7RunnerToLadder(lr);
@@ -2108,10 +2138,11 @@ async function getBpexchMarketPage(marketId, pricesToken) {
     });
   }
 
-  logger.info(`[bpexch] marketPage ${normalizedId} books=${books.length} subs=${subMarkets.length} scoreboard=${!!live?.scoreboard}`);
+  logger.info(`[bpexch] marketPage ${normalizedId}${resolvedId !== normalizedId ? ` (resolved→${resolvedId})` : ''} books=${books.length} subs=${subMarkets.length} scoreboard=${!!live?.scoreboard}`);
 
   return {
     ...mainEnriched,
+    marketId: mainEnriched.marketId || resolvedId,
     eventId,
     eventName: main.eventName || main.event?.name,
     eventTypeId: String(main.eventTypeId || main.sport?.id || ''),
@@ -2200,12 +2231,21 @@ async function getBpexchEventMarkets(eventId, pricesToken) {
   };
 }
 
-/** Resolve pure eventId (e.g. 35945509) → Match Odds marketId (1.xxx) */
+/** Resolve pure eventId (e.g. 35945509) → marketId (1.xxx)
+ *  ✅ FIX: pehle sirf getSportsHighlights(null) call hota tha, jo sirf
+ *  cricket/tennis/football (match-odds sports) return karta hai — Horse
+ *  Racing / Greyhound (racing sports) is list mein kabhi hote hi nahi
+ *  the. Isliye direct-link ya session-bridge-miss case mein horse/
+ *  greyhound events ka marketId kabhi resolve nahi hota tha, catalog2
+ *  404 deta, aur Event page "UNABLE TO LOAD" dikhata reh jaata.
+ *  sportItems(null) racing (horse+greyhound) + matchOdds (cricket/
+ *  tennis/football) dono ko ek saath combine karke deta hai, isliye
+ *  ab sab sports ke liye resolution kaam karega. */
 async function resolveMarketIdFromEventId(eventId) {
   if (!eventId) return null;
   const eid = String(eventId);
   try {
-    const items = await getSportsHighlights(null);
+    const items = await sportItems(null);
     const hit = items.find(m => String(m.event?.id) === eid);
     if (hit?.id) return String(hit.id);
   } catch (_) {}
@@ -2233,6 +2273,7 @@ module.exports = {
   getBpexchMarketPage,
   getBpexchEventMarkets,
   resolveMarketIdFromEventId,
+  resolveRealRaceMarketId,
   ensureBpexchSession,
   getPrices7Token,
   refreshPrices7TokenFromSession,
