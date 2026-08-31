@@ -1,4 +1,3 @@
-
 'use strict';
 
 const { v4: uuidv4 } = require('uuid');
@@ -18,6 +17,68 @@ const { sendSuccess, sendError } = require('../utils/response');
 const { SPORT_MAP } = require('../config/constants');
 const { SportConfig } = require('../models');
 const logger = require('../utils/logger');
+const fs = require('fs');
+const path = require('path');
+
+/* ── Admin Visibility Store ────────────────────────────────
+   Simple JSON-file store — koi DB migration ki zaroorat nahi.
+   Shape: { "<sportKey>": { hiddenEvents: ["35945509", ...],
+                             hiddenMarkets: ["eventId:marketId", ...] } }
+   Default = sab visible (jab tak explicitly hide na kiya ho) — naye
+   aane wale matches automatically visible rahenge, sirf jo admin
+   manually hide kare wo hidden honge. */
+const VISIBILITY_FILE = path.join(__dirname, '..', 'data', 'sport-visibility.json');
+
+function loadVisibility() {
+  try {
+    const raw = fs.readFileSync(VISIBILITY_FILE, 'utf8');
+    return JSON.parse(raw) || {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveVisibility(data) {
+  try {
+    fs.mkdirSync(path.dirname(VISIBILITY_FILE), { recursive: true });
+    fs.writeFileSync(VISIBILITY_FILE, JSON.stringify(data, null, 2), 'utf8');
+    return true;
+  } catch (err) {
+    logger.error(`[visibility] save failed: ${err.message}`);
+    return false;
+  }
+}
+
+function getHiddenSets(sportKey) {
+  const all = loadVisibility();
+  const entry = all[sportKey] || {};
+  return {
+    events:  new Set((entry.hiddenEvents  || []).map(String)),
+    markets: new Set((entry.hiddenMarkets || []).map(String)),
+  };
+}
+
+// Admin panel ke sport keys → backend eventTypeId map (aur reverse)
+const SPORT_EVENT_TYPE_MAP = {
+  soccer: '1', football: '1', tennis: '2', cricket: '4', horse: '7', greyhound: '4339',
+};
+function sportKeyForEventTypeId(eventTypeId) {
+  const found = Object.entries(SPORT_EVENT_TYPE_MAP).find(([, id]) => id === String(eventTypeId));
+  return found ? found[0] : null;
+}
+
+// Ek sport ke data array (getLive* ka output) pe hidden-event/market filter
+// laga do — admin panel se hide ki hui cheez dashboard se turant gayab.
+function applyVisibilityFilter(data, sportKey) {
+  if (!Array.isArray(data) || !data.length) return data;
+  const { events: hiddenEvents, markets: hiddenMarkets } = getHiddenSets(sportKey);
+  if (!hiddenEvents.size && !hiddenMarkets.size) return data;
+  return data.filter(item => {
+    if (item.eventId && hiddenEvents.has(String(item.eventId))) return false;
+    if (item.eventId && item.marketId && hiddenMarkets.has(`${item.eventId}:${item.marketId}`)) return false;
+    return true;
+  });
+}
 
 /* ── Helpers ────────────────────────────────────────────── */
 
@@ -234,17 +295,17 @@ async function fetchSportMarkets(sportKey, eventTypeId, overrides = {}) {
 
 async function getLiveCricket(req, res) {
   const data = await fetchSportMarkets('cricket', 4);
-  return sendSuccess(res, data);
+  return sendSuccess(res, applyVisibilityFilter(data, 'cricket'));
 }
 
 async function getLiveCricketInplay(req, res) {
   const data = await fetchSportMarkets('cricket', 4, { inPlayOnly: true });
-  return sendSuccess(res, data);
+  return sendSuccess(res, applyVisibilityFilter(data, 'cricket'));
 }
 
 async function getLiveFootball(req, res) {
   const data = await fetchSportMarkets('football', 1);
-  return sendSuccess(res, data);
+  return sendSuccess(res, applyVisibilityFilter(data, 'football'));
 }
 
 async function getLiveTennis(req, res) {
@@ -314,30 +375,59 @@ async function getLiveTennis(req, res) {
     return true;
   });
 
-  return sendSuccess(res, deduped);
+  return sendSuccess(res, applyVisibilityFilter(deduped, 'tennis'));
 }
 
 async function getLiveHorse(req, res) {
-  // SuperAdmin sport_configs se CONTROL NAHI — jo bpexch pe races hain waisi hi list
   try {
-    const now = new Date();
-    const from = new Date(now.getTime() - 30 * 60_000).toISOString(); // 30m past (inplay)
-    const to   = new Date(now.getTime() + 48 * 3600_000).toISOString(); // 48h ahead
+    const cfg = await getSportCfg('horse');
+    if (cfg && cfg.is_active === false) return sendSuccess(res, []);
 
-    const events = await listEvents({
+    const maxResults = String(cfg?.max_results ?? 200);
+    const hoursAhead = cfg?.hours_ahead ?? 24;
+
+    const now  = new Date();
+    // ✅ from: 5 min peeche (inplay races cover karne ke liye)
+    const from = new Date(now.getTime() - 5 * 60_000).toISOString();
+    const to   = new Date(now.getTime() + hoursAhead * 3600_000).toISOString();
+
+    const eventFilter = {
       eventTypeIds: ['7'],
       marketStartTime: { from, to },
-    });
+    };
+    if (cfg?.allowed_countries) eventFilter.marketCountries = cfg.allowed_countries.split(',').map(s => s.trim());
+    // ⚠️ allowed_competition_ids field mein TRACK NAAM hote hain (jaise
+    // "Ballarat"), Betfair competition ID nahi — races ki koi "competition"
+    // hoti hi nahi. Isliye ye seedha Betfair filter mein NAHI jaata; niche
+    // events fetch hone ke baad naam se match karke filter hota hai.
+
+    let events = await listEvents(eventFilter);
+    if (!events.length) return sendSuccess(res, []);
+
+    // ✅ FIX: track-naam se filter karo (getBetfairTracks jaisi hi derivation)
+    if (cfg?.allowed_competition_ids) {
+      const allowedTracks = new Set(
+        cfg.allowed_competition_ids.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+      );
+      if (allowedTracks.size > 0) {
+        events = events.filter(e => {
+          const rawName   = e.event?.name || '';
+          const trackName = (rawName.split('(')[0] || rawName).trim().toLowerCase();
+          return allowedTracks.has(trackName);
+        });
+      }
+    }
     if (!events.length) return sendSuccess(res, []);
 
     const catalogues = await listMarketCatalogue(
       { eventIds: events.map(e => e.event.id), marketTypeCodes: ['WIN'] },
-      '200',
+      maxResults,
       ['EVENT', 'RUNNER_METADATA', 'COMPETITION', 'RUNNER_DESCRIPTION', 'MARKET_START_TIME']
     );
     if (!catalogues.length) return sendSuccess(res, []);
 
-    const CHUNK = 50;
+    // Books fetch in chunks
+    const CHUNK = 200;
     const allMarketIds = catalogues.map(m => m.marketId);
     let allBooks = [];
     for (let i = 0; i < allMarketIds.length; i += CHUNK) {
@@ -345,31 +435,55 @@ async function getLiveHorse(req, res) {
       allBooks = allBooks.concat(books);
     }
 
-    const seen = new Set();
-    const data = catalogues.map(market => {
+    // ✅ Map — marketStartTime use karo (race-specific, more accurate than event.openDate)
+    const mapped = catalogues.map(market => {
       const book  = allBooks.find(b => b.marketId === market.marketId);
       const event = events.find(e => e.event.id === market.event?.id);
-      const startTime = market.marketStartTime || event?.event?.openDate || '';
+      const startTime = market.marketStartTime || event?.event.openDate || '';
+
       return {
         marketId:        market.marketId,
-        eventId:         market.event?.id || event?.event?.id || market.marketId,
-        match:           event?.event?.name || market.marketName || 'Unknown',
+        // ✅ FIX: eventId add kiya — pehle ye field hi nahi bheja jaata tha,
+        // is liye dashboard click pe evtMap bridge kabhi nahi banta tha aur
+        // Event page marketId ki jagah eventId use kar leta tha → "UNABLE
+        // TO LOAD". Ab bridge seedha yahin se ban jayega, extra round-trip
+        // ki zaroorat nahi.
+        eventId:         market.event?.id || event?.event.id || null,
+        match:           event?.event.name || market.marketName || 'Unknown',
         startTime,
-        marketStatus:    book?.status || 'OPEN',
-        inPlay:          !!(book?.inPlay || book?.status === 'IN_PLAY'),
+        marketStatus:    book?.status || 'UNKNOWN',
+          inPlay:         (() => {
+          if (book?.inPlay === true) return true;
+          if (book?.status === 'IN_PLAY') return true;
+          const st = event?.event?.openDate || market?.marketStartTime;
+          if (st && new Date(st) <= new Date() && book?.status === 'OPEN') return true;
+          return false;
+        })(),
         totalMatched:    book?.totalMatched || 0,
         runners:         buildOddsPayload(market.runners || [], book, 'horse'),
         competitionId:   market.competition?.id   || null,
         competitionName: market.competition?.name || null,
       };
-    }).filter(d => {
-      if (!d.marketId || seen.has(d.marketId)) return false;
-      seen.add(d.marketId);
-      return true;
-    }).sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+    });
 
-    logger.info(`[markets:horse] bpexch raw events=${events.length} markets=${data.length} (no admin filter)`);
-    return sendSuccess(res, data);
+    // ✅ Filter: sirf future + recently started (5 min grace period)
+    const cutoff = new Date(now.getTime() - 5 * 60_000);
+    const filtered = mapped.filter(d => d.startTime && new Date(d.startTime) >= cutoff);
+
+    // ✅ Deduplicate: same track + same minute
+    const seen = new Set();
+    const deduped = filtered.filter(d => {
+      const timeKey = d.startTime ? d.startTime.substring(0, 16) : '';
+      const key = `${d.match}__${timeKey}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    // ✅ Sort ascending — nearest race pehle
+    deduped.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+
+    return sendSuccess(res, applyVisibilityFilter(deduped, 'horse'));
   } catch (err) {
     logger.error(`getLiveHorse error: ${err.message}`);
     return sendError(res, 'Failed to fetch horse racing data', 500);
@@ -377,26 +491,55 @@ async function getLiveHorse(req, res) {
 }
 
 async function getLiveGreyhound(req, res) {
-  // SuperAdmin sport_configs se CONTROL NAHI — bpexch jaisi list
   try {
-    const now = new Date();
-    const from = new Date(now.getTime() - 30 * 60_000).toISOString();
-    const to   = new Date(now.getTime() + 48 * 3600_000).toISOString();
+    const cfg = await getSportCfg('greyhound');
+    if (cfg && cfg.is_active === false) return sendSuccess(res, []);
 
-    const events = await listEvents({
+    const maxResults = String(cfg?.max_results ?? 200);
+    const hoursAhead = cfg?.hours_ahead ?? 12;
+
+    const now  = new Date();
+    // ✅ from: 5 min peeche (inplay races cover karne ke liye)
+    const from = new Date(now.getTime() - 5 * 60_000).toISOString();
+    const to   = new Date(now.getTime() + hoursAhead * 3600_000).toISOString();
+
+    const eventFilter = {
       eventTypeIds: ['4339'],
       marketStartTime: { from, to },
-    });
+    };
+    if (cfg?.allowed_countries) eventFilter.marketCountries = cfg.allowed_countries.split(',').map(s => s.trim());
+    // ⚠️ allowed_competition_ids field mein TRACK NAAM hote hain, Betfair
+    // competition ID nahi — races ki koi "competition" hoti hi nahi.
+    // Isliye ye seedha Betfair filter mein NAHI jaata; niche events fetch
+    // hone ke baad naam se match karke filter hota hai.
+
+    let events = await listEvents(eventFilter);
+    if (!events.length) return sendSuccess(res, []);
+
+    // ✅ FIX: track-naam se filter karo (getBetfairTracks jaisi hi derivation)
+    if (cfg?.allowed_competition_ids) {
+      const allowedTracks = new Set(
+        cfg.allowed_competition_ids.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+      );
+      if (allowedTracks.size > 0) {
+        events = events.filter(e => {
+          const rawName   = e.event?.name || '';
+          const trackName = (rawName.split('(')[0] || rawName).trim().toLowerCase();
+          return allowedTracks.has(trackName);
+        });
+      }
+    }
     if (!events.length) return sendSuccess(res, []);
 
     const catalogues = await listMarketCatalogue(
       { eventIds: events.map(e => e.event.id), marketTypeCodes: ['WIN'] },
-      '200',
+      maxResults,
       ['EVENT', 'RUNNER_METADATA', 'COMPETITION', 'RUNNER_DESCRIPTION', 'MARKET_START_TIME']
     );
     if (!catalogues.length) return sendSuccess(res, []);
 
-    const CHUNK = 50;
+    // Books fetch in chunks
+    const CHUNK = 200;
     const allMarketIds = catalogues.map(m => m.marketId);
     let allBooks = [];
     for (let i = 0; i < allMarketIds.length; i += CHUNK) {
@@ -404,31 +547,50 @@ async function getLiveGreyhound(req, res) {
       allBooks = allBooks.concat(books);
     }
 
-    const seen = new Set();
-    const data = catalogues.map(market => {
+    // ✅ Map — marketStartTime use karo (race-specific time)
+    const mapped = catalogues.map(market => {
       const book  = allBooks.find(b => b.marketId === market.marketId);
       const event = events.find(e => e.event.id === market.event?.id);
-      const startTime = market.marketStartTime || event?.event?.openDate || '';
+      const startTime = market.marketStartTime || event?.event.openDate || '';
+
       return {
         marketId:        market.marketId,
-        eventId:         market.event?.id || event?.event?.id || market.marketId,
-        match:           event?.event?.name || market.marketName || 'Unknown',
+        // ✅ FIX: horse wala hi fix — eventId add kiya taake dashboard click
+        // pe seedha evtMap bridge ban jaye, resolve round-trip zaroori na ho.
+        eventId:         market.event?.id || event?.event.id || null,
+        match:           event?.event.name || market.marketName || 'Unknown',
         startTime,
-        marketStatus:    book?.status || 'OPEN',
-        inPlay:          !!(book?.inPlay || book?.status === 'IN_PLAY'),
+        marketStatus:    book?.status || 'UNKNOWN',
+          inPlay:         (() => {
+          if (book?.inPlay === true) return true;
+          if (book?.status === 'IN_PLAY') return true;
+          const st = event?.event?.openDate || market?.marketStartTime;
+          if (st && new Date(st) <= new Date() && book?.status === 'OPEN') return true;
+          return false;
+        })(),
         totalMatched:    book?.totalMatched || 0,
         runners:         buildOddsPayload(market.runners || [], book, 'greyhound'),
         competitionId:   market.competition?.id   || null,
         competitionName: market.competition?.name || null,
       };
-    }).filter(d => {
-      if (!d.marketId || seen.has(d.marketId)) return false;
+    });
+
+    // ✅ Filter: sirf future + recently started (5 min grace period)
+    const cutoff = new Date(now.getTime() - 5 * 60_000);
+    const filtered = mapped.filter(d => d.startTime && new Date(d.startTime) >= cutoff);
+
+    // ✅ Deduplicate by marketId
+    const seen = new Set();
+    const deduped = filtered.filter(d => {
+      if (seen.has(d.marketId)) return false;
       seen.add(d.marketId);
       return true;
-    }).sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+    });
 
-    logger.info(`[markets:greyhound] bpexch raw events=${events.length} markets=${data.length} (no admin filter)`);
-    return sendSuccess(res, data);
+    // ✅ Sort ascending — nearest race pehle
+    deduped.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+
+    return sendSuccess(res, applyVisibilityFilter(deduped, 'greyhound'));
   } catch (err) {
     logger.error(`getLiveGreyhound error: ${err.message}`);
     return sendError(res, 'Failed to fetch greyhound data', 500);
@@ -770,52 +932,6 @@ async function getMarketCatalog2(req, res) {
 
   // catalog nahi mila → genuine 404 (match khatam / ID purani / highlights cache miss)
   if (!catalog) {
-    // Race composite id: still return a usable shell so Event.html is not "UNABLE TO LOAD"
-    const isRace = /^\d{6,}\.\d+$/.test(String(marketId));
-    if (isRace) {
-      try {
-        const [hEv, gEv] = await Promise.all([
-          listEvents({ eventTypeIds: ['7'], marketStartTime: { from: new Date(Date.now()-48*3600e3).toISOString(), to: new Date(Date.now()+72*3600e3).toISOString() } }).catch(() => []),
-          listEvents({ eventTypeIds: ['4339'], marketStartTime: { from: new Date(Date.now()-48*3600e3).toISOString(), to: new Date(Date.now()+72*3600e3).toISOString() } }).catch(() => []),
-        ]);
-        const hit = [...hEv, ...gEv].find(e => String(e.event?.id) === String(marketId));
-        const isGrey = gEv.some(e => String(e.event?.id) === String(marketId));
-        const evtType = isGrey ? '4339' : '7';
-        const name = hit?.event?.name || 'Race';
-        const start = hit?.event?.openDate || new Date().toISOString();
-        // Try one more catalog2/scrape via getBpexchMarketPage was already tried — attempt listMarketCatalogue by id
-        let runners = [];
-        try {
-          const cats = await listMarketCatalogue({ marketIds: [String(marketId)] }, '1', ['EVENT', 'RUNNER_DESCRIPTION', 'RUNNER_METADATA', 'MARKET_START_TIME']);
-          if (cats?.[0]?.runners?.length) {
-            runners = buildOddsPayload(cats[0].runners, null, isGrey ? 'greyhound' : 'horse');
-          }
-        } catch (_) {}
-        logger.info(`[catalog2] race shell marketId=${marketId} runners=${runners.length}`);
-        return sendSuccess(res, {
-          marketId: String(marketId),
-          marketName: 'Win',
-          marketType: 'WIN',
-          marketStartTime: start,
-          marketStartTimeUtc: start,
-          eventTypeId: evtType,
-          eventType: isGrey ? 'Greyhound Racing' : 'Horse Racing',
-          eventId: String(marketId),
-          eventName: name,
-          status: 'OPEN',
-          isTurnInPlayEnabled: true,
-          betDelay: 0,
-          maxBetSize: 0,
-          runners,
-          subMarkets: [],
-          scoreboard: null,
-          source: 'race-shell',
-          updatedAt: new Date().toISOString(),
-        });
-      } catch (e) {
-        logger.warn(`[catalog2] race shell failed: ${e.message}`);
-      }
-    }
     logger.warn(`[catalog2] not in highlights and bpexch failed for ${marketId}`);
     return sendError(res, 'Market not found', 404);
   }
@@ -1162,6 +1278,135 @@ async function getBetfairTracks(req, res) {
   }
 }
 
+/* ── NEW: Admin Sports-Tree Visibility endpoints ─────────────
+   Sports Settings tree UI (admin.html) inhi 4 endpoints se chalta hai.
+──────────────────────────────────────────────────────────────── */
+
+// Racing (horse/greyhound) ke country>track>race shape ko tree UI ke
+// "league > matches" shape mein normalize karta hai (track = league).
+function flattenTracksToLeagues(countries) {
+  const leagues = [];
+  countries.forEach(c => {
+    (c.tracks || []).forEach(t => {
+      leagues.push({
+        id: `${c.code}:${t.name}`,
+        name: `${t.name} (${c.code})`,
+        matches: (t.races || []).map(r => ({
+          eventId: r.eventId, marketId: r.eventId, name: r.name, startTime: r.startTime,
+        })),
+      });
+    });
+  });
+  return leagues;
+}
+
+/**
+ * GET /api/v1/admin/visibility/tree?eventTypeId=&hoursAhead=48
+ * League/Track → Matches, har match ke saath current visible state.
+ */
+async function getVisibilityTree(req, res) {
+  const { eventTypeId, hoursAhead } = req.query;
+  if (!eventTypeId) return sendError(res, 'eventTypeId query parameter is required', 400);
+
+  try {
+    const sportKey = sportKeyForEventTypeId(eventTypeId) || 'unknown';
+    const { events: hiddenEvents } = getHiddenSets(sportKey);
+    const isRacing = ['7', '4339'].includes(String(eventTypeId));
+
+    let leagues;
+    if (isRacing) {
+      const fakeReq = { query: { eventTypeId } };
+      let out;
+      const fakeRes = { json: (d) => { out = d; }, status: () => fakeRes };
+      await getBetfairTracks(fakeReq, fakeRes);
+      leagues = flattenTracksToLeagues(out?.data?.countries || []);
+    } else {
+      const fakeReq = { query: { eventTypeId, hoursAhead: hoursAhead || 48 } };
+      let out;
+      const fakeRes = { json: (d) => { out = d; }, status: () => fakeRes };
+      await getBetfairActiveLeagues(fakeReq, fakeRes);
+      leagues = out?.data?.leagues || [];
+    }
+
+    leagues.forEach(l => l.matches.forEach(m => { m.visible = !hiddenEvents.has(String(m.eventId)); }));
+    return sendSuccess(res, { leagues });
+  } catch (err) {
+    logger.error(`getVisibilityTree error: ${err.message}`);
+    return sendError(res, 'Failed to load sports visibility tree', 500);
+  }
+}
+
+/**
+ * GET /api/v1/admin/visibility/markets?eventId=&eventTypeId=
+ * Ek match ke saare available markets, current visible state ke saath.
+ */
+async function getVisibilityMarkets(req, res) {
+  const { eventId, eventTypeId } = req.query;
+  if (!eventId) return sendError(res, 'eventId query parameter is required', 400);
+
+  try {
+    const catalogues = await listMarketCatalogue({ eventIds: [String(eventId)] }, '50', ['MARKET_DESCRIPTION', 'EVENT']);
+    if (!catalogues.length) return sendSuccess(res, { markets: [] });
+
+    const sportKey = sportKeyForEventTypeId(eventTypeId || catalogues[0]?.eventType?.id) || 'unknown';
+    const { markets: hiddenMarkets } = getHiddenSets(sportKey);
+
+    const markets = catalogues.map(m => ({
+      marketId:   m.marketId,
+      marketName: m.marketName,
+      marketType: m.description?.marketType || m.marketName || '',
+      visible:    !hiddenMarkets.has(`${eventId}:${m.marketId}`),
+    }));
+    return sendSuccess(res, { markets });
+  } catch (err) {
+    logger.error(`getVisibilityMarkets error: ${err.message}`);
+    return sendError(res, 'Failed to load markets for event', 500);
+  }
+}
+
+/**
+ * POST /api/v1/admin/visibility/match   { eventId, sportKey, visible }
+ */
+async function setMatchVisibility(req, res) {
+  const { eventId, sportKey, visible } = req.body || {};
+  if (!eventId || !sportKey) return sendError(res, 'eventId and sportKey are required', 400);
+
+  try {
+    const all = loadVisibility();
+    if (!all[sportKey]) all[sportKey] = { hiddenEvents: [], hiddenMarkets: [] };
+    const set = new Set((all[sportKey].hiddenEvents || []).map(String));
+    if (visible) set.delete(String(eventId)); else set.add(String(eventId));
+    all[sportKey].hiddenEvents = Array.from(set);
+    saveVisibility(all);
+    return sendSuccess(res, { eventId, visible: !!visible });
+  } catch (err) {
+    logger.error(`setMatchVisibility error: ${err.message}`);
+    return sendError(res, 'Failed to update match visibility', 500);
+  }
+}
+
+/**
+ * POST /api/v1/admin/visibility/market   { eventId, marketId, sportKey, visible }
+ */
+async function setMarketVisibility(req, res) {
+  const { eventId, marketId, sportKey, visible } = req.body || {};
+  if (!eventId || !marketId || !sportKey) return sendError(res, 'eventId, marketId and sportKey are required', 400);
+
+  try {
+    const all = loadVisibility();
+    if (!all[sportKey]) all[sportKey] = { hiddenEvents: [], hiddenMarkets: [] };
+    const key = `${eventId}:${marketId}`;
+    const set = new Set((all[sportKey].hiddenMarkets || []).map(String));
+    if (visible) set.delete(key); else set.add(key);
+    all[sportKey].hiddenMarkets = Array.from(set);
+    saveVisibility(all);
+    return sendSuccess(res, { eventId, marketId, visible: !!visible });
+  } catch (err) {
+    logger.error(`setMarketVisibility error: ${err.message}`);
+    return sendError(res, 'Failed to update market visibility', 500);
+  }
+}
+
 /* ── NEW: All markets for a specific event ───────────────── */
 
 /**
@@ -1378,5 +1623,9 @@ module.exports = {
   getBetfairActiveLeagues,   // ← NEW
   getBetfairMarketTypes,
   getBetfairTracks,          // ← NEW
+  getVisibilityTree,         // ← NEW (admin sports-tree)
+  getVisibilityMarkets,      // ← NEW (admin sports-tree)
+  setMatchVisibility,        // ← NEW (admin sports-tree)
+  setMarketVisibility,       // ← NEW (admin sports-tree)
   getEventMarkets,           // ← NEW
 };
