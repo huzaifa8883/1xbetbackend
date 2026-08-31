@@ -1901,6 +1901,36 @@ function categorizeSubMarket(c) {
  *   3) catalogs(ids)          → Over/Under / Bookmaker / Fancy structure
  * Merge (2) prices onto (1)/(3) runners by selectionId.
  */
+// ✅ SHARED helper — composite race id (eventId.raceNumber, jaise
+// "36002580.0805") ko VERIFIED real Betfair-style marketId ("1.xxx")
+// mein resolve karta hai. Discover karta hai event page se candidate
+// IDs, phir har candidate ka catalog2 fetch karke uska eventTypeId
+// check karta hai (7=Horse, 4339=Greyhound) — isse galat-sport ka
+// market kabhi accept nahi hota. getBpexchMarketPage() aur controller
+// ke getMarketData() dono isi function ko use karte hain (duplicate
+// logic na ho, aur dono jagah same verification guarantee mile).
+async function resolveRealRaceMarketId(compositeId) {
+  const compositeEventId = String(compositeId).split('.')[0];
+  const discovered = await discoverMarketIdsFromEventPage(compositeEventId);
+  const candidates = [
+    ...discovered.filter(id => id.startsWith('1.')),
+    ...discovered.filter(id => !id.startsWith('1.')),
+  ];
+  for (const cand of candidates) {
+    try {
+      const probe = await fetchBpexchCatalog2(cand);
+      const probeType = String(probe?.eventTypeId || probe?.sport?.id || '');
+      if (probe && ['7', '4339'].includes(probeType)) {
+        return { realId: cand, catalog2: probe };
+      }
+      if (probe) {
+        logger.warn(`[bpexch] race composite ${compositeId} — candidate ${cand} rejected, wrong sport (eventTypeId=${probeType})`);
+      }
+    } catch (_) { /* try next candidate */ }
+  }
+  return { realId: null, catalog2: null };
+}
+
 async function getBpexchMarketPage(marketId, pricesToken) {
   const normalizedId = normalizeMarketId(marketId);
 
@@ -1909,43 +1939,20 @@ async function getBpexchMarketPage(marketId, pricesToken) {
   // Betfair-style marketId ("1.xxxxxxxxx") event page ke andar embedded
   // hota hai, jaisa browser DevTools se confirm hua (prices7/Data call
   // asal mein "1.261686353" jaisi ID use kar rahi thi, composite ID
-  // nahi). Pehle discoverMarketIdsFromEventPage() se real ID nikaalte
-  // hain, phir NORMAL catalog2+prices7 flow use karte hain — wahi jo
-  // baaki sports (cricket/tennis/football) ke liye already proven kaam
-  // kar raha hai. Purana scrapeBpexchRaceEventPage() (fragile HTML
+  // nahi). Pehle resolveRealRaceMarketId() se real ID nikaalte hain,
+  // phir NORMAL catalog2+prices7 flow use karte hain — wahi jo baaki
+  // sports (cricket/tennis/football) ke liye already proven kaam kar
+  // raha hai. Purana scrapeBpexchRaceEventPage() (fragile HTML
   // guessing) sirf last-resort fallback ke tor pe rakha hai.
   const isRaceComposite = /^\d{6,}\.\d+$/.test(String(normalizedId));
   let resolvedId = normalizedId;
   let mainFromProbe = null;
   if (isRaceComposite) {
-    const compositeEventId = String(normalizedId).split('.')[0];
-    const discovered = await discoverMarketIdsFromEventPage(compositeEventId);
-    // ✅ FIX: candidate ID milne ke baad bhi USE se pehle VERIFY karo ke
-    // wo wakai racing (Horse=7 / Greyhound=4339) ka market hai — warna
-    // agar page pe koi unrelated widget ka ID scrape ho gaya ho (jaise
-    // Cricket), to galat sport ka data event page pe dikhne se bachega.
-    const candidates = [
-      ...discovered.filter(id => id.startsWith('1.')),
-      ...discovered.filter(id => !id.startsWith('1.')),
-    ];
-    let realId = null;
-    for (const cand of candidates) {
-      try {
-        const probe = await fetchBpexchCatalog2(cand);
-        const probeType = String(probe?.eventTypeId || probe?.sport?.id || '');
-        if (probe && ['7', '4339'].includes(probeType)) {
-          realId = cand;
-          mainFromProbe = probe;
-          break;
-        }
-        if (probe) {
-          logger.warn(`[bpexch] race composite ${normalizedId} — candidate ${cand} rejected, wrong sport (eventTypeId=${probeType})`);
-        }
-      } catch (_) { /* try next candidate */ }
-    }
+    const { realId, catalog2 } = await resolveRealRaceMarketId(normalizedId);
     if (realId) {
       logger.info(`[bpexch] race composite ${normalizedId} → verified real marketId ${realId}`);
       resolvedId = realId;
+      mainFromProbe = catalog2;
     } else {
       logger.warn(`[bpexch] race composite ${normalizedId} — no verified racing marketId found, falling back to HTML scrape`);
       const racePage = await scrapeBpexchRaceEventPage(normalizedId);
@@ -2241,6 +2248,7 @@ module.exports = {
   getBpexchMarketPage,
   getBpexchEventMarkets,
   resolveMarketIdFromEventId,
+  resolveRealRaceMarketId,
   ensureBpexchSession,
   getPrices7Token,
   refreshPrices7TokenFromSession,
