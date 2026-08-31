@@ -1128,26 +1128,55 @@ async function getBetfairActiveLeagues(req, res) {
       ['EVENT', 'COMPETITION']
     );
 
-    const leagueMap = {}; // competitionId -> { id, name, matches: [...] }
+    // Competition info bpexch highlights mein nahi hoti (competition: null).
+    // Fallback: competition ho to usse group karo, warna event ko
+    // "Other Matches" ya direct match row ke taur pe dikhao.
+    const leagueMap = {};
+
+    // First pass: catalog se banao (competition available ho to sahi grouping)
     catalogues.forEach(m => {
       const comp = m.competition;
       const ev   = m.event;
-      if (!comp || !ev) return;
-      if (!leagueMap[comp.id]) leagueMap[comp.id] = { id: String(comp.id), name: comp.name, matches: [] };
-      if (!leagueMap[comp.id].matches.some(x => x.eventId === ev.id)) {
-        leagueMap[comp.id].matches.push({
+      if (!ev) return;
+
+      // Competition key — agar null to 'no_comp' pseudo key
+      const compId   = comp?.id   || 'no_comp';
+      const compName = comp?.name || 'All Matches';
+
+      if (!leagueMap[compId]) leagueMap[compId] = { id: String(compId), name: compName, matches: [] };
+      if (!leagueMap[compId].matches.some(x => x.eventId === ev.id)) {
+        leagueMap[compId].matches.push({
           eventId:   ev.id,
           marketId:  m.marketId,
+          name:      ev.name,
+          startTime: ev.openDate || m.marketStartTime,
+        });
+      }
+    });
+
+    // Second pass: listEvents se jo bhi events mile the unhe ensure karo
+    // (catalog mein na ho to directly add karo — taake koi match miss na ho)
+    events.forEach(e => {
+      const ev = e.event;
+      if (!ev?.id) return;
+      const alreadyIn = Object.values(leagueMap).some(l => l.matches.some(m => m.eventId === ev.id));
+      if (!alreadyIn) {
+        if (!leagueMap['no_comp']) leagueMap['no_comp'] = { id: 'no_comp', name: 'All Matches', matches: [] };
+        leagueMap['no_comp'].matches.push({
+          eventId:   ev.id,
+          marketId:  null,
           name:      ev.name,
           startTime: ev.openDate,
         });
       }
     });
 
-    const leagues = Object.values(leagueMap).map(l => {
-      l.matches.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
-      return l;
-    }).sort((a, b) => a.name.localeCompare(b.name));
+    const leagues = Object.values(leagueMap)
+      .filter(l => l.matches.length > 0)
+      .map(l => {
+        l.matches.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+        return l;
+      }).sort((a, b) => a.name.localeCompare(b.name));
 
     return sendSuccess(res, { leagues });
   } catch (err) {
@@ -1229,7 +1258,24 @@ async function getBetfairTracks(req, res) {
 
     if (!events.length) return sendSuccess(res, { countries: [] });
 
-    // country → { trackName → { eventCount, races:[{eventId,name,startTime}] } }
+    // WIN markets fetch karo — real marketId ke liye (taake admin panel
+    // se select/deselect sahi eventId pe match kare applyVisibilityFilter ke saath)
+    const eventIds = events.map(e => e.event?.id).filter(Boolean);
+    let marketIdMap = {}; // eventId → marketId
+    try {
+      const cats = await listMarketCatalogue(
+        { eventIds, marketTypeCodes: ['WIN'] },
+        String(Math.min(eventIds.length + 10, 400)),
+        ['EVENT']
+      );
+      cats.forEach(m => {
+        if (m.event?.id && m.marketId) marketIdMap[m.event.id] = m.marketId;
+      });
+    } catch (e) {
+      logger.warn(`[getBetfairTracks] WIN catalogue fetch failed: ${e.message}`);
+    }
+
+    // country → { trackName → { eventCount, races:[{eventId,marketId,name,startTime}] } }
     const countryMap = {};
     events.forEach(e => {
       const ev = e.event;
@@ -1244,11 +1290,9 @@ async function getBetfairTracks(req, res) {
         countryMap[countryCode][trackName] = { eventCount: 0, races: [] };
       }
       countryMap[countryCode][trackName].eventCount++;
-      // ✅ NEW: har race ka eventId bhi save karo — is se admin panel
-      // individual race click karke uske markets select kar sakta hai
-      // (pehle sirf track-level count tha, race-level detail nahi thi)
       countryMap[countryCode][trackName].races.push({
         eventId:   ev.id,
+        marketId:  marketIdMap[ev.id] || null,  // real WIN marketId
         name:      rawName,
         startTime: ev.openDate,
       });
@@ -1291,8 +1335,13 @@ function flattenTracksToLeagues(countries) {
       leagues.push({
         id: `${c.code}:${t.name}`,
         name: `${t.name} (${c.code})`,
+        // marketId: r.marketId (agar available ho) warna r.eventId
+        // visibility filter eventId pe hoti hai — marketId sirf UI ke liye
         matches: (t.races || []).map(r => ({
-          eventId: r.eventId, marketId: r.eventId, name: r.name, startTime: r.startTime,
+          eventId:   r.eventId,
+          marketId:  r.marketId || r.eventId,  // real marketId prefer karo
+          name:      r.name,
+          startTime: r.startTime,
         })),
       });
     });
