@@ -1394,19 +1394,55 @@ async function getVisibilityMarkets(req, res) {
   if (!eventId) return sendError(res, 'eventId query parameter is required', 400);
 
   try {
-    const catalogues = await listMarketCatalogue({ eventIds: [String(eventId)] }, '50', ['MARKET_DESCRIPTION', 'EVENT']);
-    if (!catalogues.length) return sendSuccess(res, { markets: [] });
-
-    const sportKey = sportKeyForEventTypeId(eventTypeId || catalogues[0]?.eventType?.id) || 'unknown';
+    const sportKey = sportKeyForEventTypeId(eventTypeId) || 'unknown';
+    const isRacing = ['horse', 'greyhound'].includes(sportKey);
     const { markets: hiddenMarkets } = getHiddenSets(sportKey);
 
-    const markets = catalogues.map(m => ({
-      marketId:   m.marketId,
-      marketName: m.marketName,
-      marketType: m.description?.marketType || m.marketName || '',
-      visible:    !hiddenMarkets.has(`${eventId}:${m.marketId}`),
+    let markets = [];
+
+    if (!isRacing) {
+      // ✅ FIX: cricket/tennis/football ke liye listMarketCatalogue sirf
+      // ek hi synthetic "Match Odds" market deta tha — Bookmaker/Toss/
+      // Fancy/etc uska hissa nahi hote (wo sirf getBpexchEventMarkets se
+      // milte hain, jo /event-markets route bhi use karta hai). Ab yahan
+      // bhi wahi function use kar rahe hain taake tree mein saare markets
+      // dikhein, sirf Match Odds nahi.
+      try {
+        const bpx = await getBpexchEventMarkets(String(eventId));
+        if (bpx?.marketId) {
+          markets.push({
+            marketId: bpx.marketId,
+            marketName: bpx.marketName || 'Match Odds',
+            marketType: 'MATCH_ODDS',
+          });
+        }
+        for (const sm of (bpx?.subMarkets || [])) {
+          markets.push({
+            marketId: sm.marketId,
+            marketName: sm.marketName || sm.category || 'Market',
+            marketType: sm.marketType || sm.category || '',
+          });
+        }
+      } catch (e) {
+        logger.warn(`[getVisibilityMarkets] bpexch fetch failed for eventId=${eventId}: ${e.message}`);
+      }
+    }
+
+    // Racing (real Betfair) — ya bpexch se kuch na mila to fallback
+    if (isRacing || !markets.length) {
+      const catalogues = await listMarketCatalogue({ eventIds: [String(eventId)] }, '50', ['MARKET_DESCRIPTION', 'EVENT']);
+      markets = catalogues.map(m => ({
+        marketId:   m.marketId,
+        marketName: m.marketName,
+        marketType: m.description?.marketType || m.marketName || '',
+      }));
+    }
+
+    const result = markets.map(m => ({
+      ...m,
+      visible: !hiddenMarkets.has(`${eventId}:${m.marketId}`),
     }));
-    return sendSuccess(res, { markets });
+    return sendSuccess(res, { markets: result });
   } catch (err) {
     logger.error(`getVisibilityMarkets error: ${err.message}`);
     return sendError(res, 'Failed to load markets for event', 500);
