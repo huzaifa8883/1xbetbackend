@@ -1,4 +1,3 @@
-
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -2146,12 +2145,21 @@ async function getBpexchEventMarkets(eventId, pricesToken) {
   };
 }
 
-/** Resolve pure eventId (e.g. 35945509) → Match Odds marketId (1.xxx) */
+/** Resolve pure eventId (e.g. 35945509) → marketId (1.xxx)
+ *  ✅ FIX: pehle sirf getSportsHighlights(null) call hota tha, jo sirf
+ *  cricket/tennis/football (match-odds sports) return karta hai — Horse
+ *  Racing / Greyhound (racing sports) is list mein kabhi hote hi nahi
+ *  the. Isliye direct-link ya session-bridge-miss case mein horse/
+ *  greyhound events ka marketId kabhi resolve nahi hota tha, catalog2
+ *  404 deta, aur Event page "UNABLE TO LOAD" dikhata reh jaata.
+ *  sportItems(null) racing (horse+greyhound) + matchOdds (cricket/
+ *  tennis/football) dono ko ek saath combine karke deta hai, isliye
+ *  ab sab sports ke liye resolution kaam karega. */
 async function resolveMarketIdFromEventId(eventId) {
   if (!eventId) return null;
   const eid = String(eventId);
   try {
-    const items = await getSportsHighlights(null);
+    const items = await sportItems(null);
     const hit = items.find(m => String(m.event?.id) === eid);
     if (hit?.id) return String(hit.id);
   } catch (_) {}
