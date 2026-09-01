@@ -1,4 +1,5 @@
 
+
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -134,6 +135,7 @@ function resolveFootballId() {
    sports dono isi ek response se aate hain) ───────────────────────── */
 let _highlightsHtmlCache = null;
 let _highlightsHtmlExpiry = 0;
+let _highlightsFailStreak = 0;
 // Chhota TTL rakha hai taake "time ke sath data update" ho — har naya
 // request (cache expire hone ke baad) fresh HTML khींchta hai.
 const HIGHLIGHTS_CACHE_TTL_MS = parseInt(process.env.BPEXCH_HIGHLIGHTS_CACHE_TTL_MS || '4000', 10);
@@ -148,6 +150,7 @@ let _highlightsJsonPromise = null;  // in-flight dedup
 
 async function fetchMarkethighlightsJson() {
   const url = `${BPEXCH_BASE_URL}/api1/markethighlights`;
+  try { await ensureBpexchSession(); } catch (_) {}
   const res = await axios.get(url, {
     timeout: TIMEOUT_MS,
     headers: {
@@ -156,6 +159,8 @@ async function fetchMarkethighlightsJson() {
       Referer: `${BPEXCH_BASE_URL}/Common/Dashboard`,
       Origin: BPEXCH_BASE_URL,
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      ...(typeof bpexchHeaders === 'function' ? bpexchHeaders() : {}),
+      'Cache-Control': 'no-cache',
     },
     validateStatus: s => s < 500,
   });
@@ -256,23 +261,58 @@ function normalizeHighlightItem(item) {
 
 async function fetchHighlightsHtml() {
   const url = `${BPEXCH_BASE_URL}/Common/MarketHighlights`;
+  // Session cookie lagao — hours baad anonymous/CF feed band kar sakta hai
+  try { await ensureBpexchSession(); } catch (_) { /* non-fatal */ }
   const res = await axios.get(url, {
-    params: { _: Date.now() }, // site khud bhi cache-buster query bhejta hai
+    params: { _: Date.now() },
     timeout: TIMEOUT_MS,
     headers: {
       'X-Requested-With': 'XMLHttpRequest',
       Accept: 'text/html, */*',
+      ...(typeof bpexchHeaders === 'function' ? bpexchHeaders() : {}),
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
     },
+    validateStatus: s => s < 500,
   });
-  return typeof res.data === 'string' ? res.data : String(res.data);
+  if (res.status !== 200) throw new Error(`MarketHighlights HTTP ${res.status}`);
+  const html = typeof res.data === 'string' ? res.data : String(res.data || '');
+  if (!html || html.length < 200) throw new Error('MarketHighlights empty/short body');
+  if (html.includes('Just a moment') || /cf-browser-verification/i.test(html)) {
+    throw new Error('MarketHighlights cloudflare challenge');
+  }
+  return html;
 }
 
 async function getHighlightsHtml() {
   if (_highlightsHtmlCache && Date.now() < _highlightsHtmlExpiry) return _highlightsHtmlCache;
-  const html = await fetchHighlightsHtml();
-  _highlightsHtmlCache = html;
-  _highlightsHtmlExpiry = Date.now() + HIGHLIGHTS_CACHE_TTL_MS;
-  return html;
+  try {
+    const html = await fetchHighlightsHtml();
+    _highlightsHtmlCache = html;
+    _highlightsHtmlExpiry = Date.now() + HIGHLIGHTS_CACHE_TTL_MS;
+    _highlightsFailStreak = 0;
+    return html;
+  } catch (err) {
+    _highlightsFailStreak = (_highlightsFailStreak || 0) + 1;
+    logger.warn(`[bpexch] highlights fetch fail #${_highlightsFailStreak}: ${err.message}`);
+    // Short grace: stale cache better than empty
+    if (_highlightsHtmlCache && _highlightsFailStreak < 5) {
+      _highlightsHtmlExpiry = Date.now() + 2000;
+      return _highlightsHtmlCache;
+    }
+    // Repeated fails → hard reset session + caches (self-heal, no restart)
+    if (_highlightsFailStreak >= 3) {
+      _bpexchCookie = '';
+      _bpexchCookieExpiry = 0;
+      _highlightsHtmlCache = null;
+      _highlightsHtmlExpiry = 0;
+      _highlightsJsonCache = null;
+      _highlightsJsonExpiry = 0;
+      _matchOddsLookupPromise = null;
+      try { await ensureBpexchSession(); } catch (_) {}
+    }
+    throw err;
+  }
 }
 
 function sliceBetweenMarkers(html, startMarker, endMarker) {
@@ -1303,15 +1343,15 @@ async function getMatchOddsLookup() {
   _matchOddsLookupPromise = (async () => {
     try {
       const items = await getSportsHighlights(null);
-      return new Map(items.map(it => [String(it.id), it]));
+      return new Map((items || []).map(it => [String(it.id), it]));
     } catch (err) {
       logger.warn(`[bpexch] match-odds lookup for listMarketBook failed: ${err.message}`);
       return new Map();
+    } finally {
+      // Always clear so next call can retry (no hours-long stuck promise)
+      setTimeout(() => { _matchOddsLookupPromise = null; }, Math.min(HIGHLIGHTS_CACHE_TTL_MS, 4000));
     }
   })();
-  // Highlights cache jitni der valid hai usi hisaab se ye lookup bhi
-  // dobara banega — is promise ko highlights cache expiry ke sath hi reset karo
-  setTimeout(() => { _matchOddsLookupPromise = null; }, HIGHLIGHTS_CACHE_TTL_MS);
   return _matchOddsLookupPromise;
 }
 
@@ -1617,7 +1657,7 @@ async function ensureBpexchSession() {
         _bpexchCookie = mergeSetCookie(_bpexchCookie, follow.headers['set-cookie']);
       }
 
-      _bpexchCookieExpiry = Date.now() + 30 * 60_000; // 30 min
+      _bpexchCookieExpiry = Date.now() + 20 * 60_000; // 20 min — refresh before session dies
       logger.info(`[bpexch] login OK cookieLen=${_bpexchCookie.length}`);
       // After login, try to obtain prices7 JWT (async, non-blocking for cookie return)
       refreshPrices7TokenFromSession().catch(e =>
@@ -1776,6 +1816,43 @@ async function refreshPrices7TokenFromSession(force = false) {
   })();
 
   return _prices7RefreshPromise;
+}
+
+
+
+/* ── Keepalive: odds hours baad band hone se bachao ────────────────
+   Har 12 min: bpexch re-login + prices7 JWT refresh + soft cache clear.
+   Process restart ki zaroorat nahi padni chahiye.
+─────────────────────────────────────────────────────────────────── */
+let _bpexchKeepaliveTimer = null;
+function startBpexchKeepalive() {
+  if (_bpexchKeepaliveTimer) return;
+  const EVERY_MS = parseInt(process.env.BPEXCH_KEEPALIVE_MS || String(12 * 60 * 1000), 10);
+  _bpexchKeepaliveTimer = setInterval(async () => {
+    try {
+      logger.info('[bpexch] keepalive tick — refresh session + token + soft cache clear');
+      _bpexchCookieExpiry = 0; // force re-login
+      await ensureBpexchSession();
+      try {
+        if (typeof refreshPrices7TokenFromSession === 'function') {
+          await refreshPrices7TokenFromSession(true);
+        }
+      } catch (e) {
+        logger.warn(`[bpexch] keepalive prices7: ${e.message}`);
+      }
+      _highlightsHtmlExpiry = 0;
+      _highlightsJsonExpiry = 0;
+      _matchOddsLookupPromise = null;
+      _highlightsFailStreak = 0;
+    } catch (e) {
+      logger.warn(`[bpexch] keepalive error: ${e.message}`);
+    }
+  }, EVERY_MS);
+  if (typeof _bpexchKeepaliveTimer.unref === 'function') _bpexchKeepaliveTimer.unref();
+  logger.info(`[bpexch] keepalive started every ${Math.round(EVERY_MS / 60000)} min`);
+}
+try { startBpexchKeepalive(); } catch (e) {
+  logger.warn(`[bpexch] keepalive start failed: ${e.message}`);
 }
 
 /** Public: always returns a usable token if login works */
@@ -2375,6 +2452,7 @@ module.exports = {
   resolveRealRaceMarketId,
   ensureBpexchSession,
   getPrices7Token,
+  startBpexchKeepalive,
   refreshPrices7TokenFromSession,
   fetchPrices7MarketData,
   // ✅ Single-scrape entry point — getLiveHorse/getLiveGreyhound ab isi ek
