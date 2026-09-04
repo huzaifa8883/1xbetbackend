@@ -2432,15 +2432,14 @@ async function resolveMarketIdFromEventId(eventId) {
 
 
 
+
 /**
- * Resolve SportRadar match id for scorecard widget (match.lmtLight).
- * Flow:
- *   1) catalog2 → eventId + any nested scoreboard ids
- *   2) prices7 market data scoreboard
- *   3) bpexch Scorecard / Market HTML (session) — parse matchId / SIR / LMT urls
- *   4) handler AJAX endpoints
+ * Resolve REAL SportRadar match id for SIR match.lmtLight widget.
+ * CRITICAL: Betfair eventId (e.g. 36026448) is NOT a SportRadar id.
+ * Mounting SIR with eventId → "No data available".
+ * Only accept ids found inside SportRadar-specific markup.
  */
-const _srMatchIdCache = new Map(); // key -> { id, exp }
+const _srMatchIdCache = new Map();
 const SR_CACHE_TTL_MS = 30 * 60_000;
 
 async function resolveSportRadarMatchId(marketOrEventId) {
@@ -2451,67 +2450,63 @@ async function resolveSportRadarMatchId(marketOrEventId) {
   const cached = _srMatchIdCache.get(id) || _srMatchIdCache.get(raw);
   if (cached && Date.now() < cached.exp) return cached.id;
 
+  let eventIdStr = null;
+  const banned = new Set([
+    id,
+    id.replace(/^1\./, ''),
+    raw,
+    String(raw).replace(/^1\./, ''),
+  ]);
+
   function remember(srId, source) {
-    if (!srId) return null;
-    const s = String(srId).replace(/\D/g, '') || String(srId);
-    if (s.length < 5 || s.length > 12) return null;
-    // skip only exact Betfair market numeric tail (e.g. 261961116 from 1.261961116)
-    const mktTail = id.replace(/^1\./, '');
-    if (s === mktTail) return null;
-    logger.info(`[scorecard] SportRadar matchId=${s} via ${source} for ${id}`);
+    if (srId == null || srId === '') return null;
+    const s = String(srId).replace(/\D/g, '');
+    if (s.length < 6 || s.length > 12) return null;
+    if (banned.has(s)) return null;
+    if (eventIdStr && s === eventIdStr) return null;
+    logger.info(`[scorecard] REAL SportRadar matchId=${s} via ${source} for ${id}`);
     const entry = { id: s, exp: Date.now() + SR_CACHE_TTL_MS };
     _srMatchIdCache.set(id, entry);
     _srMatchIdCache.set(raw, entry);
+    if (eventIdStr) _srMatchIdCache.set(eventIdStr, entry);
     return s;
   }
 
-  function extractFromText(text) {
-    if (!text) return null;
+  function extractStrictSrId(text) {
+    if (!text || typeof text !== 'string') return null;
     const patterns = [
-      /SIR\s*\(\s*["']addWidget["'][\s\S]{0,200}?matchId\s*:\s*(\d{5,12})/i,
-      /match\.lmtLight[\s\S]{0,120}?matchId\s*:\s*(\d{5,12})/i,
-      /data-sr-input-props\s*=\s*["'][^"']*matchId[^"']*?(\d{5,12})/i,
-      /["']matchId["']\s*:\s*(\d{5,12})/,
-      /var\s+matchId\s*=\s*(\d{5,12})\s*;/i,
-      /matchId\s*=\s*(\d{5,12})\s*;/i,
-      /get_scorecard\/(\d{5,12})/i,
-      /lmt\.fn\.sportradar\.com\/[^"'\\s]+\/(\d{5,12})/i,
-      /widgets\.sir\.sportradar\.com[^"'\\s]*matchId[=:](\d{5,12})/i,
-      /sr-widget[^>]{0,200}matchId["'\s:]+(\d{5,12})/i,
-      /"sportradarMatchId"\s*:\s*"?(\d{5,12})"?/i,
-      /"srMatchId"\s*:\s*"?(\d{5,12})"?/i,
-      /"eventId"\s*:\s*(\d{6,12}).{0,40}"provider"\s*:\s*"sportradar"/i,
-      /SHOWLIVE\s*\(\s*(\d{5,12})\s*\)/i,
-      /ShowLive\s*\(\s*(\d{5,12})\s*\)/i,
-      /SHOWSC\s*\(\s*(\d{5,12})\s*\)/i,
-      /livesc[^>]*src=["'][^"']*[?&](?:id|matchId)=(\d{5,12})/i,
-      /Scorecard\?id=(\d{5,12})/i,
-      /matchId["'\s:=]+(\d{6,10})/i,
+      /SIR\s*\(\s*["']addWidget["'][\s\S]{0,500}?matchId\s*:\s*(\d{6,12})/i,
+      /match\.lmt(?:Light|Plus|PlusModal)?[\s\S]{0,250}?matchId\s*:\s*(\d{6,12})/i,
+      /data-sr-input-props\s*=\s*["'][^"']{0,300}?matchId[^0-9]{0,15}(\d{6,12})/i,
+      /lmt\.fn\.sportradar\.com\/[^"'\\\s]+\/(\d{6,12})/i,
+      /get_scorecard\/(\d{6,12})/i,
+      /widgets\.sir\.sportradar\.com\/[^"'\\\s]*[?&]matchId=(\d{6,12})/i,
+      /"sportradarMatchId"\s*:\s*"?(\d{6,12})"?/i,
+      /"srMatchId"\s*:\s*"?(\d{6,12})"?/i,
+      /"sr_match_id"\s*:\s*"?(\d{6,12})"?/i,
     ];
     for (const re of patterns) {
       const m = re.exec(text);
       if (m && m[1]) {
-        const hit = remember(m[1], 'regex');
+        const hit = remember(m[1], 'strict-regex');
         if (hit) return hit;
       }
     }
     return null;
   }
 
-  // ── 1) catalog2 structure ──
-  let eventId = null;
-  let cat = null;
+  // 1) catalog2
   try {
-    cat = await fetchBpexchCatalog2(id);
+    const cat = await fetchBpexchCatalog2(id);
     if (cat) {
-      eventId = cat.eventId || cat.event?.id || null;
-      const hit = extractFromText(JSON.stringify(cat));
+      eventIdStr = String(cat.eventId || cat.event?.id || '').replace(/\D/g, '') || null;
+      if (eventIdStr) banned.add(eventIdStr);
+      const hit = extractStrictSrId(JSON.stringify(cat));
       if (hit) return hit;
-      // nested scoreboard
-      if (cat.scoreboard) {
-        const sb = cat.scoreboard;
-        const cand = sb.matchId || sb.MatchId || sb.srMatchId || sb.eventId || sb.id;
-        const hit2 = remember(cand, 'catalog2.scoreboard');
+      const sb = cat.scoreboard || cat.scores;
+      if (sb && typeof sb === 'object') {
+        const cand = sb.sportradarMatchId || sb.srMatchId || sb.sr_match_id || sb.sportRadarId;
+        const hit2 = remember(cand, 'catalog2.srField');
         if (hit2) return hit2;
       }
     }
@@ -2519,16 +2514,16 @@ async function resolveSportRadarMatchId(marketOrEventId) {
     logger.warn(`[scorecard] catalog2 ${id}: ${e.message}`);
   }
 
-  // ── 2) prices7 live scoreboard ──
+  // 2) prices7
   try {
     const live = await fetchPrices7MarketData(id);
     if (live) {
-      const hit = extractFromText(JSON.stringify(live));
+      const hit = extractStrictSrId(JSON.stringify(live));
       if (hit) return hit;
-      const sb = live.scoreboard || live.scores || null;
-      if (sb) {
-        const cand = sb.matchId || sb.MatchId || sb.srMatchId || sb.eventId || sb.id;
-        const hit2 = remember(cand, 'prices7.scoreboard');
+      const sb = live.scoreboard || live.scores;
+      if (sb && typeof sb === 'object') {
+        const cand = sb.sportradarMatchId || sb.srMatchId || sb.sr_match_id || sb.sportRadarId;
+        const hit2 = remember(cand, 'prices7.srField');
         if (hit2) return hit2;
       }
     }
@@ -2536,19 +2531,17 @@ async function resolveSportRadarMatchId(marketOrEventId) {
     logger.warn(`[scorecard] prices7 ${id}: ${e.message}`);
   }
 
-  // ── 3) bpexch HTML pages (need session) ──
+  // 3) bpexch Scorecard HTML only (Market page uses matchId=eventId — ignore)
   try { await ensureBpexchSession(); } catch (_) {}
 
-  const idsToTry = [...new Set([id, eventId, raw].filter(Boolean).map(String))];
+  const idsToTry = [...new Set([id, eventIdStr, raw].filter(Boolean).map(String))];
   const pathTemplates = [
     (x) => `${BPEXCH_BASE_URL}/Common/Scorecard?id=${encodeURIComponent(x)}`,
     (x) => `${BPEXCH_BASE_URL}/Common/ScorecardIframe?id=${encodeURIComponent(x)}`,
-    (x) => `${BPEXCH_BASE_URL}/Common/Market?id=${encodeURIComponent(x)}`,
     (x) => `${BPEXCH_BASE_URL}/Common/Market?handler=Scorecard&id=${encodeURIComponent(x)}`,
+    (x) => `${BPEXCH_BASE_URL}/Common/Market?handler=Scorecard&Evid=${encodeURIComponent(x)}`,
     (x) => `${BPEXCH_BASE_URL}/Common/Market?handler=LMT&id=${encodeURIComponent(x)}`,
-    (x) => `${BPEXCH_BASE_URL}/Common/Market?handler=ChannelData&Evid=${encodeURIComponent(x)}`,
-    (x) => `${BPEXCH_BASE_URL}/Common/Event/${encodeURIComponent(x)}`,
-    (x) => `${BPEXCH_BASE_URL}/Common/Event?id=${encodeURIComponent(x)}`,
+    (x) => `${BPEXCH_BASE_URL}/Common/Market?handler=LMT&Evid=${encodeURIComponent(x)}`,
   ];
 
   for (const xid of idsToTry) {
@@ -2558,7 +2551,7 @@ async function resolveSportRadarMatchId(marketOrEventId) {
         const res = await axios.get(url, {
           timeout: TIMEOUT_MS,
           headers: bpexchHeaders({
-            Accept: 'text/html,application/xhtml+xml,application/json',
+            Accept: 'text/html,application/xhtml+xml,application/json,*/*',
             'X-Requested-With': 'XMLHttpRequest',
             Referer: `${BPEXCH_BASE_URL}/Common/Market?id=${encodeURIComponent(id)}`,
           }),
@@ -2573,18 +2566,30 @@ async function resolveSportRadarMatchId(marketOrEventId) {
         body = String(body || '');
         if (body.length < 40) continue;
         if (/Just a moment|cf-browser-verification|Access denied|Error 1005/i.test(body)) {
-          logger.warn(`[scorecard] blocked/challenge at ${url.split('?')[0]}`);
+          logger.warn(`[scorecard] blocked at ${url.split('?')[0]}`);
           continue;
         }
-        const hit = extractFromText(body);
+
+        const hit = extractStrictSrId(body);
         if (hit) return hit;
+
+        // Scorecard page only: var matchId = NNN is SR id (not event id)
+        const hasSir = /widgets\.sir\.sportradar|match\.lmtLight|SIR\s*\(/i.test(body);
+        if (hasSir) {
+          const mVar = /var\s+matchId\s*=\s*(\d{6,12})\s*;/i.exec(body);
+          if (mVar && mVar[1] && mVar[1] !== eventIdStr && !banned.has(mVar[1])) {
+            const hit2 = remember(mVar[1], 'scorecard-page-var');
+            if (hit2) return hit2;
+          }
+        }
+        logger.info(`[scorecard] no SR id in body url=${url.split('?')[0]} len=${body.length} hasSir=${hasSir}`);
       } catch (e) {
-        logger.warn(`[scorecard] ${url.split('?')[0]}: ${e.message}`);
+        logger.warn(`[scorecard] fetch fail ${url.split('?')[0]}: ${e.message}`);
       }
     }
   }
 
-  logger.warn(`[scorecard] no SportRadar matchId for market=${id} event=${eventId || '-'}`);
+  logger.warn(`[scorecard] no REAL SportRadar matchId for market=${id} event=${eventIdStr || '-'}`);
   return null;
 }
 
