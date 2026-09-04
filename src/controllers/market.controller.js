@@ -1,3 +1,4 @@
+
 'use strict';
 
 const { v4: uuidv4 } = require('uuid');
@@ -14,6 +15,7 @@ const {
   fetchPrices7MarketData,
   normalizeMarketId,
   sportItems,
+  resolveSportRadarMatchId,
 } = require('../services/betfair.service');
 const { sendSuccess, sendError } = require('../utils/response');
 const { SPORT_MAP } = require('../config/constants');
@@ -1716,6 +1718,30 @@ async function getEventMarkets(req, res) {
 
 /* ── Exports ─────────────────────────────────────────────── */
 
+
+/* ── Scorecard: SportRadar match id for SIR widget ─────────────── */
+async function getScorecardId(req, res) {
+  try {
+    const raw = req.query.id || req.query.marketId || req.query.eventId || '';
+    if (!raw) return sendError(res, 'id required', 400);
+    let resolveFn = null;
+    try {
+      resolveFn = require('../services/betfair.service').resolveSportRadarMatchId;
+    } catch (_) {}
+    if (!resolveFn && typeof resolveSportRadarMatchId === 'function') resolveFn = resolveSportRadarMatchId;
+    if (!resolveFn) return sendError(res, 'resolveSportRadarMatchId missing', 500);
+    const srMatchId = await resolveFn(String(raw));
+    return sendSuccess(res, {
+      id: String(raw),
+      srMatchId: srMatchId || null,
+      clientId: '8ee45b574e2781d581b0b0a133803906',
+    });
+  } catch (e) {
+    logger.error(`[scorecard-id] ${e.message}`);
+    return sendError(res, e.message, 500);
+  }
+}
+
 module.exports = {
   getLiveCricket,
   getLiveCricketInplay,
@@ -1726,6 +1752,7 @@ module.exports = {
   getLiveSport,
   getMarketData,
   getMarketCatalog2,
+  getScorecardId,
   getNavigation,
   getBetfairCompetitions,
   getBetfairActiveLeagues,   // ← NEW
