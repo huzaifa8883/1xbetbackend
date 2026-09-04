@@ -56,6 +56,7 @@ router.get('/catalog2', ctrl.getMarketCatalog2);
  * Response: { success, data: { id, srMatchId, clientId } }
  */
 router.get('/scorecard-id', ctrl.getScorecardId);
+router.get('/scorecard-html', ctrl.getScorecardHtml);
 /**
  * @route   GET /api/v1/markets/Navigation?id=<id>&type=<0|1|2>
  * @desc    Sports navigation tree (sports → competitions → events → markets)
