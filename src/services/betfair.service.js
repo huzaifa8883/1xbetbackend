@@ -2431,80 +2431,160 @@ async function resolveMarketIdFromEventId(eventId) {
 
 
 
+
 /**
  * Resolve SportRadar match id for scorecard widget (match.lmtLight).
- * bpexch embeds e.g. matchId: 73654230 in Scorecard / Market page HTML.
- * We scrape with session so CF/anonymous issues are reduced.
+ * Flow:
+ *   1) catalog2 → eventId + any nested scoreboard ids
+ *   2) prices7 market data scoreboard
+ *   3) bpexch Scorecard / Market HTML (session) — parse matchId / SIR / LMT urls
+ *   4) handler AJAX endpoints
  */
+const _srMatchIdCache = new Map(); // key -> { id, exp }
+const SR_CACHE_TTL_MS = 30 * 60_000;
+
 async function resolveSportRadarMatchId(marketOrEventId) {
-  const id = normalizeMarketId(String(marketOrEventId || '').trim());
-  if (!id) return null;
+  const raw = String(marketOrEventId || '').trim();
+  if (!raw) return null;
+  const id = normalizeMarketId(raw);
 
-  await ensureBpexchSession();
+  const cached = _srMatchIdCache.get(id) || _srMatchIdCache.get(raw);
+  if (cached && Date.now() < cached.exp) return cached.id;
 
-  const urls = [
-    `${BPEXCH_BASE_URL}/Common/Scorecard?id=${encodeURIComponent(id)}`,
-    `${BPEXCH_BASE_URL}/Common/ScorecardIframe?id=${encodeURIComponent(id)}`,
-    `${BPEXCH_BASE_URL}/Common/Market?id=${encodeURIComponent(id)}`,
-    `${BPEXCH_BASE_URL}/Common/Event/${encodeURIComponent(id)}`,
-    `${BPEXCH_BASE_URL}/Common/Event?id=${encodeURIComponent(id)}`,
-  ];
+  function remember(srId, source) {
+    if (!srId) return null;
+    const s = String(srId).replace(/\D/g, '') || String(srId);
+    if (s.length < 5 || s.length > 12) return null;
+    // skip only exact Betfair market numeric tail (e.g. 261961116 from 1.261961116)
+    const mktTail = id.replace(/^1\./, '');
+    if (s === mktTail) return null;
+    logger.info(`[scorecard] SportRadar matchId=${s} via ${source} for ${id}`);
+    const entry = { id: s, exp: Date.now() + SR_CACHE_TTL_MS };
+    _srMatchIdCache.set(id, entry);
+    _srMatchIdCache.set(raw, entry);
+    return s;
+  }
 
-  const patterns = [
-    /matchId["'\s:]+(\d{5,})/i,
-    /"matchId"\s*:\s*(\d{5,})/,
-    /data-sr-input-props="[^"]*matchId[^"]*?(\d{5,})/i,
-    /match\.lmtLight[^)]*matchId:\s*(\d{5,})/i,
-    /SIR\s*\(\s*["']addWidget["'][^)]*matchId:\s*(\d{5,})/i,
-    /get_scorecard\/(\d{5,})/i,
-    /lmt\.fn\.sportradar\.com[^"']+\/(\d{5,})/i,
-  ];
-
-  for (const url of urls) {
-    try {
-      const res = await axios.get(url, {
-        timeout: TIMEOUT_MS,
-        headers: bpexchHeaders({ Accept: 'text/html,application/xhtml+xml' }),
-        validateStatus: s => s < 500,
-        maxRedirects: 5,
-      });
-      if (res.headers['set-cookie']) {
-        _bpexchCookie = mergeSetCookie(_bpexchCookie, res.headers['set-cookie']);
+  function extractFromText(text) {
+    if (!text) return null;
+    const patterns = [
+      /SIR\s*\(\s*["']addWidget["'][\s\S]{0,200}?matchId\s*:\s*(\d{5,12})/i,
+      /match\.lmtLight[\s\S]{0,120}?matchId\s*:\s*(\d{5,12})/i,
+      /data-sr-input-props\s*=\s*["'][^"']*matchId[^"']*?(\d{5,12})/i,
+      /["']matchId["']\s*:\s*(\d{5,12})/,
+      /var\s+matchId\s*=\s*(\d{5,12})\s*;/i,
+      /matchId\s*=\s*(\d{5,12})\s*;/i,
+      /get_scorecard\/(\d{5,12})/i,
+      /lmt\.fn\.sportradar\.com\/[^"'\\s]+\/(\d{5,12})/i,
+      /widgets\.sir\.sportradar\.com[^"'\\s]*matchId[=:](\d{5,12})/i,
+      /sr-widget[^>]{0,200}matchId["'\s:]+(\d{5,12})/i,
+      /"sportradarMatchId"\s*:\s*"?(\d{5,12})"?/i,
+      /"srMatchId"\s*:\s*"?(\d{5,12})"?/i,
+      /"eventId"\s*:\s*(\d{6,12}).{0,40}"provider"\s*:\s*"sportradar"/i,
+      /SHOWLIVE\s*\(\s*(\d{5,12})\s*\)/i,
+      /ShowLive\s*\(\s*(\d{5,12})\s*\)/i,
+      /SHOWSC\s*\(\s*(\d{5,12})\s*\)/i,
+      /livesc[^>]*src=["'][^"']*[?&](?:id|matchId)=(\d{5,12})/i,
+      /Scorecard\?id=(\d{5,12})/i,
+      /matchId["'\s:=]+(\d{6,10})/i,
+    ];
+    for (const re of patterns) {
+      const m = re.exec(text);
+      if (m && m[1]) {
+        const hit = remember(m[1], 'regex');
+        if (hit) return hit;
       }
-      const html = typeof res.data === 'string' ? res.data : JSON.stringify(res.data || '');
-      if (!html || html.length < 50) continue;
-      if (html.includes('Just a moment')) continue;
+    }
+    return null;
+  }
 
-      for (const re of patterns) {
-        const m = re.exec(html);
-        if (m && m[1]) {
-          const srId = m[1];
-          // avoid matching Betfair-ish ids that are too long market fragments
-          if (srId.length >= 5 && srId.length <= 12) {
-            logger.info(`[scorecard] SportRadar matchId=${srId} from ${url.split('?')[0]} for ${id}`);
-            return srId;
-          }
+  // ── 1) catalog2 structure ──
+  let eventId = null;
+  let cat = null;
+  try {
+    cat = await fetchBpexchCatalog2(id);
+    if (cat) {
+      eventId = cat.eventId || cat.event?.id || null;
+      const hit = extractFromText(JSON.stringify(cat));
+      if (hit) return hit;
+      // nested scoreboard
+      if (cat.scoreboard) {
+        const sb = cat.scoreboard;
+        const cand = sb.matchId || sb.MatchId || sb.srMatchId || sb.eventId || sb.id;
+        const hit2 = remember(cand, 'catalog2.scoreboard');
+        if (hit2) return hit2;
+      }
+    }
+  } catch (e) {
+    logger.warn(`[scorecard] catalog2 ${id}: ${e.message}`);
+  }
+
+  // ── 2) prices7 live scoreboard ──
+  try {
+    const live = await fetchPrices7MarketData(id);
+    if (live) {
+      const hit = extractFromText(JSON.stringify(live));
+      if (hit) return hit;
+      const sb = live.scoreboard || live.scores || null;
+      if (sb) {
+        const cand = sb.matchId || sb.MatchId || sb.srMatchId || sb.eventId || sb.id;
+        const hit2 = remember(cand, 'prices7.scoreboard');
+        if (hit2) return hit2;
+      }
+    }
+  } catch (e) {
+    logger.warn(`[scorecard] prices7 ${id}: ${e.message}`);
+  }
+
+  // ── 3) bpexch HTML pages (need session) ──
+  try { await ensureBpexchSession(); } catch (_) {}
+
+  const idsToTry = [...new Set([id, eventId, raw].filter(Boolean).map(String))];
+  const pathTemplates = [
+    (x) => `${BPEXCH_BASE_URL}/Common/Scorecard?id=${encodeURIComponent(x)}`,
+    (x) => `${BPEXCH_BASE_URL}/Common/ScorecardIframe?id=${encodeURIComponent(x)}`,
+    (x) => `${BPEXCH_BASE_URL}/Common/Market?id=${encodeURIComponent(x)}`,
+    (x) => `${BPEXCH_BASE_URL}/Common/Market?handler=Scorecard&id=${encodeURIComponent(x)}`,
+    (x) => `${BPEXCH_BASE_URL}/Common/Market?handler=LMT&id=${encodeURIComponent(x)}`,
+    (x) => `${BPEXCH_BASE_URL}/Common/Market?handler=ChannelData&Evid=${encodeURIComponent(x)}`,
+    (x) => `${BPEXCH_BASE_URL}/Common/Event/${encodeURIComponent(x)}`,
+    (x) => `${BPEXCH_BASE_URL}/Common/Event?id=${encodeURIComponent(x)}`,
+  ];
+
+  for (const xid of idsToTry) {
+    for (const tpl of pathTemplates) {
+      const url = tpl(xid);
+      try {
+        const res = await axios.get(url, {
+          timeout: TIMEOUT_MS,
+          headers: bpexchHeaders({
+            Accept: 'text/html,application/xhtml+xml,application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+            Referer: `${BPEXCH_BASE_URL}/Common/Market?id=${encodeURIComponent(id)}`,
+          }),
+          validateStatus: s => s < 500,
+          maxRedirects: 5,
+        });
+        if (res.headers['set-cookie']) {
+          _bpexchCookie = mergeSetCookie(_bpexchCookie, res.headers['set-cookie']);
         }
+        let body = res.data;
+        if (body && typeof body === 'object') body = JSON.stringify(body);
+        body = String(body || '');
+        if (body.length < 40) continue;
+        if (/Just a moment|cf-browser-verification|Access denied|Error 1005/i.test(body)) {
+          logger.warn(`[scorecard] blocked/challenge at ${url.split('?')[0]}`);
+          continue;
+        }
+        const hit = extractFromText(body);
+        if (hit) return hit;
+      } catch (e) {
+        logger.warn(`[scorecard] ${url.split('?')[0]}: ${e.message}`);
       }
-    } catch (e) {
-      logger.warn(`[scorecard] fetch ${url}: ${e.message}`);
     }
   }
 
-  // Try catalog2 / prices7 scoreboard for any nested match id
-  try {
-    const cat = await fetchBpexchCatalog2(id);
-    const blob = JSON.stringify(cat || {});
-    for (const re of patterns) {
-      const m = re.exec(blob);
-      if (m && m[1]) {
-        logger.info(`[scorecard] SportRadar matchId=${m[1]} from catalog2 for ${id}`);
-        return m[1];
-      }
-    }
-  } catch (_) {}
-
-  logger.warn(`[scorecard] no SportRadar matchId for ${id}`);
+  logger.warn(`[scorecard] no SportRadar matchId for market=${id} event=${eventId || '-'}`);
   return null;
 }
 
