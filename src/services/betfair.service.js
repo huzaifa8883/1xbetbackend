@@ -2431,6 +2431,84 @@ async function resolveMarketIdFromEventId(eventId) {
 
 
 
+/**
+ * Resolve SportRadar match id for scorecard widget (match.lmtLight).
+ * bpexch embeds e.g. matchId: 73654230 in Scorecard / Market page HTML.
+ * We scrape with session so CF/anonymous issues are reduced.
+ */
+async function resolveSportRadarMatchId(marketOrEventId) {
+  const id = normalizeMarketId(String(marketOrEventId || '').trim());
+  if (!id) return null;
+
+  await ensureBpexchSession();
+
+  const urls = [
+    `${BPEXCH_BASE_URL}/Common/Scorecard?id=${encodeURIComponent(id)}`,
+    `${BPEXCH_BASE_URL}/Common/ScorecardIframe?id=${encodeURIComponent(id)}`,
+    `${BPEXCH_BASE_URL}/Common/Market?id=${encodeURIComponent(id)}`,
+    `${BPEXCH_BASE_URL}/Common/Event/${encodeURIComponent(id)}`,
+    `${BPEXCH_BASE_URL}/Common/Event?id=${encodeURIComponent(id)}`,
+  ];
+
+  const patterns = [
+    /matchId["'\s:]+(\d{5,})/i,
+    /"matchId"\s*:\s*(\d{5,})/,
+    /data-sr-input-props="[^"]*matchId[^"]*?(\d{5,})/i,
+    /match\.lmtLight[^)]*matchId:\s*(\d{5,})/i,
+    /SIR\s*\(\s*["']addWidget["'][^)]*matchId:\s*(\d{5,})/i,
+    /get_scorecard\/(\d{5,})/i,
+    /lmt\.fn\.sportradar\.com[^"']+\/(\d{5,})/i,
+  ];
+
+  for (const url of urls) {
+    try {
+      const res = await axios.get(url, {
+        timeout: TIMEOUT_MS,
+        headers: bpexchHeaders({ Accept: 'text/html,application/xhtml+xml' }),
+        validateStatus: s => s < 500,
+        maxRedirects: 5,
+      });
+      if (res.headers['set-cookie']) {
+        _bpexchCookie = mergeSetCookie(_bpexchCookie, res.headers['set-cookie']);
+      }
+      const html = typeof res.data === 'string' ? res.data : JSON.stringify(res.data || '');
+      if (!html || html.length < 50) continue;
+      if (html.includes('Just a moment')) continue;
+
+      for (const re of patterns) {
+        const m = re.exec(html);
+        if (m && m[1]) {
+          const srId = m[1];
+          // avoid matching Betfair-ish ids that are too long market fragments
+          if (srId.length >= 5 && srId.length <= 12) {
+            logger.info(`[scorecard] SportRadar matchId=${srId} from ${url.split('?')[0]} for ${id}`);
+            return srId;
+          }
+        }
+      }
+    } catch (e) {
+      logger.warn(`[scorecard] fetch ${url}: ${e.message}`);
+    }
+  }
+
+  // Try catalog2 / prices7 scoreboard for any nested match id
+  try {
+    const cat = await fetchBpexchCatalog2(id);
+    const blob = JSON.stringify(cat || {});
+    for (const re of patterns) {
+      const m = re.exec(blob);
+      if (m && m[1]) {
+        logger.info(`[scorecard] SportRadar matchId=${m[1]} from catalog2 for ${id}`);
+        return m[1];
+      }
+    }
+  } catch (_) {}
+
+  logger.warn(`[scorecard] no SportRadar matchId for ${id}`);
+  return null;
+}
+
+
 module.exports = {
   getSessionToken,
   getEventDetails,
@@ -2452,6 +2530,7 @@ module.exports = {
   resolveRealRaceMarketId,
   ensureBpexchSession,
   getPrices7Token,
+  resolveSportRadarMatchId,
   startBpexchKeepalive,
   refreshPrices7TokenFromSession,
   fetchPrices7MarketData,
