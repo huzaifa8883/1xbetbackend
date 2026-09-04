@@ -1,4 +1,3 @@
-
 'use strict';
 
 const { v4: uuidv4 } = require('uuid');
@@ -16,6 +15,7 @@ const {
   normalizeMarketId,
   sportItems,
   resolveSportRadarMatchId,
+  fetchBpexchScorecardHtml,
 } = require('../services/betfair.service');
 const { sendSuccess, sendError } = require('../utils/response');
 const { SPORT_MAP } = require('../config/constants');
@@ -1746,6 +1746,43 @@ async function getScorecardId(req, res) {
   }
 }
 
+
+/* ── Scorecard HTML proxy — exact bpexch SIR widget ───────── */
+async function getScorecardHtml(req, res) {
+  try {
+    const raw = req.query.id || req.query.marketId || req.query.eventId || '';
+    if (!raw) {
+      res.status(400).send('id required');
+      return;
+    }
+    let fetchFn = null;
+    try {
+      fetchFn = require('../services/betfair.service').fetchBpexchScorecardHtml;
+    } catch (_) {}
+    if (!fetchFn && typeof fetchBpexchScorecardHtml === 'function') fetchFn = fetchBpexchScorecardHtml;
+    if (!fetchFn) {
+      res.status(500).send('fetchBpexchScorecardHtml missing');
+      return;
+    }
+    const result = await fetchFn(String(raw));
+    if (!result || !result.html) {
+      // Minimal fallback page with message
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.status(200).send(`<!doctype html><html><body style="margin:0;background:#0b1220;color:#94a3b8;font-family:sans-serif;padding:16px;text-align:center;">
+        Scorecard not available for this market yet.
+      </body></html>`);
+      return;
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    // Allow parent page to size iframe via postMessage (bpexch already sends)
+    res.status(200).send(result.html);
+  } catch (e) {
+    logger.error(`[scorecard-html] ${e.message}`);
+    res.status(500).send('scorecard error');
+  }
+}
+
 module.exports = {
   getLiveCricket,
   getLiveCricketInplay,
@@ -1757,6 +1794,7 @@ module.exports = {
   getMarketData,
   getMarketCatalog2,
   getScorecardId,
+  getScorecardHtml,
   getNavigation,
   getBetfairCompetitions,
   getBetfairActiveLeagues,   // ← NEW
