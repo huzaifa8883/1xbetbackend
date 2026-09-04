@@ -1731,9 +1731,13 @@ async function getScorecardId(req, res) {
     if (!resolveFn && typeof resolveSportRadarMatchId === 'function') resolveFn = resolveSportRadarMatchId;
     if (!resolveFn) return sendError(res, 'resolveSportRadarMatchId missing', 500);
     const srMatchId = await resolveFn(String(raw));
+    // Guard: never treat Betfair eventId / market tail as SportRadar id
+    let safe = srMatchId ? String(srMatchId) : null;
+    const tail = String(raw).replace(/^1\./, '');
+    if (safe && (safe === tail || safe === String(raw))) safe = null;
     return sendSuccess(res, {
       id: String(raw),
-      srMatchId: srMatchId || null,
+      srMatchId: safe,
       clientId: '8ee45b574e2781d581b0b0a133803906',
     });
   } catch (e) {
