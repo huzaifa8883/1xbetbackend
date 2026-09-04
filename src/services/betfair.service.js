@@ -2594,6 +2594,79 @@ async function resolveSportRadarMatchId(marketOrEventId) {
 }
 
 
+
+/**
+ * Fetch bpexch Scorecard HTML (contains real SIR match.lmtLight widget).
+ * Returned to frontend via same-origin iframe → EXACT bpexch design.
+ */
+async function fetchBpexchScorecardHtml(marketOrEventId) {
+  const raw = String(marketOrEventId || '').trim();
+  if (!raw) return null;
+  const id = normalizeMarketId(raw);
+
+  try { await ensureBpexchSession(); } catch (_) {}
+
+  let eventId = null;
+  try {
+    const cat = await fetchBpexchCatalog2(id);
+    eventId = cat && (cat.eventId || cat.event?.id) ? String(cat.eventId || cat.event.id) : null;
+  } catch (_) {}
+
+  const ids = [...new Set([id, eventId, raw].filter(Boolean).map(String))];
+  const urls = [];
+  for (const x of ids) {
+    urls.push(`${BPEXCH_BASE_URL}/Common/Scorecard?id=${encodeURIComponent(x)}`);
+    urls.push(`${BPEXCH_BASE_URL}/Common/ScorecardIframe?id=${encodeURIComponent(x)}`);
+    urls.push(`${BPEXCH_BASE_URL}/Common/Market?handler=Scorecard&id=${encodeURIComponent(x)}`);
+    urls.push(`${BPEXCH_BASE_URL}/Common/Market?handler=Scorecard&Evid=${encodeURIComponent(x)}`);
+  }
+
+  for (const url of urls) {
+    try {
+      const res = await axios.get(url, {
+        timeout: TIMEOUT_MS,
+        headers: bpexchHeaders({
+          Accept: 'text/html,application/xhtml+xml',
+          'X-Requested-With': 'XMLHttpRequest',
+          Referer: `${BPEXCH_BASE_URL}/Common/Market?id=${encodeURIComponent(id)}`,
+        }),
+        validateStatus: s => s < 500,
+        maxRedirects: 5,
+      });
+      if (res.headers['set-cookie']) {
+        _bpexchCookie = mergeSetCookie(_bpexchCookie, res.headers['set-cookie']);
+      }
+      let html = typeof res.data === 'string' ? res.data : '';
+      if (!html || html.length < 80) continue;
+      if (/Just a moment|cf-browser-verification|Access denied|Error 1005|login/i.test(html) && !/sir\.sportradar|match\.lmtLight|widgets\.sir/i.test(html)) {
+        logger.warn(`[scorecard-html] skip non-scorecard body from ${url.split('?')[0]} len=${html.length}`);
+        continue;
+      }
+
+      // Prefer pages that already embed SportRadar
+      const hasSir = /widgets\.sir\.sportradar|match\.lmtLight|SIR\s*\(|sr-widget/i.test(html);
+
+      // Rewrite relative URLs so assets still load from bpexch where needed
+      html = html.replace(/(href|src)=["']\/(?!\/)/gi, `$1="${BPEXCH_BASE_URL}/`);
+      // Base tag helps relative paths
+      if (!/<base\s/i.test(html)) {
+        html = html.replace(/<head([^>]*)>/i, `<head$1><base href="${BPEXCH_BASE_URL}/">`);
+      }
+      // Allow embedding in our iframe (remove frame-bust if any simple patterns)
+      html = html.replace(/if\s*\(\s*top\s*!==\s*self\s*\)\s*top\.location[^;]+;?/gi, '');
+      html = html.replace(/if\s*\(\s*window\s*!==\s*window\.top\s*\)[^}]+}/gi, '');
+
+      // Height postMessage already in their scorecard — keep it
+      logger.info(`[scorecard-html] ok from ${url.split('?')[0]} len=${html.length} hasSir=${hasSir}`);
+      return { html, hasSir, source: url.split('?')[0] };
+    } catch (e) {
+      logger.warn(`[scorecard-html] ${url.split('?')[0]}: ${e.message}`);
+    }
+  }
+  return null;
+}
+
+
 module.exports = {
   getSessionToken,
   getEventDetails,
@@ -2616,6 +2689,7 @@ module.exports = {
   ensureBpexchSession,
   getPrices7Token,
   resolveSportRadarMatchId,
+  fetchBpexchScorecardHtml,
   startBpexchKeepalive,
   refreshPrices7TokenFromSession,
   fetchPrices7MarketData,
