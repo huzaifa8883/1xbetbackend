@@ -1,4 +1,5 @@
 
+
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -2298,10 +2299,15 @@ async function getBpexchMarketPage(marketId, pricesToken) {
       const part = await fetchBpexchCatalogs(subIds.slice(i, i + 40));
       subCatalogs = subCatalogs.concat(part || []);
     }
-    // per-id fallback if bulk empty
-    if (!subCatalogs.length) {
-      const results = await Promise.all(subIds.slice(0, 20).map(id => fetchBpexchCatalog2(id).catch(() => null)));
-      subCatalogs = results.filter(Boolean);
+    // per-id fill for any id bulk missed (Bookmaker 1.xxx often missing from bulk)
+    const got = new Set(subCatalogs.map(c => String(c.marketId)));
+    const missing = subIds.filter(id => !got.has(String(id)));
+    if (missing.length) {
+      const results = await Promise.all(missing.slice(0, 25).map(id => fetchBpexchCatalog2(id).catch(() => null)));
+      for (const cat of results) {
+        if (cat && cat.marketId) subCatalogs.push(cat);
+      }
+      logger.info(`[bpexch] catalogs per-id fill missing=${missing.length} got=${results.filter(Boolean).length}`);
     }
   }
 
@@ -2389,10 +2395,15 @@ async function getBpexchMarketPage(marketId, pricesToken) {
   for (const cat of subCatalogs) {
     const mid = String(cat.marketId);
     if (mid === String(resolvedId) || seen.has(mid)) continue;
-    if (eventIdStr && cat.eventId != null && String(cat.eventId) !== eventIdStr) continue;
+    const catName = String(cat.marketName || '').toLowerCase();
+    const isBm = cat.isBmMarket === true || catName.includes('bookmaker') || catName.includes('book maker')
+      || catName.includes('book-maker') || String(cat.externalId || '').toUpperCase().includes('-BM');
+    // Keep if same event OR present in prices7 books OR is bookmaker
+    const inPrices7 = bookById.has(mid);
+    if (eventIdStr && cat.eventId != null && String(cat.eventId) !== eventIdStr && !isBm && !inPrices7) continue;
     seen.add(mid);
     const enriched = mergeBookOntoCatalog(cat);
-    const category = categorizeSubMarket(enriched);
+    const category = isBm ? 'bookmaker' : categorizeSubMarket(enriched);
     if (category === 'matchOdds') continue;
     subMarkets.push({ ...enriched, category });
   }
@@ -2444,14 +2455,27 @@ async function getBpexchMarketPage(marketId, pricesToken) {
         lay3: ladder.lay[2]?.price, ls3: ladder.lay[2]?.size,
       };
     });
+    // Heuristic: 1.xxx with 2–3 runners often Bookmaker when not Match Odds
+    let synName = `Market ${mid}`;
+    let synType = 'UNKNOWN';
+    let synCat = 'other';
+    if (String(mid).startsWith('1.') && runners.length >= 2 && runners.length <= 3) {
+      synName = 'Bookmaker';
+      synType = 'BOOKMAKER';
+      synCat = 'bookmaker';
+    } else if (String(mid).startsWith('9.')) {
+      synCat = 'fancy2';
+      synName = synName;
+    }
     subMarkets.push({
       marketId: mid,
-      marketName: `Market ${mid}`,
-      marketType: 'UNKNOWN',
+      marketName: synName,
+      marketType: synType,
       status: mb.marketStatus || 'OPEN',
       totalMatched: mb.totalMatched || 0,
+      isBmMarket: synCat === 'bookmaker',
       runners,
-      category: 'other',
+      category: synCat,
     });
   }
 
