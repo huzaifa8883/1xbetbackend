@@ -1,5 +1,4 @@
 
-
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1981,6 +1980,49 @@ async function discoverMarketIdsFromEventPage(eventId) {
   }
 }
 
+/**
+ * Scrape Market page HTML for related market ids (Bookmaker / Fancy / etc.)
+ */
+async function discoverMarketIdsFromMarketPage(marketId) {
+  if (!marketId) return [];
+  await ensureBpexchSession();
+  const id = normalizeMarketId(marketId);
+  const urls = [
+    `${BPEXCH_BASE_URL}/Common/Market?id=${encodeURIComponent(id)}`,
+    `${BPEXCH_BASE_URL}/Common/Market/${encodeURIComponent(id)}`,
+  ];
+  const found = new Set();
+  for (const url of urls) {
+    try {
+      const res = await axios.get(url, {
+        timeout: TIMEOUT_MS,
+        headers: bpexchHeaders({ Accept: 'text/html' }),
+        validateStatus: s => s < 500,
+      });
+      const html = typeof res.data === 'string' ? res.data : '';
+      if (!html || html.length < 200) continue;
+      let m;
+      const re = /(?:marketId|MarketId|data-market(?:-id)?|market_id)["'\s:=]+([19]\.\d{5,})/gi;
+      while ((m = re.exec(html)) !== null) found.add(m[1]);
+      const re2 = /[?&]id=([19]\.\d{5,})/g;
+      while ((m = re2.exec(html)) !== null) found.add(m[1]);
+      const re4 = /"marketId"\s*:\s*"([19]\.[0-9]+)"/g;
+      while ((m = re4.exec(html)) !== null) found.add(m[1]);
+      // bare 1.xxx near BOOKMAKER / Fancy labels
+      const re5 = /(?:Bookmaker|BOOKMAKER|Fancy|TIED MATCH|Tied Match)[^\d]{0,80}([19]\.\d{6,})/gi;
+      while ((m = re5.exec(html)) !== null) found.add(m[1]);
+      if (found.size) {
+        logger.info(`[bpexch] market page ${id} discovered ${found.size} related ids`);
+        break;
+      }
+    } catch (e) {
+      logger.warn(`[bpexch] market page scrape failed: ${e.message}`);
+    }
+  }
+  found.delete(String(id));
+  return [...found];
+}
+
 async function fetchPrices7MarketData(marketId, token) {
   let tok = await getPrices7Token(token || null);
   if (!tok) {
@@ -2182,7 +2224,45 @@ async function getBpexchMarketPage(marketId, pricesToken) {
   if (Array.isArray(main.relatedMarketIds)) {
     for (const id of main.relatedMarketIds) if (id) subIds.push(String(id));
   }
-  subIds = [...new Set(subIds)];
+  // catalog2 sometimes embeds related markets as objects
+  for (const key of ['relatedMarkets', 'markets', 'otherMarkets', 'subMarkets']) {
+    const arr = main[key];
+    if (!Array.isArray(arr)) continue;
+    for (const item of arr) {
+      const mid = item && (item.marketId || item.id || item.MarketId);
+      if (mid) subIds.push(String(mid));
+    }
+  }
+  subIds = [...new Set(subIds)].filter(id => id && id !== String(resolvedId));
+
+  // ✅ Fallback: prices7 only returned Match Odds (or no token) → scrape event page
+  // for Bookmaker / Fancy / Tied Match ids (same event)
+  const eventIdForDiscover = main.eventId || main.event?.id || main.event?.eventId;
+  if (subIds.length < 2 && eventIdForDiscover) {
+    try {
+      const discovered = await discoverMarketIdsFromEventPage(eventIdForDiscover);
+      for (const id of discovered) {
+        if (id && id !== String(resolvedId)) subIds.push(String(id));
+      }
+      subIds = [...new Set(subIds)];
+      logger.info(`[bpexch] event-page discover eventId=${eventIdForDiscover} → +ids total subIds=${subIds.length}`);
+    } catch (e) {
+      logger.warn(`[bpexch] event-page discover failed: ${e.message}`);
+    }
+  }
+  // Still empty → scrape Market HTML for related Bookmaker/Fancy ids
+  if (subIds.length < 2) {
+    try {
+      const fromMarket = await discoverMarketIdsFromMarketPage(resolvedId);
+      for (const id of fromMarket) {
+        if (id && id !== String(resolvedId)) subIds.push(String(id));
+      }
+      subIds = [...new Set(subIds)];
+      logger.info(`[bpexch] market-page discover ${resolvedId} → total subIds=${subIds.length}`);
+    } catch (e) {
+      logger.warn(`[bpexch] market-page discover failed: ${e.message}`);
+    }
+  }
 
   // Fill missing bookmaker/fancy books — prices7 root call sometimes only returns Match Odds
   const missingBookIds = subIds.filter(id => !bookById.has(String(id)));
@@ -2346,8 +2426,8 @@ async function getBpexchMarketPage(marketId, pricesToken) {
     eventTypeId: String(main.eventTypeId || main.sport?.id || ''),
     eventType: main.eventType || main.sport?.name,
     subMarkets,
-    scoreboard: live?.scoreboard || null,
-    scores: live?.scores || null,
+    scoreboard: live?.scoreboard || live?.scoreBoard || main.scoreboard || null,
+    scores: live?.scores || main.scores || null,
     news: live?.news || main.news || '',
     source: 'bpexch',
   };
