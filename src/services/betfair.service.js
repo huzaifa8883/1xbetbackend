@@ -2184,6 +2184,20 @@ async function getBpexchMarketPage(marketId, pricesToken) {
   }
   subIds = [...new Set(subIds)];
 
+  // Fill missing bookmaker/fancy books — prices7 root call sometimes only returns Match Odds
+  const missingBookIds = subIds.filter(id => !bookById.has(String(id)));
+  if (missingBookIds.length) {
+    const extraFetches = await Promise.all(
+      missingBookIds.slice(0, 15).map(id => fetchPrices7MarketData(id, pricesToken).catch(() => null))
+    );
+    for (const liveX of extraFetches) {
+      const booksX = Array.isArray(liveX?.marketBooks) ? liveX.marketBooks : [];
+      for (const b of booksX) {
+        if (b && b.id != null) bookById.set(String(b.id), b);
+      }
+    }
+  }
+
   // ── 3) catalogs for related markets ──
   let subCatalogs = [];
   if (subIds.length) {
@@ -2223,7 +2237,15 @@ async function getBpexchMarketPage(marketId, pricesToken) {
     });
     return {
       ...cat,
-      status: mb.marketStatus || cat.status,
+      status: (function () {
+        const st = String(mb.marketStatus || cat.status || 'OPEN').toUpperCase();
+        // Bookmaker briefly SUSPENDS between balls — if ladder has prices, keep OPEN for UI
+        const hasPx = (mb.runners || []).some(r =>
+          r.price1 || r.price2 || r.price3 || r.lay1 || r.lay2 || r.lay3
+        );
+        if ((st === 'SUSPENDED' || st === 'SUSPEND') && hasPx) return 'OPEN';
+        return mb.marketStatus || cat.status || 'OPEN';
+      })(),
       totalMatched: mb.totalMatched ?? cat.totalMatched,
       betDelay: mb.betDelay ?? cat.betDelay,
       runners,
