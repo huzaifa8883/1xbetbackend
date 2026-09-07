@@ -1,4 +1,5 @@
 
+
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -2101,7 +2102,9 @@ function categorizeSubMarket(c) {
   const n = String(c.marketName || '').toLowerCase();
   // Match Odds / Winner are NEVER bookmaker even if isBmMarket flag is weirdly true
   if (t === 'MATCH_ODDS' || t === 'WINNER' || t === 'WIN' || n === 'match odds') return 'matchOdds';
-  if (t === 'BOOKMAKER' || t === 'BOOKMAKER2' || n.includes('bookmaker')) return 'bookmaker';
+  if (t === 'BOOKMAKER' || t === 'BOOKMAKER2' || t === 'BM' || t === 'BOOK_MAKER'
+      || n.includes('bookmaker') || n.includes('book maker') || n.includes('book-maker')
+      || n === 'bm') return 'bookmaker';
   if (c.isBmMarket && !t.includes('MATCH') && !n.includes('match odds')) return 'bookmaker';
   if (t === 'TOSS' || n.includes('toss')) return 'toss';
   if (t === 'FANCY2' || t === 'LOCAL_FANCY' || n.includes('fancy 2') || n.includes('fancy-2')) return 'fancy2';
@@ -2235,33 +2238,35 @@ async function getBpexchMarketPage(marketId, pricesToken) {
   }
   subIds = [...new Set(subIds)].filter(id => id && id !== String(resolvedId));
 
-  // ✅ Fallback: prices7 only returned Match Odds (or no token) → scrape event page
-  // for Bookmaker / Fancy / Tied Match ids (same event)
+  // ✅ ALWAYS merge event/market page ids — prices7 often returns Fancy (9.xxx)
+  // only and SKIPS Bookmaker (1.xxx). Previously we only discovered when
+  // subIds.length < 2 which meant Bookmaker was never found when Fancy existed.
   const eventIdForDiscover = main.eventId || main.event?.id || main.event?.eventId;
-  if (subIds.length < 2 && eventIdForDiscover) {
+  const beforeDiscover = subIds.length;
+  if (eventIdForDiscover) {
     try {
       const discovered = await discoverMarketIdsFromEventPage(eventIdForDiscover);
       for (const id of discovered) {
         if (id && id !== String(resolvedId)) subIds.push(String(id));
       }
       subIds = [...new Set(subIds)];
-      logger.info(`[bpexch] event-page discover eventId=${eventIdForDiscover} → +ids total subIds=${subIds.length}`);
+      logger.info(`[bpexch] event-page discover eventId=${eventIdForDiscover} before=${beforeDiscover} after=${subIds.length}`);
     } catch (e) {
       logger.warn(`[bpexch] event-page discover failed: ${e.message}`);
     }
   }
-  // Still empty → scrape Market HTML for related Bookmaker/Fancy ids
-  if (subIds.length < 2) {
-    try {
-      const fromMarket = await discoverMarketIdsFromMarketPage(resolvedId);
-      for (const id of fromMarket) {
-        if (id && id !== String(resolvedId)) subIds.push(String(id));
-      }
-      subIds = [...new Set(subIds)];
-      logger.info(`[bpexch] market-page discover ${resolvedId} → total subIds=${subIds.length}`);
-    } catch (e) {
-      logger.warn(`[bpexch] market-page discover failed: ${e.message}`);
+  // Market page HTML — picks up Bookmaker / Tied Match when event page is thin
+  try {
+    const fromMarket = await discoverMarketIdsFromMarketPage(resolvedId);
+    for (const id of fromMarket) {
+      if (id && id !== String(resolvedId)) subIds.push(String(id));
     }
+    subIds = [...new Set(subIds)];
+    if (fromMarket.length) {
+      logger.info(`[bpexch] market-page discover ${resolvedId} +${fromMarket.length} total subIds=${subIds.length}`);
+    }
+  } catch (e) {
+    logger.warn(`[bpexch] market-page discover failed: ${e.message}`);
   }
 
   // Fill missing bookmaker/fancy books — prices7 root call sometimes only returns Match Odds
@@ -2382,6 +2387,32 @@ async function getBpexchMarketPage(marketId, pricesToken) {
     const category = categorizeSubMarket(enriched);
     if (category === 'matchOdds') continue;
     subMarkets.push({ ...enriched, category });
+  }
+
+  // Fill catalogs for any 1.xxx book ids still missing (Bookmaker often here)
+  const needCat = [];
+  for (const mb of books) {
+    const mid = String(mb.id);
+    if (mid === String(resolvedId) || seen.has(mid)) continue;
+    if (!subCatalogs.some(c => String(c.marketId) === mid)) needCat.push(mid);
+  }
+  if (needCat.length) {
+    const extras = await Promise.all(needCat.slice(0, 12).map(id => fetchBpexchCatalog2(id).catch(() => null)));
+    for (const cat of extras) {
+      if (!cat || !cat.marketId) continue;
+      subCatalogs.push(cat);
+      const mid = String(cat.marketId);
+      if (mid === String(resolvedId) || seen.has(mid)) continue;
+      if (eventIdStr && cat.eventId != null && String(cat.eventId) !== eventIdStr) {
+        // still include if isBmMarket — Bookmaker sometimes has null/different event link
+        if (!cat.isBmMarket && !(String(cat.marketName||'').toLowerCase().includes('book'))) continue;
+      }
+      seen.add(mid);
+      const enriched = mergeBookOntoCatalog(cat);
+      const category = categorizeSubMarket(enriched);
+      if (category === 'matchOdds') continue;
+      subMarkets.push({ ...enriched, category });
+    }
   }
 
   // markets that appear only in prices7 books (no catalog yet) — still expose with synthetic names
