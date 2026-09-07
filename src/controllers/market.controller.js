@@ -930,9 +930,20 @@ async function getMarketCatalog2(req, res) {
           t2_wickets: bpx.scoreboard.t2_wickets ?? bpx.scoreboard.team2Wickets ?? 0,
           t2_overs:   bpx.scoreboard.t2_overs   ?? bpx.scoreboard.team2Overs   ?? 0,
           t2_crr:     bpx.scoreboard.t2_crr     ?? bpx.scoreboard.team2Crr     ?? 0,
-          rrr:    bpx.scoreboard.rrr    ?? 0,
+          rrr:    bpx.scoreboard.rrr    ?? bpx.scoreboard.RRR ?? 0,
           target: bpx.scoreboard.target ?? 0,
-          toWin:  bpx.scoreboard.toWin  ?? bpx.scoreboard.to_win ?? 0,
+          // bpexch: "26 of 12 balls" style string
+          toWin:  bpx.scoreboard.toWin
+                  || bpx.scoreboard.to_win
+                  || bpx.scoreboard.balls_remaining
+                  || bpx.scoreboard.ballLeft
+                  || bpx.scoreboard.req_balls
+                  || bpx.scoreboard.requiredBalls
+                  || '',
+          ballsText: bpx.scoreboard.toWin
+                  || bpx.scoreboard.to_win
+                  || bpx.scoreboard.balls_remaining
+                  || '',
         } : null,
         scores:     bpx.scores || null,
         news:       bpx.news || '',
