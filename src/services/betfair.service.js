@@ -1,5 +1,4 @@
 
-
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -2100,20 +2099,29 @@ function prices7RunnerToLadder(lr) {
 function categorizeSubMarket(c) {
   const t = String(c.marketType || '').toUpperCase();
   const n = String(c.marketName || '').toLowerCase();
-  // Match Odds / Winner are NEVER bookmaker even if isBmMarket flag is weirdly true
+  const ext = String(c.externalId || '').toUpperCase();
+
+  // CRITICAL: bpexch Bookmaker has marketType=MATCH_ODDS + marketName=Bookmaker + externalId=...-BM
+  // Check name / externalId / isBmMarket BEFORE MATCH_ODDS type
+  if (
+    n.includes('bookmaker') || n.includes('book maker') || n.includes('book-maker') || n === 'bm' ||
+    t === 'BOOKMAKER' || t === 'BOOKMAKER2' || t === 'BM' || t === 'BOOK_MAKER' ||
+    ext.includes('-BM') ||
+    (c.isBmMarket === true && n !== 'match odds')
+  ) {
+    return 'bookmaker';
+  }
+
   if (t === 'MATCH_ODDS' || t === 'WINNER' || t === 'WIN' || n === 'match odds') return 'matchOdds';
-  if (t === 'BOOKMAKER' || t === 'BOOKMAKER2' || t === 'BM' || t === 'BOOK_MAKER'
-      || n.includes('bookmaker') || n.includes('book maker') || n.includes('book-maker')
-      || n === 'bm') return 'bookmaker';
-  if (c.isBmMarket && !t.includes('MATCH') && !n.includes('match odds')) return 'bookmaker';
   if (t === 'TOSS' || n.includes('toss')) return 'toss';
-  if (t === 'FANCY2' || t === 'LOCAL_FANCY' || n.includes('fancy 2') || n.includes('fancy-2')) return 'fancy2';
+  if (t === 'FANCY2' || t === 'LOCAL_FANCY' || n.includes('fancy 2') || n.includes('fancy-2') || n.includes('fancy2')) return 'fancy2';
   if (t === 'FIGURE' || (n.includes('figure') && !n.includes('odd'))) return 'figure';
-  if (t === 'ODD_FIGURE' || t === 'EVEN_ODD' || n.includes('odd figure') || n.includes('even odd')) return 'oddFigure';
-  if (t.includes('FANCY') || n.includes('fancy') || n.includes('session') || n.includes('innings')) return 'fancy';
+  if (t === 'ODD_FIGURE' || t === 'EVEN_ODD' || n.includes('odd figure') || n.includes('even odd') || n.includes('kalli')) return 'oddFigure';
+  if (t.includes('FANCY') || n.includes('fancy') || n.includes('session') || n.includes('innings') || n.includes('wkt')) return 'fancy';
   if (n.includes('over') || n.includes('under') || t.includes('OVER') || t.includes('UNDER') || t.includes('TOTAL') || t.includes('HANDICAP') || t.includes('CORRECT')) return 'other';
   return 'other';
 }
+
 
 /**
  * Full market page — exact bpexch flow:
