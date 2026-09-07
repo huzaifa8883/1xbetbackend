@@ -820,27 +820,57 @@ async function getMarketCatalog2(req, res) {
 
       const isRaceId = /^\d{6,}\.\d+$/.test(String(marketId));
       // If catalog2 runners have no prices, fill from highlights listMarketBook
-      let runnersOut = (bpx.runners || []).map(r => ({
-          selectionId:  r.selectionId,
-          runnerName:   r.runnerName,
-          handicap:     r.handicap || 0,
-          sortPriority: r.sortPriority || 0,
-          status:       r.status || 'ACTIVE',
-          back:         r.back || [],
-          lay:          r.lay || [],
-          price1: r.price1 ?? r.back?.[0]?.price, size1: r.size1 ?? r.back?.[0]?.size,
-          price2: r.price2 ?? r.back?.[1]?.price, size2: r.size2 ?? r.back?.[1]?.size,
-          price3: r.price3 ?? r.back?.[2]?.price, size3: r.size3 ?? r.back?.[2]?.size,
-          lay1: r.lay1 ?? r.lay?.[0]?.price, ls1: r.ls1 ?? r.lay?.[0]?.size,
-          lay2: r.lay2 ?? r.lay?.[1]?.price, ls2: r.ls2 ?? r.lay?.[1]?.size,
-          lay3: r.lay3 ?? r.lay?.[2]?.price, ls3: r.ls3 ?? r.lay?.[2]?.size,
-          clothNumber:  r.clothNumber || null,
-          clothColor:   r.silkColor || r.clothColor || null,
-          silkUrl:      null,
-          jockeyName:   r.jockeyName || null,
-          trainerName:  r.trainerName || null,
-          metadataDict: r.metadata || null,
-        })).filter(r => {
+      const RACE_COLORS = [
+        '#E63946','#FFFFFF','#1D3557','#F4D03F','#2ECC71','#111111','#F39C12','#8E44AD',
+        '#16A085','#E74C3C','#3498DB','#F1C40F','#E67E22','#1ABC9C','#95A5A6','#2C3E50',
+        '#C0392B','#7F8C8D','#27AE60','#D35400',
+      ];
+      // Greyhound trap colors (1-8 standard)
+      const GREY_COLORS = [
+        '#E63946','#1D3557','#FFFFFF','#F4D03F','#2ECC71','#111111','#F39C12','#E91E63',
+      ];
+      let runnersOut = (bpx.runners || []).map((r, idx) => {
+          let meta = r.metadata || r.metadataDict || r.runnerMetadata || {};
+          if (typeof meta === 'string') {
+            try { meta = JSON.parse(meta); } catch (_) { meta = {}; }
+          }
+          if (!meta || typeof meta !== 'object') meta = {};
+          const clothNumber = r.clothNumber || meta.CLOTH_NUMBER || meta.cloth_number || meta.ClothNumber || meta.TRAP || meta.trap || null;
+          const sortPriority = r.sortPriority || meta.SORT_PRIORITY || (idx + 1);
+          const posN = parseInt(clothNumber, 10) || parseInt(sortPriority, 10) || (idx + 1);
+          const isGrey = String(bpx.eventTypeId || bpx.sport?.id || '') === '4339'
+            || /grey/i.test(String(bpx.eventType || bpx.sport?.name || ''));
+          const silkUrl = r.silkUrl
+            || meta.COLOURS_FILENAME_URL || meta.colours_filename_url || meta.ColoursFilenameUrl
+            || meta.SILK_URL || meta.silkUrl || null;
+          const clothColor = r.clothColor || r.silkColor
+            || meta.COLOURS_DESCRIPTION || meta.silkColor
+            || (isGrey ? GREY_COLORS[(posN - 1) % GREY_COLORS.length] : RACE_COLORS[(posN - 1) % RACE_COLORS.length]);
+          const clothStriped = isGrey && (posN === 6);
+          return {
+            selectionId:  r.selectionId,
+            runnerName:   r.runnerName,
+            handicap:     r.handicap || 0,
+            sortPriority,
+            status:       r.status || 'ACTIVE',
+            back:         r.back || [],
+            lay:          r.lay || [],
+            price1: r.price1 ?? r.back?.[0]?.price, size1: r.size1 ?? r.back?.[0]?.size,
+            price2: r.price2 ?? r.back?.[1]?.price, size2: r.size2 ?? r.back?.[1]?.size,
+            price3: r.price3 ?? r.back?.[2]?.price, size3: r.size3 ?? r.back?.[2]?.size,
+            lay1: r.lay1 ?? r.lay?.[0]?.price, ls1: r.ls1 ?? r.lay?.[0]?.size,
+            lay2: r.lay2 ?? r.lay?.[1]?.price, ls2: r.ls2 ?? r.lay?.[1]?.size,
+            lay3: r.lay3 ?? r.lay?.[2]?.price, ls3: r.ls3 ?? r.lay?.[2]?.size,
+            clothNumber:  clothNumber || String(posN),
+            clothColor,
+            clothStriped,
+            silkUrl:      silkUrl || null,
+            silkColor:    clothColor,
+            jockeyName:   r.jockeyName || meta.JOCKEY_NAME || meta.jockey_name || meta.JockeyName || null,
+            trainerName:  r.trainerName || meta.TRAINER_NAME || meta.trainer_name || meta.TrainerName || null,
+            metadataDict: Object.keys(meta).length ? meta : (r.metadata || null),
+          };
+        }).filter(r => {
           const n = String(r.runnerName || '');
           // drop Vue/score template junk that was scraped by mistake
           if (!n || /\{\{|scores\.|v-if|v-for|^\{\s*gs/i.test(n)) return false;
