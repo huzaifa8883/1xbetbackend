@@ -61,7 +61,7 @@ function computeSettlementPnL(order) {
      AUS / USA / RSA:
        - In-play: NEVER allowed → "Inplay bets are not allowed"
        - Pre-off: only within last 2 minutes before start
-         earlier → "Betting starting in X minutes"
+         earlier → "Betting will open in X minutes"
      GB / IE:
        - Pre-off: only within last 10 minutes before start
        - In-play: WIN allowed, To Be Placed (PLACE) NOT allowed
@@ -134,7 +134,7 @@ function validateRacingBetRules(details) {
     if (inPlay) return 'Inplay bets are not allowed';
     if (minsToStart != null && minsToStart > 5) {
       const m = Math.ceil(minsToStart - 5);
-      return `Betting starting in ${m} minute${m === 1 ? '' : 's'}`;
+      return `Betting will open in ${m} minute${m === 1 ? '' : 's'}`;
     }
     return null;
   }
@@ -147,7 +147,7 @@ function validateRacingBetRules(details) {
     if (inPlay) return 'Inplay bets are not allowed';
     if (minsToStart != null && minsToStart > 2) {
       const m = Math.ceil(minsToStart - 2);
-      return `Betting starting in ${m} minute${m === 1 ? '' : 's'}`;
+      return `Betting will open in ${m} minute${m === 1 ? '' : 's'}`;
     }
     return null;
   }
@@ -156,7 +156,7 @@ function validateRacingBetRules(details) {
     if (inPlay && place) return 'Inplay bets are not allowed';
     if (!inPlay && minsToStart != null && minsToStart > 10) {
       const m = Math.ceil(minsToStart - 10);
-      return `Betting starting in ${m} minute${m === 1 ? '' : 's'}`;
+      return `Betting will open in ${m} minute${m === 1 ? '' : 's'}`;
     }
     // in-play WIN allowed for GB/IE
     return null;
