@@ -1,5 +1,3 @@
-
-
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1432,16 +1430,63 @@ async function listMarketBook(marketIds = [], priceProjection) {
   return results;
 }
 
-/* ── getEventDetails (orders.js compatible) ─────────────── */
+/* ── getEventDetails (orders.js compatible + racing fields) ─────────────── */
 async function getEventDetails(marketId) {
+  const empty = {
+    eventName: 'Unknown Event', category: 'Other',
+    eventTypeId: null, countryCode: null, marketStartTime: null,
+    marketType: null, marketName: null, status: null, inPlay: false,
+  };
   try {
-    const catalogue = await listMarketCatalogue({ marketIds: [marketId] }, '1', ['EVENT', 'EVENT_TYPE']);
+    // Prefer bpexch catalog2 — has countryCode, start time, marketType, status
+    try {
+      const cat = await fetchBpexchCatalog2(String(marketId));
+      if (cat && (cat.marketId || cat.eventName || cat.runners)) {
+        const st = cat.marketStartTime || cat.marketStartTimeUtc || null;
+        const status = String(cat.status || cat.marketStatus || '').toUpperCase();
+        const startMs = st ? Date.parse(String(st).endsWith('Z') || /[+-]\d{2}/.test(String(st)) ? st : String(st).replace(' ', 'T') + (/[zZ]|[+-]\d{2}/.test(String(st)) ? '' : 'Z')) : NaN;
+        const inPlay = status === 'INPLAY' || status === 'IN_PLAY' ||
+          !!(cat.inPlay || cat.inplay || cat.isInPlay) ||
+          (!isNaN(startMs) && Date.now() >= startMs);
+        return {
+          eventName: cat.eventName || cat.event?.name || 'Unknown Event',
+          category: cat.eventType || cat.sport?.name || 'Other',
+          eventTypeId: cat.eventTypeId != null ? String(cat.eventTypeId) : null,
+          countryCode: cat.countryCode || cat.event?.countryCode || null,
+          marketStartTime: st,
+          marketType: cat.marketType || cat.description?.marketType || null,
+          marketName: cat.marketName || null,
+          status,
+          inPlay,
+        };
+      }
+    } catch (e) {
+      logger.warn(`getEventDetails catalog2 ${marketId}: ${e.message}`);
+    }
+
+    const catalogue = await listMarketCatalogue(
+      { marketIds: [String(marketId)] },
+      '1',
+      ['EVENT', 'EVENT_TYPE', 'MARKET_START_TIME', 'MARKET_DESCRIPTION']
+    );
     const market = catalogue?.[0];
-    if (!market?.event) return { eventName: 'Unknown Event', category: 'Other' };
-    return { eventName: market.event.name, category: market.eventType?.name || 'Other' };
+    if (!market?.event) return empty;
+    const st = market.marketStartTime || null;
+    const startMs = st ? Date.parse(st) : NaN;
+    return {
+      eventName: market.event.name,
+      category: market.eventType?.name || 'Other',
+      eventTypeId: market.eventType?.id != null ? String(market.eventType.id) : null,
+      countryCode: market.event?.countryCode || null,
+      marketStartTime: st,
+      marketType: market.description?.marketType || market.marketType || null,
+      marketName: market.marketName || null,
+      status: null,
+      inPlay: !isNaN(startMs) && Date.now() >= startMs,
+    };
   } catch (err) {
     logger.warn(`getEventDetails failed for ${marketId}: ${err.message}`);
-    return { eventName: 'Unknown Event', category: 'Other' };
+    return empty;
   }
 }
 
