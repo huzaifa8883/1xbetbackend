@@ -1,4 +1,3 @@
-
 'use strict';
 
 const { sequelize } = require('../config/database');
@@ -54,6 +53,119 @@ function computeSettlementPnL(order) {
   }
 }
 
+
+/* ─────────────────────────────────────────────────────────────
+   Racing bet rules (Horse 7 / Greyhound 4339)
+
+   HORSE:
+     AUS / USA / RSA:
+       - In-play: NEVER allowed → "Inplay bets are not allowed"
+       - Pre-off: only within last 2 minutes before start
+         earlier → "Betting starting in X minutes"
+     GB / IE:
+       - Pre-off: only within last 10 minutes before start
+       - In-play: WIN allowed, To Be Placed (PLACE) NOT allowed
+   GREYHOUND (all countries):
+       - In-play: NEVER allowed
+       - Pre-off: only within last 5 minutes before start
+────────────────────────────────────────────────────────────── */
+function detectRaceCountry(eventName, countryCode) {
+  const cc = String(countryCode || '').toUpperCase().trim();
+  if (['GB', 'UK', 'GBR'].includes(cc)) return 'GB';
+  if (['IE', 'IRL'].includes(cc)) return 'IE';
+  if (['US', 'USA'].includes(cc)) return 'US';
+  if (['AU', 'AUS'].includes(cc)) return 'AUS';
+  if (['ZA', 'RSA', 'SA'].includes(cc)) return 'RSA';
+
+  const n = String(eventName || '').toUpperCase();
+  if (/\(GB\)|\(UK\)|\(GBR\)/.test(n)) return 'GB';
+  if (/\(IE\)|\(IRL\)/.test(n)) return 'IE';
+  if (/\(US\)|\(USA\)/.test(n)) return 'US';
+  if (/\(AUS\)|\(AU\)/.test(n)) return 'AUS';
+  if (/\(RSA\)|\(ZA\)|\(SA\)/.test(n)) return 'RSA';
+
+  // common venue hints
+  if (/\b(ASCOT|NEWMARKET|YORK|CHELTENHAM|LIVERPOOL|SANDOWN|Kempton|LINGFIELD|WOLVERHAMPTON|SOUTHWELL|NEWCASTLE|DONCASTER|HAYDOCK|AYR|EPSOM|GOODWOOD|WINDSOR|BATH|BRIGHTON|CHESTER|PUNCHESTOWN)\b/i.test(eventName || '')) return 'GB';
+  if (/\b(LAYTOWN|CURRAGH|LEOPARDSTOWN|FAIRYHOUSE|DUNDALK|NAAS|TIPPERARY|GOWRAN|CORK|DOWN\s*ROYAL|DOWNPATRICK)\b/i.test(eventName || '')) return 'IE';
+  if (/\b(BELMONT|SARATOGA|CHURCHILL|SANTA ANITA|GULFSTREAM|KEENELAND|AQUEDUCT|DELAWARE|BELTERRA|PARX|LAUREL|PIMLICO)\b/i.test(eventName || '')) return 'US';
+  if (/\b(FLEMINGTON|RANDWICK|ROSEHILL|MOONEE VALLEY|CAULFIELD|EAGLE FARM|DOOMBEN|WARWICK FARM|MORPHETTVILLE)\b/i.test(eventName || '')) return 'AUS';
+  if (/\b(TURFFONTEIN|GREYVILLE|KENILWORTH|VAAL|SCOTTSVILLE)\b/i.test(eventName || '')) return 'RSA';
+
+  return cc || 'OTHER';
+}
+
+function isPlaceMarket(marketType, marketName) {
+  const t = String(marketType || '').toUpperCase();
+  const n = String(marketName || '').toLowerCase();
+  if (t === 'PLACE' || t === 'EACH_WAY' || t === 'TOP_FINISH') return true;
+  if (n.includes('to be placed') || n.includes('place only') || /\bplace\b/.test(n)) return true;
+  return false;
+}
+
+function parseStartMs(iso) {
+  if (!iso) return NaN;
+  let s = String(iso).trim();
+  if (/^\d+$/.test(s)) return Number(s);
+  if (/[zZ]$/.test(s) || /[+-]\d{2}:?\d{2}$/.test(s)) return new Date(s).getTime();
+  s = s.replace(/(\.\d{3})\d+/, '$1').replace(' ', 'T');
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s) && !/[zZ]$/.test(s) && !/[+-]\d{2}/.test(s)) s += 'Z';
+  return new Date(s).getTime();
+}
+
+/**
+ * Returns null if bet is allowed, or an error message string if blocked.
+ */
+function validateRacingBetRules(details) {
+  if (!details) return null;
+  const eid = String(details.eventTypeId || '');
+  const isHorse = eid === '7' || /horse/i.test(String(details.category || ''));
+  const isGrey = eid === '4339' || /greyhound/i.test(String(details.category || ''));
+  if (!isHorse && !isGrey) return null;
+
+  const country = detectRaceCountry(details.eventName, details.countryCode);
+  const startMs = parseStartMs(details.marketStartTime);
+  const now = Date.now();
+  const minsToStart = isNaN(startMs) ? null : (startMs - now) / 60000;
+  const inPlay = !!(details.inPlay) || (!isNaN(startMs) && now >= startMs);
+  const place = isPlaceMarket(details.marketType, details.marketName);
+
+  // ── Greyhound: no in-play, open only last 5 minutes ──
+  if (isGrey) {
+    if (inPlay) return 'Inplay bets are not allowed';
+    if (minsToStart != null && minsToStart > 5) {
+      const m = Math.ceil(minsToStart - 5);
+      return `Betting starting in ${m} minute${m === 1 ? '' : 's'}`;
+    }
+    return null;
+  }
+
+  // ── Horse ──
+  const strict = ['US', 'AUS', 'RSA', 'OTHER'].includes(country);
+  const gbIe = country === 'GB' || country === 'IE';
+
+  if (strict) {
+    if (inPlay) return 'Inplay bets are not allowed';
+    if (minsToStart != null && minsToStart > 2) {
+      const m = Math.ceil(minsToStart - 2);
+      return `Betting starting in ${m} minute${m === 1 ? '' : 's'}`;
+    }
+    return null;
+  }
+
+  if (gbIe) {
+    if (inPlay && place) return 'Inplay bets are not allowed';
+    if (!inPlay && minsToStart != null && minsToStart > 10) {
+      const m = Math.ceil(minsToStart - 10);
+      return `Betting starting in ${m} minute${m === 1 ? '' : 's'}`;
+    }
+    // in-play WIN allowed for GB/IE
+    return null;
+  }
+
+  return null;
+}
+
+
 /* ─────────────────────────────────────────────────────────────
    placeBets  — Bet lagao
 ────────────────────────────────────────────────────────────── */
@@ -71,17 +183,26 @@ async function placeBets(req, res) {
 
   const enriched = await Promise.all(
     bets.map(async (bet) => {
-      const { eventName, category } = await getEventDetails(bet.marketId).catch(() => ({
+      const details = await getEventDetails(bet.marketId).catch(() => ({
         eventName: 'Unknown', category: 'Other',
       }));
       return {
         ...bet,
-        event_name:  eventName,
-        category,
+        event_name:  details.eventName,
+        category:    details.category,
         runner_name: bet.runnerName || bet.runner_name || '',
+        _raceDetails: details,
       };
     }),
   );
+
+  // Racing rules (horse / greyhound) — reject before wallet/match
+  for (const bet of enriched) {
+    const msg = validateRacingBetRules(bet._raceDetails);
+    if (msg) {
+      return sendError(res, msg, 400);
+    }
+  }
 
   const now = Date.now();
   const normalized = enriched.map((bet, i) => {
