@@ -59,7 +59,7 @@ function computeSettlementPnL(order) {
 
    HORSE:
      AUS / USA / RSA:
-       - In-play: NEVER allowed → "Inplay bets are not allowed"
+       - In-play: NEVER allowed → "Inplay bet is not allowed in this race"
        - Pre-off: only within last 2 minutes before start
          earlier → "Betting will open in X minutes"
      GB / IE:
@@ -131,7 +131,7 @@ function validateRacingBetRules(details) {
 
   // ── Greyhound: no in-play, open only last 5 minutes ──
   if (isGrey) {
-    if (inPlay) return 'Inplay bets are not allowed';
+    if (inPlay) return 'Inplay bet is not allowed in this race';
     if (minsToStart != null && minsToStart > 5) {
       const m = Math.ceil(minsToStart - 5);
       return `Betting will open in ${m} minute${m === 1 ? '' : 's'}`;
@@ -144,7 +144,7 @@ function validateRacingBetRules(details) {
   const gbIe = country === 'GB' || country === 'IE';
 
   if (strict) {
-    if (inPlay) return 'Inplay bets are not allowed';
+    if (inPlay) return 'Inplay bet is not allowed in this race';
     if (minsToStart != null && minsToStart > 2) {
       const m = Math.ceil(minsToStart - 2);
       return `Betting will open in ${m} minute${m === 1 ? '' : 's'}`;
@@ -153,7 +153,7 @@ function validateRacingBetRules(details) {
   }
 
   if (gbIe) {
-    if (inPlay && place) return 'Inplay bets are not allowed';
+    if (inPlay && place) return 'Inplay bet is not allowed in this race';
     if (!inPlay && minsToStart != null && minsToStart > 10) {
       const m = Math.ceil(minsToStart - 10);
       return `Betting will open in ${m} minute${m === 1 ? '' : 's'}`;
