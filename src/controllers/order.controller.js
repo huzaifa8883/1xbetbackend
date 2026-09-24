@@ -1,3 +1,4 @@
+Files
 'use strict';
 
 const { sequelize } = require('../config/database');
@@ -126,7 +127,10 @@ function validateRacingBetRules(details) {
   const startMs = parseStartMs(details.marketStartTime);
   const now = Date.now();
   const minsToStart = isNaN(startMs) ? null : (startMs - now) / 60000;
-  const inPlay = !!(details.inPlay) || (!isNaN(startMs) && now >= startMs);
+  /* in-play ONLY from market status/flags — US/AUS races often start late */
+  const status = String(details.status || details.marketStatus || '').toUpperCase();
+  const inPlay = !!(details.inPlay || details.inplay) ||
+    status === 'INPLAY' || status === 'IN_PLAY' || status === 'IN-PLAY';
   const place = isPlaceMarket(details.marketType, details.marketName);
 
   // ── Greyhound: no in-play, open only last 5 minutes ──
@@ -201,6 +205,26 @@ async function placeBets(req, res) {
     const msg = validateRacingBetRules(bet._raceDetails);
     if (msg) {
       return sendError(res, msg, 400);
+    }
+  }
+
+  // Max bet hard limits: Horse 200K, Greyhound 50K
+  for (const bet of enriched) {
+    const d = bet._raceDetails || {};
+    const eid = String(d.eventTypeId || '');
+    const cat = String(d.category || d.eventType || '').toLowerCase();
+    const en  = String(d.eventName || bet.event_name || '');
+    const isGrey = eid === '4339' || /greyhound/.test(cat) || /greyhound/i.test(en);
+    const isHorse = eid === '7' || /horse/.test(cat) || (/\(aus\)|\(us\)|\(gb\)|\(ie\)|\(rsa\)/i.test(en) && !isGrey);
+    if (!isGrey && !isHorse) continue;
+    const size = parseFloat(bet.size);
+    if (!isFinite(size) || size <= 0) continue;
+    let limit = parseFloat(d.maxBetSize || d.maxBet || 0);
+    const hard = isGrey ? 50000 : 200000;
+    if (!limit || limit <= 0 || limit > hard) limit = hard;
+    if (size > limit) {
+      const label = limit >= 1000 ? (Math.round(limit / 1000) + 'K') : String(limit);
+      return sendError(res, `Max bet limited to ${label}`, 400);
     }
   }
 
