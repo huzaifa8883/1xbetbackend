@@ -1,4 +1,3 @@
-Files
 'use strict';
 
 const { sequelize } = require('../config/database');
