@@ -1,5 +1,3 @@
-
-
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1460,11 +1458,6 @@ async function getEventDetails(marketId) {
           marketName: cat.marketName || null,
           status,
           inPlay,
-          isFancy: !!(cat.isFancy || cat.hasFancyOdds || cat.isLocalFancy),
-          isFancy2: !!(cat.isLocalFancy || /fancy\s*2/i.test(String(cat.marketName || ''))),
-          isBmMarket: !!(cat.isBmMarket || /bookmaker/i.test(String(cat.marketName || ''))),
-          hasFancyOdds: !!cat.hasFancyOdds,
-          maxBetSize: cat.maxBetSize || cat.sport?.maxBet || null,
         };
       }
     } catch (e) {
