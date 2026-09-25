@@ -4,35 +4,16 @@
 const { BET_SIDE, ORDER_STATUS } = require('../config/constants');
 
 /* ─────────────────────────────────────────────────────────────
-   MARKET KIND DETECTION
-   Match Odds / Toss / Bookmaker → exchange decimal math
-   Fancy / Fancy2                → Indian line (Yes/No) math
+   calculateLiability  — single bet ka liability
+   BACK : stake
+   LAY  : (price - 1) * stake
 ────────────────────────────────────────────────────────────── */
-function detectMarketKind(betOrMeta = {}) {
-  const name = String(
-    betOrMeta.marketName || betOrMeta.market_name ||
-    betOrMeta.runnerName || betOrMeta.runner_name || ''
-  ).toLowerCase();
-  const cat = String(
-    betOrMeta.category || betOrMeta.marketType || betOrMeta.market_type ||
-    betOrMeta.bettingType || ''
-  ).toLowerCase();
-  const flags = betOrMeta;
-
-  if (flags.isFancy2 || /fancy\s*[-_]?2|fancy2|local\s*fancy/.test(cat + ' ' + name)) {
-    return 'FANCY2';
-  }
-  if (
-    flags.isFancy || flags.isLocalFancy || flags.hasFancyOdds ||
-    /(^|[^a-z])fancy([^a-z]|$)/.test(cat) ||
-    /\bfancy\b/.test(name) ||
-    /session|over runs|wkt|wicket|only overs|boundaries|balls face|fall of/.test(name)
-  ) {
-    return 'FANCY';
-  }
-  if (/bookmaker|\bbm\b/.test(cat + ' ' + name) || flags.isBmMarket) return 'BOOKMAKER';
-  if (/\btoss\b/.test(cat + ' ' + name)) return 'TOSS';
-  return 'EXCHANGE';
+function calculateLiability(bet) {
+  const price = parseFloat(bet.price);
+  const size  = parseFloat(bet.size);
+  const side  = normalizeSide(bet.side || bet.type);
+  if (side === BET_SIDE.BACK || side === 'BACK') return size;
+  return (price - 1) * size;
 }
 
 function normalizeSide(side) {
@@ -42,55 +23,25 @@ function normalizeSide(side) {
   return s;
 }
 
-function isRatePrice(price) {
-  const p = Number(price);
-  return isFinite(p) && p >= 50 && p <= 1000;
-}
-
-function winProfit(price, size) {
-  const p = Number(price);
-  const s = Number(size);
-  if (!isFinite(p) || !isFinite(s) || s <= 0) return 0;
-  if (isRatePrice(p)) return s * (p / 100);
-  return s * (p - 1);
-}
-
-function layLoss(price, size) {
-  return winProfit(price, size);
-}
-
 /* ─────────────────────────────────────────────────────────────
-   calculateLiability
+   evaluateMatch  — orders.js / SQL backend
 
-   EXCHANGE / BOOKMAKER / TOSS:
-     BACK → stake
-     LAY  → (price - 1) * stake  (or rate/100 * stake)
+   BACK BET:
+     - selected price > highest available back  → PENDING
+     - selected price ≤ highest available back  → MATCHED at highest back
 
-   FANCY / FANCY2 (Yes/No line):
-     BACK (Yes) → stake
-     LAY  (No)  → winProfit(price, size)
-────────────────────────────────────────────────────────────── */
-function calculateLiability(bet) {
-  const price = parseFloat(bet.price);
-  const size  = parseFloat(bet.size);
-  const side  = normalizeSide(bet.side || bet.type);
-  const kind  = detectMarketKind(bet);
+   LAY BET:
+     - selected price < lowest available lay    → PENDING
+     - selected price ≥ lowest available lay    → MATCHED at lowest lay
 
-  if (!isFinite(price) || !isFinite(size) || size <= 0) return 0;
-
-  if (side === 'BACK' || side === BET_SIDE.BACK) {
-    return size;
-  }
-
-  if (kind === 'FANCY' || kind === 'FANCY2') {
-    return layLoss(price, size);
-  }
-  if (isRatePrice(price)) return size * (price / 100);
-  return Math.max(0, (price - 1) * size);
-}
-
-/* ─────────────────────────────────────────────────────────────
-   evaluateMatch
+   FIXES vs old:
+     1) Empty ladder: pehle seedha PENDING return hota tha — board pe
+        price dikh ke bhi match nahi hota tha (getRunnerBook aksar
+        empty ex deta hai). Ab empty ladder pe requested price pe
+        full stake MATCHED (platform scraped-odds model).
+     2) side 'B'/'L' / 'b'/'l' normalize
+     3) status ORDER_STATUS constants se (string mismatch avoid)
+     4) invalid price/size → PENDING
 ────────────────────────────────────────────────────────────── */
 function evaluateMatch(order, runner) {
   let matchedSize   = 0;
@@ -99,138 +50,89 @@ function evaluateMatch(order, runner) {
 
   const selectedPrice = Number(order.price);
   const orderSize     = parseFloat(order.size);
-  const kind          = detectMarketKind(order);
 
-  if (!isFinite(orderSize) || orderSize <= 0) {
-    return { matchedSize: 0, status: ORDER_STATUS.PENDING, executedPrice: selectedPrice || 0 };
-  }
-
-  const minPrice = (kind === 'FANCY' || kind === 'FANCY2') ? 0.01 : 1;
-  if (!isFinite(selectedPrice) || selectedPrice <= minPrice) {
+  if (!isFinite(selectedPrice) || selectedPrice <= 1 || !isFinite(orderSize) || orderSize <= 0) {
     return { matchedSize: 0, status: ORDER_STATUS.PENDING, executedPrice: selectedPrice || 0 };
   }
 
   const side  = normalizeSide(order.side || order.type);
   const backs = (runner && runner.ex && Array.isArray(runner.ex.availableToBack))
-    ? runner.ex.availableToBack.filter(b => Number(b.price) > minPrice)
+    ? runner.ex.availableToBack.filter(b => Number(b.price) > 1)
     : [];
   const lays  = (runner && runner.ex && Array.isArray(runner.ex.availableToLay))
-    ? runner.ex.availableToLay.filter(l => Number(l.price) > minPrice)
+    ? runner.ex.availableToLay.filter(l => Number(l.price) > 1)
     : [];
 
-  if (kind === 'FANCY' || kind === 'FANCY2') {
-    if (side === 'BACK') {
-      if (!backs.length) {
-        return { matchedSize: orderSize, status: ORDER_STATUS.MATCHED, executedPrice: selectedPrice };
-      }
-      const bestBack = Math.max(...backs.map(b => Number(b.price)));
-      if (selectedPrice <= bestBack) {
-        return { matchedSize: orderSize, status: ORDER_STATUS.MATCHED, executedPrice: bestBack };
-      }
-      return { matchedSize: 0, status: ORDER_STATUS.PENDING, executedPrice: selectedPrice };
-    }
-    if (side === 'LAY') {
-      if (!lays.length) {
-        return { matchedSize: orderSize, status: ORDER_STATUS.MATCHED, executedPrice: selectedPrice };
-      }
-      const bestLay = Math.min(...lays.map(l => Number(l.price)));
-      if (selectedPrice >= bestLay) {
-        return { matchedSize: orderSize, status: ORDER_STATUS.MATCHED, executedPrice: bestLay };
-      }
-      return { matchedSize: 0, status: ORDER_STATUS.PENDING, executedPrice: selectedPrice };
-    }
-    return { matchedSize: 0, status: ORDER_STATUS.PENDING, executedPrice: selectedPrice };
-  }
-
   if (side === 'BACK') {
+    // Empty ladder → auto-match at clicked price (scraped board model)
     if (!backs.length) {
-      return { matchedSize: orderSize, status: ORDER_STATUS.MATCHED, executedPrice: selectedPrice };
+      return {
+        matchedSize: orderSize,
+        status: ORDER_STATUS.MATCHED,
+        executedPrice: selectedPrice,
+      };
     }
-    const highestBack = Math.max(...backs.map(b => Number(b.price)));
+    const prices      = backs.map(b => Number(b.price));
+    const highestBack = Math.max(...prices);
+
     if (selectedPrice > highestBack) {
-      return { matchedSize: 0, status: ORDER_STATUS.PENDING, executedPrice: selectedPrice };
+      status = ORDER_STATUS.PENDING;
+      matchedSize = 0;
+      executedPrice = selectedPrice;
+    } else {
+      // Match at best available back (your original rule)
+      executedPrice = highestBack;
+      matchedSize   = orderSize;
+      status        = ORDER_STATUS.MATCHED;
     }
-    return { matchedSize: orderSize, status: ORDER_STATUS.MATCHED, executedPrice: highestBack };
-  }
-
-  if (side === 'LAY') {
+  } else if (side === 'LAY') {
     if (!lays.length) {
-      return { matchedSize: orderSize, status: ORDER_STATUS.MATCHED, executedPrice: selectedPrice };
+      return {
+        matchedSize: orderSize,
+        status: ORDER_STATUS.MATCHED,
+        executedPrice: selectedPrice,
+      };
     }
-    const lowestLay = Math.min(...lays.map(l => Number(l.price)));
+    const prices    = lays.map(l => Number(l.price));
+    const lowestLay = Math.min(...prices);
+
     if (selectedPrice < lowestLay) {
-      return { matchedSize: 0, status: ORDER_STATUS.PENDING, executedPrice: selectedPrice };
+      status = ORDER_STATUS.PENDING;
+      matchedSize = 0;
+      executedPrice = selectedPrice;
+    } else {
+      executedPrice = lowestLay;
+      matchedSize   = orderSize;
+      status        = ORDER_STATUS.MATCHED;
     }
-    return { matchedSize: orderSize, status: ORDER_STATUS.MATCHED, executedPrice: lowestLay };
+  } else {
+    // Unknown side — keep pending
+    status = ORDER_STATUS.PENDING;
   }
 
-  return { matchedSize: 0, status: ORDER_STATUS.PENDING, executedPrice: selectedPrice };
+  return { matchedSize, status, executedPrice };
 }
 
-function settlePnL(bet, winnerSelectionId) {
-  const price = Number(bet.price);
-  const size  = Number(bet.matched || bet.size || 0);
-  const side  = normalizeSide(bet.side || bet.type);
-  const sel   = String(bet.selection_id || bet.selectionId || '');
-  const winSel = String(winnerSelectionId || '');
-  const won   = sel === winSel;
+/* ─────────────────────────────────────────────────────────────
+   computeTotalLiability  — green-book + pending combined
 
-  if (!isFinite(size) || size <= 0) return 0;
-
-  if (side === 'BACK') {
-    return won ? winProfit(price, size) : -size;
-  }
-  return won ? -layLoss(price, size) : size;
-}
-
+   MATCHED bets  → market-wise green-book calculation
+   PENDING bets  → simple per-bet liability sum
+────────────────────────────────────────────────────────────── */
 function computeTotalLiability(orders) {
   if (!Array.isArray(orders) || !orders.length) return 0;
 
-  const matched = orders.filter(o =>
-    String(o.status).toUpperCase() === 'MATCHED' || o.status === ORDER_STATUS.MATCHED);
-  const pending = orders.filter(o =>
-    String(o.status).toUpperCase() === 'PENDING' || o.status === ORDER_STATUS.PENDING);
+  const matched = orders.filter(o => String(o.status).toUpperCase() === 'MATCHED'
+    || o.status === ORDER_STATUS.MATCHED);
+  const pending = orders.filter(o => String(o.status).toUpperCase() === 'PENDING'
+    || o.status === ORDER_STATUS.PENDING);
 
   let totalLiability = 0;
 
+  // ── MATCHED: market-wise green-book ──────────────────────
   const marketIds = [...new Set(matched.map(o => o.market_id || o.marketId))];
   for (const marketId of marketIds) {
     const marketOrders = matched.filter(o => (o.market_id || o.marketId) === marketId);
-    if (!marketOrders.length) continue;
-
-    const kind = detectMarketKind(marketOrders[0]);
-
-    if (kind === 'FANCY' || kind === 'FANCY2') {
-      const sels = [...new Set(marketOrders.map(b => String(b.selection_id || b.selectionId)))];
-      let worst = 0;
-      for (const winSel of sels) {
-        let pnl = 0;
-        for (const bet of marketOrders) {
-          pnl += settlePnL(bet, winSel);
-        }
-        if (pnl < worst) worst = pnl;
-      }
-      if (sels.length === 1) {
-        let pnlBack = 0;
-        let pnlLay  = 0;
-        for (const bet of marketOrders) {
-          const side = normalizeSide(bet.side || bet.type);
-          const price = Number(bet.price);
-          const size  = Number(bet.matched || bet.size);
-          if (side === 'BACK') {
-            pnlBack += winProfit(price, size);
-            pnlLay  -= size;
-          } else {
-            pnlBack -= layLoss(price, size);
-            pnlLay  += size;
-          }
-        }
-        worst = Math.min(worst, pnlBack, pnlLay);
-      }
-      if (worst < 0) totalLiability += Math.abs(worst);
-      continue;
-    }
-
     let globalPnL = 0;
     const runnerAdj = {};
 
@@ -254,6 +156,7 @@ function computeTotalLiability(orders) {
     totalLiability  += worstCase < 0 ? Math.abs(worstCase) : 0;
   }
 
+  // ── PENDING: simple per-bet sum ───────────────────────────
   for (const bet of pending) {
     totalLiability += calculateLiability(bet);
   }
@@ -265,10 +168,4 @@ module.exports = {
   calculateLiability,
   evaluateMatch,
   computeTotalLiability,
-  detectMarketKind,
-  settlePnL,
-  winProfit,
-  layLoss,
-  isRatePrice,
-  normalizeSide,
 };
