@@ -231,7 +231,33 @@ async function placeBets(req, res) {
   const normalized = enriched.map((bet, i) => {
     const price  = parseFloat(bet.price);
     const size   = parseFloat(bet.size);
-    const liable = bet.side === BET_SIDE.BACK ? size : (price - 1) * size;
+    const d = bet._raceDetails || {};
+    // Fancy/Fancy2/BM meta for liability + matching
+    const meta = {
+      side: bet.side,
+      type: bet.side,
+      price,
+      size,
+      marketName: d.marketName || bet.marketName || '',
+      market_name: d.marketName || bet.marketName || '',
+      category: bet.category || d.category || '',
+      marketType: d.marketType || bet.marketType || '',
+      runnerName: bet.runner_name || '',
+      runner_name: bet.runner_name || '',
+      isFancy: !!(d.isFancy || d.hasFancyOdds),
+      isFancy2: !!(d.isFancy2 || d.isLocalFancy),
+      isBmMarket: !!d.isBmMarket,
+    };
+    const liable = calculateLiability(meta);
+    // Persist kind in category so later match/liability detect works
+    let category = bet.category || d.category || 'Other';
+    try {
+      const { detectMarketKind } = require('../services/matching.service');
+      const kind = detectMarketKind(meta);
+      if (kind === 'FANCY' || kind === 'FANCY2') category = kind.toLowerCase();
+      else if (kind === 'BOOKMAKER') category = 'bookmaker';
+      else if (kind === 'TOSS') category = 'toss';
+    } catch (_) {}
     return {
       request_id:   now + i,
       user_id:      userId,
@@ -239,7 +265,7 @@ async function placeBets(req, res) {
       selection_id: bet.selectionId,
       runner_name:  bet.runner_name || '',
       event_name:   bet.event_name,
-      category:     bet.category,
+      category,
       side:         bet.side,
       type:         bet.side === BET_SIDE.BACK ? 'BACK' : 'LAY',
       price,
